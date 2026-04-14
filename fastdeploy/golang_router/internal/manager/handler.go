@@ -14,8 +14,10 @@ import (
 type Manager struct {
 	mixedWorkerMap   map[string]*WorkerInfo
 	prefillWorkerMap map[string]*WorkerInfo
-	decodeWorkerMap  map[string]*WorkerInfo
+	decodeWorkerMap  map[string]*WorkerInfo // decodeWorkerMap holds DECODE workers in PD mode and ATTN workers in AFD mode.
+	ffnWorkerMap     map[string]*WorkerInfo // ffnWorkerMap holds FFN workers (AFD only).
 	splitwise        bool
+	afd              bool
 	mu               sync.RWMutex
 }
 
@@ -45,7 +47,9 @@ func Init(cfg *config.Config) {
 		mixedWorkerMap:   make(map[string]*WorkerInfo),
 		prefillWorkerMap: make(map[string]*WorkerInfo),
 		decodeWorkerMap:  make(map[string]*WorkerInfo),
+		ffnWorkerMap:     make(map[string]*WorkerInfo),
 		splitwise:        cfg.Server.Splitwise,
+		afd:              cfg.Server.AFD,
 	}
 	DefaultManager = manager
 	// Define a default timeout duration
@@ -67,6 +71,8 @@ func WorkerMapToList(ctx context.Context, workerType string) []string {
 		workerMap = DefaultManager.prefillWorkerMap
 	case "decode":
 		workerMap = DefaultManager.decodeWorkerMap
+	case "ffn":
+		workerMap = DefaultManager.ffnWorkerMap
 	default:
 		return []string{}
 	}
@@ -100,7 +106,8 @@ func (m *Manager) GetHealthyURLs(ctx context.Context) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	totalSeversLength := len(m.prefillWorkerMap) + len(m.decodeWorkerMap) + len(m.mixedWorkerMap)
+	totalSeversLength := len(m.prefillWorkerMap) + len(m.decodeWorkerMap) + len(m.mixedWorkerMap) +
+		len(m.ffnWorkerMap)
 	allServerURLs := make([]string, 0, totalSeversLength)
 
 	for id := range m.prefillWorkerMap {
@@ -110,6 +117,9 @@ func (m *Manager) GetHealthyURLs(ctx context.Context) []string {
 		allServerURLs = append(allServerURLs, id)
 	}
 	for id := range m.mixedWorkerMap {
+		allServerURLs = append(allServerURLs, id)
+	}
+	for id := range m.ffnWorkerMap {
 		allServerURLs = append(allServerURLs, id)
 	}
 	return allServerURLs
@@ -128,6 +138,7 @@ func SelectWorker(ctx context.Context, message string) (string, error) {
 	return selectedWorkerURL, nil
 }
 
+// SelectWorkerPair selects a prefill worker and a decode-side worker(decode worker in PD, attn worker in AFD).
 func SelectWorkerPair(ctx context.Context, message string) (string, string, error) {
 	selectWorkerMu.Lock()
 	defer selectWorkerMu.Unlock()
@@ -137,22 +148,22 @@ func SelectWorkerPair(ctx context.Context, message string) (string, string, erro
 	if len(prefillWorkers) == 0 || len(decodeWorkers) == 0 {
 		return "", "", nil
 	}
-	logger.Info(ctx,"before SelectWorker prefill. ts_ms=%s", time.Now().Format("2006-01-02 15:04:05.000"))
+	logger.Info(ctx, "before SelectWorker prefill. ts_ms=%s", time.Now().Format("2006-01-02 15:04:05.000"))
 	selectedPrefillWorkerURL, err := scheduler_handler.SelectWorker(ctx, prefillWorkers, message, "prefill")
 	if err != nil {
 		logger.Error(ctx, "Failed to select prefill worker: %v", err)
 		return "", "", err
 	}
-	logger.Info(ctx,"before SelectWorker decode, after prefill. ts_ms=%s", time.Now().Format("2006-01-02 15:04:05.000"))
+	logger.Info(ctx, "before SelectWorker decode, after prefill. ts_ms=%s", time.Now().Format("2006-01-02 15:04:05.000"))
 	selectedDecodeWorkerURL, err := scheduler_handler.SelectWorker(ctx, decodeWorkers, message, "decode")
 	if err != nil {
-		// Prefill counter was already incremented but decode failed;
+		// Prefill counter was already incremented but decode-side failed;
 		// release prefill counters here since CommonCompletions defer is not yet registered.
 		scheduler_handler.Release(ctx, selectedPrefillWorkerURL)
 		scheduler_handler.ReleasePrefillTokens(ctx, selectedPrefillWorkerURL, message)
 		logger.Info(ctx, "[SelectWorkerPair] decode selection failed, releasing prefill counter url=%s", selectedPrefillWorkerURL)
 		return "", "", err
 	}
-	logger.Info(ctx,"after SelectWorker decode, before return. ts_ms=%s", time.Now().Format("2006-01-02 15:04:05.000"))
+	logger.Info(ctx, "after SelectWorker decode, before return. ts_ms=%s", time.Now().Format("2006-01-02 15:04:05.000"))
 	return selectedPrefillWorkerURL, selectedDecodeWorkerURL, nil
 }

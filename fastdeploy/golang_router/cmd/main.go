@@ -20,11 +20,13 @@ func main() {
 		configPath  string
 		port        string
 		splitwise   bool
+		afd         bool
 		showVersion bool
 	)
 	flag.StringVar(&configPath, "config_path", "", "path to config file")
 	flag.StringVar(&port, "port", "", "listen port of router")
 	flag.BoolVar(&splitwise, "splitwise", false, "enable splitwise mode")
+	flag.BoolVar(&afd, "afd", false, "enable AFD mode (requires --splitwise)")
 	flag.BoolVar(&showVersion, "version", false, "print version info")
 	flag.BoolVar(&showVersion, "V", false, "print version info (shorthand)")
 	flag.Parse()
@@ -35,7 +37,7 @@ func main() {
 	}
 
 	// Load configuration
-	cfg, err := config.Load(configPath, port, splitwise)
+	cfg, err := config.Load(configPath, port, splitwise, afd)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}

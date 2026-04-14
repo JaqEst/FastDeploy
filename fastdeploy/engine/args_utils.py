@@ -307,6 +307,11 @@ class EngineArgs:
     Splitwise role: prefill, decode or mixed
     """
 
+    afd_role: Optional[str] = None
+    """
+    AFD role: attn, ffn, or None (disabled).
+    """
+
     data_parallel_size: int = 1
     """
     Number of data parallelism.
@@ -604,6 +609,16 @@ class EngineArgs:
                 raise ValueError(
                     f"When using {self.splitwise_role} role and the {self.scheduler_name} "
                     f"scheduler, please provide --router argument."
+                )
+
+        if self.afd_role is not None:
+            if self.afd_role not in ("attn", "ffn"):
+                raise ValueError(
+                    f"afd_role must be 'attn' or 'ffn', got: '{self.afd_role}'"
+                )
+            if self.splitwise_role != "decode":
+                raise ValueError(
+                    f"When afd_role is set to '{self.afd_role}', splitwise_role must be 'decode'"
                 )
 
         if not (
@@ -1219,6 +1234,13 @@ class EngineArgs:
             default=EngineArgs.splitwise_role,
             help="Role of splitwise. Default is \
             'mixed'. (prefill, decode, mixed)",
+        )
+
+        splitwise_group.add_argument(
+            "--afd-role",
+            type=str,
+            default=EngineArgs.afd_role,
+            help="Role of attn-ffn disaggregation. Default is None. (attn, ffn)",
         )
 
         splitwise_group.add_argument(

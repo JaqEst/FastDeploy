@@ -96,7 +96,8 @@ func GetAllServerURLs(ctx context.Context) []string {
 	DefaultManager.mu.RLock()
 	defer DefaultManager.mu.RUnlock()
 
-	totalSeversLength := len(DefaultManager.prefillWorkerMap) + len(DefaultManager.decodeWorkerMap)
+	totalSeversLength := len(DefaultManager.prefillWorkerMap) + len(DefaultManager.decodeWorkerMap) +
+		len(DefaultManager.ffnWorkerMap)
 	allServerURLs := make([]string, 0, totalSeversLength)
 
 	for _, server := range DefaultManager.prefillWorkerMap {
@@ -105,12 +106,16 @@ func GetAllServerURLs(ctx context.Context) []string {
 	for _, server := range DefaultManager.decodeWorkerMap {
 		allServerURLs = append(allServerURLs, server.Url)
 	}
+	for _, server := range DefaultManager.ffnWorkerMap {
+		allServerURLs = append(allServerURLs, server.Url)
+	}
 	return allServerURLs
 }
 
 func HealthGenerate(c *gin.Context) {
 	// The buffer size of this channel equals the total number of tasks, avoids goroutine blocking
-	results := make(chan healthCheckResult, len(DefaultManager.prefillWorkerMap)+len(DefaultManager.decodeWorkerMap))
+	results := make(chan healthCheckResult, len(DefaultManager.prefillWorkerMap)+len(DefaultManager.decodeWorkerMap)+
+		len(DefaultManager.ffnWorkerMap))
 	// Use WaitGroup to wait for all goroutines to complete sending results
 	var wg sync.WaitGroup
 
@@ -151,7 +156,7 @@ func HealthGenerate(c *gin.Context) {
 	})
 }
 
-func RemoveServers(ctx context.Context, prefillToRemove []string, decodeToRemove []string, mixedToRemove []string) {
+func RemoveServers(ctx context.Context, prefillToRemove []string, decodeToRemove []string, mixedToRemove []string, ffnToRemove []string) {
 	DefaultManager.mu.Lock()
 	defer DefaultManager.mu.Unlock()
 
@@ -164,7 +169,7 @@ func RemoveServers(ctx context.Context, prefillToRemove []string, decodeToRemove
 	for _, id := range decodeToRemove {
 		if worker, exists := DefaultManager.decodeWorkerMap[id]; exists {
 			delete(DefaultManager.decodeWorkerMap, id)
-			logger.Error(ctx, "Removed unhealthy decode instance: %s", worker.Url)
+			logger.Error(ctx, "Removed unhealthy %s instance: %s", worker.WorkerType, worker.Url)
 		}
 	}
 	for _, id := range mixedToRemove {
@@ -173,12 +178,18 @@ func RemoveServers(ctx context.Context, prefillToRemove []string, decodeToRemove
 			logger.Error(ctx, "Removed unhealthy mixed instance: %s", worker.Url)
 		}
 	}
+	for _, id := range ffnToRemove {
+		if worker, exists := DefaultManager.ffnWorkerMap[id]; exists {
+			delete(DefaultManager.ffnWorkerMap, id)
+			logger.Error(ctx, "Removed unhealthy ffn instance: %s", worker.Url)
+		}
+	}
 }
 
-func ReadServers(ctx context.Context) (prefillInstances, decodeInstances, mixedInstances []string) {
+func ReadServers(ctx context.Context) (prefillInstances, decodeInstances, mixedInstances, ffnInstances []string) {
 	if DefaultManager == nil {
-		logger.Debug(ctx, "Healthy instances: prefill=[], decode=[], mixed=[] (DefaultManager is nil)")
-		return []string{}, []string{}, []string{}
+		logger.Debug(ctx, "Healthy instances: prefill=[], decode=[], mixed=[], ffn=[] (DefaultManager is nil)")
+		return []string{}, []string{}, []string{}, []string{}
 	}
 
 	DefaultManager.mu.RLock()
@@ -188,6 +199,7 @@ func ReadServers(ctx context.Context) (prefillInstances, decodeInstances, mixedI
 	prefillInstances = make([]string, 0, len(DefaultManager.prefillWorkerMap))
 	decodeInstances = make([]string, 0, len(DefaultManager.decodeWorkerMap))
 	mixedInstances = make([]string, 0, len(DefaultManager.mixedWorkerMap))
+	ffnInstances = make([]string, 0, len(DefaultManager.ffnWorkerMap))
 
 	// Copy data to avoid holding lock for long time
 	for _, w := range DefaultManager.prefillWorkerMap {
@@ -199,13 +211,17 @@ func ReadServers(ctx context.Context) (prefillInstances, decodeInstances, mixedI
 	for _, w := range DefaultManager.mixedWorkerMap {
 		mixedInstances = append(mixedInstances, w.Url)
 	}
+	for _, w := range DefaultManager.ffnWorkerMap {
+		ffnInstances = append(ffnInstances, w.Url)
+	}
 	logger.Debug(ctx,
-		"Healthy instances: prefill=%v, decode=%v, mixed=%v",
+		"Healthy instances: prefill=%v, decode=%v, mixed=%v, ffn=%v",
 		prefillInstances,
 		decodeInstances,
 		mixedInstances,
+		ffnInstances,
 	)
-	return prefillInstances, decodeInstances, mixedInstances
+	return prefillInstances, decodeInstances, mixedInstances, ffnInstances
 }
 
 func MonitorInstanceHealthCore(ctx context.Context) {
@@ -240,7 +256,7 @@ func MonitorInstanceHealthCore(ctx context.Context) {
 		close(resultCh)
 	}()
 
-	var prefillToRemove, decodeToRemove, mixedToRemove []string
+	var prefillToRemove, decodeToRemove, mixedToRemove, ffnToRemove []string
 
 	for res := range resultCh {
 		if !res.isHealthy {
@@ -248,17 +264,19 @@ func MonitorInstanceHealthCore(ctx context.Context) {
 			switch res.worker.WorkerType {
 			case "prefill":
 				prefillToRemove = append(prefillToRemove, res.id)
-			case "decode":
+			case "decode", "attn":
 				decodeToRemove = append(decodeToRemove, res.id)
 			case "mixed":
 				mixedToRemove = append(mixedToRemove, res.id)
+			case "ffn":
+				ffnToRemove = append(ffnToRemove, res.id)
 			}
 			go scheduler_handler.CleanupUnhealthyCounter(ctx, res.id)
 		}
 	}
 
 	// Remove unhealthy instances
-	RemoveServers(ctx, prefillToRemove, decodeToRemove, mixedToRemove)
+	RemoveServers(ctx, prefillToRemove, decodeToRemove, mixedToRemove, ffnToRemove)
 
 	ReadServers(ctx)
 }

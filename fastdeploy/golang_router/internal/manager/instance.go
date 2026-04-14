@@ -16,9 +16,11 @@ const (
 	MIXED InstanceRole = iota
 	PREFILL
 	DECODE
+	ATTN
+	FFN
 )
 
-var roleNames = [...]string{"mixed", "prefill", "decode"}
+var roleNames = [...]string{"mixed", "prefill", "decode", "attn", "ffn"}
 
 func (r InstanceRole) String() string { return roleNames[r] }
 
@@ -41,7 +43,7 @@ type Role struct {
 func (r *Role) parse(getInt func() (int, error), getStr func() (string, error)) error {
 	r.IsSet = true
 	if i, err := getInt(); err == nil {
-		if i >= 0 && i <= int(DECODE) {
+		if i >= 0 && i <= int(FFN) {
 			r.EnumValue, r.IsCustom = InstanceRole(i), false
 			return nil
 		}

@@ -853,6 +853,7 @@ def parse_args():
         help="disable sequence parallel moe",
     )
     parser.add_argument("--splitwise_role", type=str, default="mixed", help="splitwise role")
+    parser.add_argument("--afd_role", type=str, default=None, help="AFD role: attn, ffn, or None (disabled)")
     parser.add_argument(
         "--tensor_parallel_size",
         type=int,

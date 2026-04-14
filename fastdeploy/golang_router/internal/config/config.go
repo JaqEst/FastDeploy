@@ -20,6 +20,7 @@ type ServerConfig struct {
 	Host      string `yaml:"host"`
 	Mode      string `yaml:"mode"` // debug, release, test
 	Splitwise bool   `yaml:"splitwise"`
+	AFD       bool   `yaml:"afd"`
 }
 
 type ManagerConfig struct {
@@ -53,7 +54,7 @@ type LogConfig struct {
 	Output string `yaml:"output"` // stdout, file
 }
 
-func Load(configPath, listenPort string, isSplitwise bool) (*Config, error) {
+func Load(configPath, listenPort string, isSplitwise bool, isEnableAFD bool) (*Config, error) {
 	var cfg Config
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
@@ -74,6 +75,12 @@ func Load(configPath, listenPort string, isSplitwise bool) (*Config, error) {
 	}
 	if isSplitwise {
 		cfg.Server.Splitwise = true
+	}
+	if isEnableAFD {
+		cfg.Server.AFD = true
+	}
+	if cfg.Server.AFD && !cfg.Server.Splitwise {
+		return nil, fmt.Errorf("AFD mode requires --splitwise to be enabled")
 	}
 	if cfg.Server.Mode == "" {
 		cfg.Server.Mode = "release"

@@ -2452,6 +2452,7 @@ class EngineService:
             f" --engine_pid {self.cfg.parallel_config.engine_worker_queue_port[0]}"
             f" --max_num_batched_tokens {self.cfg.scheduler_config.max_num_batched_tokens}"
             f" --splitwise_role {self.cfg.scheduler_config.splitwise_role}"
+            f" --afd_role {self.cfg.scheduler_config.afd_role}"
             f" --kv_cache_ratio {self.cfg.cache_config.kv_cache_ratio}"
             f" --expert_parallel_size {self.cfg.parallel_config.expert_parallel_size}"
             f" --chunked_moe_size {self.cfg.parallel_config.chunked_moe_size}"

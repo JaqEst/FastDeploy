@@ -2020,7 +2020,7 @@ class FDConfig:
         if test_mode:
             return
         self.check()
-        # self.print()    # NOTE: it's better to explicitly call .print() when FDConfig is initialized
+        self.print()    # NOTE: it's better to explicitly call .print() when FDConfig is initialized
 
     @property
     def enable_mm_runtime(self) -> bool:
@@ -2370,7 +2370,7 @@ class FDConfig:
             self.cache_config.cache_transfer_protocol.split(",") if self.cache_config.cache_transfer_protocol else []
         )
         self.register_info = {
-            "role": self.scheduler_config.splitwise_role,
+            "role": self.scheduler_config.afd_role if self.scheduler_config.afd_role is not None else self.scheduler_config.splitwise_role,
             "host_ip": self.host_ip,
             "port": port,
             "metrics_port": metrics_port,

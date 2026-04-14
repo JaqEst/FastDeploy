@@ -31,6 +31,16 @@ func GetSplitwise(ctx context.Context) bool {
 	return DefaultManager.splitwise
 }
 
+// GetAFD returns whether AFD mode is enabled.
+func GetAFD(ctx context.Context) bool {
+	if DefaultManager == nil {
+		return false
+	}
+	DefaultManager.mu.RLock()
+	defer DefaultManager.mu.RUnlock()
+	return DefaultManager.afd
+}
+
 func GetAllMapServers(ctx context.Context) map[string]*WorkerInfo {
 	if DefaultManager == nil {
 		return make(map[string]*WorkerInfo)
@@ -46,6 +56,9 @@ func GetAllMapServers(ctx context.Context) map[string]*WorkerInfo {
 		allServers[id] = workerInfo
 	}
 	for id, workerInfo := range DefaultManager.mixedWorkerMap {
+		allServers[id] = workerInfo
+	}
+	for id, workerInfo := range DefaultManager.ffnWorkerMap {
 		allServers[id] = workerInfo
 	}
 	return allServers
@@ -68,10 +81,15 @@ func getWorkerInfo(ctx context.Context, url string) *WorkerInfo {
 	if w, ok := DefaultManager.mixedWorkerMap[url]; ok {
 		return w
 	}
+	if w, ok := DefaultManager.ffnWorkerMap[url]; ok {
+		return w
+	}
 	return nil
 }
 
-// BuildDisaggregateInfo builds disaggregate_info structure
+// BuildDisaggregateInfo builds disaggregate_info structure.
+// In AFD mode, the decodeURL parameter actually points to an ATTN worker, but
+// the returned field names use "decode_*" to maintain API compatibility with the engine.
 func BuildDisaggregateInfo(ctx context.Context, prefillURL, decodeURL string) (map[string]any, error) {
 	prefillInfo := getWorkerInfo(ctx, prefillURL)
 	decodeInfo := getWorkerInfo(ctx, decodeURL)
@@ -158,18 +176,30 @@ func RegisterInstanceCore(ctx context.Context, rawInstance *InstanceInfo) error 
 	}
 
 	splitwiseMode := GetSplitwise(ctx)
+	afdMode := GetAFD(ctx)
 
 	instanceRole := instance.Role.EnumValue
-	if splitwiseMode && instanceRole == MIXED {
-		return fmt.Errorf("splitwise mode only supports PREFILL/DECODE instances")
+
+	if afdMode && (instanceRole == MIXED || instanceRole == DECODE) {
+		return fmt.Errorf("AFD mode only support PREFILL/ATTN/FFN instances")
 	}
+
+	if !afdMode && splitwiseMode {
+		if instanceRole == MIXED {
+			return fmt.Errorf("splitwise mode only supports PREFILL/DECODE instances")
+		}
+		if instanceRole == ATTN || instanceRole == FFN {
+			return fmt.Errorf("non-AFD splitwise mode does not support ATTN/FFN instances")
+		}
+	}
+
 	if !splitwiseMode && instanceRole != MIXED {
-		return fmt.Errorf("only MIXED instances are allowed")
+			return fmt.Errorf("only MIXED instances are allowed")
 	}
 
 	// Check instance health status
 	if !CheckWorkerHealth(ctx, instance.URL()) {
-		return fmt.Errorf("%s service is not healthy",instance.URL())
+		return fmt.Errorf("%s service is not healthy", instance.URL())
 	}
 
 	allServers := GetAllMapServers(ctx)
@@ -199,8 +229,10 @@ func RegisterInstanceCore(ctx context.Context, rawInstance *InstanceInfo) error 
 				delete(DefaultManager.mixedWorkerMap, id)
 			case PREFILL:
 				delete(DefaultManager.prefillWorkerMap, id)
-			case DECODE:
+			case DECODE, ATTN:
 				delete(DefaultManager.decodeWorkerMap, id)
+			case FFN:
+				delete(DefaultManager.ffnWorkerMap, id)
 			}
 		}
 	}
@@ -210,8 +242,10 @@ func RegisterInstanceCore(ctx context.Context, rawInstance *InstanceInfo) error 
 		DefaultManager.mixedWorkerMap[id] = workerInfo
 	case PREFILL:
 		DefaultManager.prefillWorkerMap[id] = workerInfo
-	case DECODE:
+	case DECODE, ATTN:
 		DefaultManager.decodeWorkerMap[id] = workerInfo
+	case FFN:
+		DefaultManager.ffnWorkerMap[id] = workerInfo
 	default:
 		logger.Warn(ctx, "Instance %s role is unknown", id)
 	}
@@ -305,10 +339,16 @@ func RegisteredNumber(c *gin.Context) {
 
 	DefaultManager.mu.RLock()
 	defer DefaultManager.mu.RUnlock()
+
+	decodeKey := "decode"
+	if DefaultManager.afd {
+		decodeKey = "attn"
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"mixed":   len(DefaultManager.mixedWorkerMap),
 		"prefill": len(DefaultManager.prefillWorkerMap),
-		"decode":  len(DefaultManager.decodeWorkerMap),
+		decodeKey: len(DefaultManager.decodeWorkerMap),
+		"ffn":     len(DefaultManager.ffnWorkerMap),
 	})
 }
 
@@ -316,10 +356,11 @@ func Registered(c *gin.Context) {
 	DefaultManager.mu.RLock()
 	defer DefaultManager.mu.RUnlock()
 
-	var prefillInstances, decodeInstances, mixedInstances []WorkerInfo
+	var prefillInstances, decodeInstances, mixedInstances, ffnInstances []WorkerInfo
 	decodeInstances = make([]WorkerInfo, 0)
 	prefillInstances = make([]WorkerInfo, 0)
 	mixedInstances = make([]WorkerInfo, 0)
+	ffnInstances = make([]WorkerInfo, 0)
 	for _, w := range DefaultManager.prefillWorkerMap {
 		prefillInstances = append(prefillInstances, *w)
 	}
@@ -329,11 +370,20 @@ func Registered(c *gin.Context) {
 	for _, w := range DefaultManager.mixedWorkerMap {
 		mixedInstances = append(mixedInstances, *w)
 	}
+	for _, w := range DefaultManager.ffnWorkerMap {
+		ffnInstances = append(ffnInstances, *w)
+	}
+
+	decodeKey := "decode"
+	if DefaultManager.afd {
+		decodeKey = "attn"
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"code":    http.StatusOK,
 		"msg":     "success",
-		"decode":  decodeInstances,
+		decodeKey: decodeInstances,
 		"prefill": prefillInstances,
 		"mixed":   mixedInstances,
+		"ffn":     ffnInstances,
 	})
 }

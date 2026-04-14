@@ -321,6 +321,7 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 	}
 
 	isSplitwise := manager.GetSplitwise(ctx)
+	isAFD := manager.GetAFD(ctx)
 
 	traceID := c.GetHeader("X_BD_LOGID")
 	if traceID != "" {
@@ -347,11 +348,18 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 	)
 
 	if isSplitwise {
+		decodeHeaderKey := "X-Router-Decode-URL"
+		noWorkerMsg := "No available prefill/decode workers"
+		if isAFD {
+			decodeHeaderKey = "X-Router-Attn-URL"
+			noWorkerMsg = "No available prefill/attn workers"
+		}
+
 		requestID = getRequestID(ctx, rawReq)
 		ctx = context.WithValue(ctx, logger.RequestIDKey, requestID)
 		c.Request = c.Request.WithContext(ctx)
 
-		// PD mode: select instances for Prefill/Decode separately
+		// select instances for Prefill and Decode/Attn separately
 		message = extractor(rawReq)
 
 		logger.Info(ctx, "Parsing completed; starting worker selection.")
@@ -364,11 +372,11 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 		}
 		if prefillURL == "" || decodeURL == "" {
 			c.Writer.WriteHeader(http.StatusServiceUnavailable)
-			c.Writer.Write([]byte(fmt.Sprintf(`{"error": "No available prefill/decode workers", "request_id": "%s"}`, requestID)))
+			c.Writer.Write([]byte(fmt.Sprintf(`{"error": "%s", "request_id": "%s"}`, noWorkerMsg, requestID)))
 			return
 		}
 
-		// Both prefill and decode counters are now incremented.
+		// Both prefill and decode-side counters are now incremented.
 		// Register defer to guarantee release on ALL subsequent paths.
 		releaseTargets = []string{decodeURL}
 		defer func() {
@@ -408,7 +416,7 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 
 		// Expose scheduling results to caller for debugging/validating scheduling strategy
 		c.Writer.Header().Set("X-Router-Prefill-URL", prefillURL)
-		c.Writer.Header().Set("X-Router-Decode-URL", decodeURL)
+		c.Writer.Header().Set(decodeHeaderKey, decodeURL)
 	} else {
 		logger.Info(ctx, "Parsing completed; starting worker selection.")
 		// Non-PD mode: use Mixed instance
