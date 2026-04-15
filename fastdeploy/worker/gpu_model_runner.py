@@ -2084,6 +2084,10 @@ class GPUModelRunner(ModelRunnerBase):
             intermediate_tensors:
             num_running_requests: batch_size
         """
+        if self.scheduler_config.afd_role == "ffn":
+            self.model(None, None)
+            return
+        
         if not self.enable_overlap_schedule:
             self.execute_model_normal(model_forward_batch, num_running_requests)
         else:

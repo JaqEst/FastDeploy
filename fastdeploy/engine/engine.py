@@ -99,6 +99,10 @@ class LLMEngine:
             self.do_profile = 1
         else:
             self.do_profile = 0
+        
+        if self.cfg.scheduler_config.afd_role == "ffn":
+            self.do_profile = 0
+        
         self._finalizer = weakref.finalize(self, self._exit_sub_services)
 
         main_process_metrics.set_cache_config_info(obj=self.cfg.cache_config)
@@ -144,7 +148,11 @@ class LLMEngine:
         self.data_processor = self.engine.data_processor
 
         # If block numer is specified and model is deployed in mixed mode, start cache manager first
-        if not self.do_profile and self.cfg.scheduler_config.splitwise_role != "mixed":
+        if (
+            not self.do_profile
+            and self.cfg.scheduler_config.splitwise_role != "mixed"
+            and self.cfg.scheduler_config.afd_role != "ffn"
+        ):
             if not current_platform.is_intel_hpu():
                 device_ids = self.cfg.parallel_config.device_ids.split(",")
                 self.cache_manager_processes = self.engine.start_cache_service(device_ids, self.ipc_signal_suffix)
@@ -764,7 +772,10 @@ class LLMEngine:
         num_gpu_blocks = self.get_profile_block_num_signal.value[0]
         self.cfg.cache_config.reset(num_gpu_blocks)
         self.engine.resource_manager.reset_cache_config(self.cfg.cache_config)
-        if self.cfg.cache_config.enable_prefix_caching or self.cfg.scheduler_config.splitwise_role != "mixed":
+        if (
+            self.cfg.scheduler_config.afd_role != "ffn"
+            and (self.cfg.cache_config.enable_prefix_caching or self.cfg.scheduler_config.splitwise_role != "mixed")
+        ):
             if not current_platform.is_intel_hpu():
                 device_ids = self.cfg.parallel_config.device_ids.split(",")
                 self.cache_manager_processes = self.engine.start_cache_service(device_ids, self.ipc_signal_suffix)

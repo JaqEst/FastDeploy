@@ -230,6 +230,10 @@ class GpuWorker(WorkerBase):
         | Static Full Graph (full=True)     | Dynamic                  | Static + CUDAGraph       |
         | Static Split Graph (full=False)   | Static + CUDAGraph       | Dynamic + CUDAGraph      |
         """
+        if self.fd_config.scheduler_config.afd_role == "ffn":
+            logger.info("Skip graph warmup/cudagraph capture for AFD FFN worker.")
+            return
+
         if self.fd_config.graph_opt_config.graph_opt_level >= 1 and not self.model_runner.use_cudagraph:
             self.model_runner.sot_warmup()
         if self.fd_config.graph_opt_config.graph_opt_level >= 1:

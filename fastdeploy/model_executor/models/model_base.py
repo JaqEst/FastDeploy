@@ -22,6 +22,7 @@ from paddle import nn
 from paddleformers.transformers import PretrainedModel
 
 from fastdeploy.config import (
+    FDConfig,
     ModelConfig,
     iter_architecture_defaults,
     try_match_architecture_defaults,
@@ -114,6 +115,10 @@ class ModelRegistry:
     _arch_to_model_cls = {}
     _arch_to_pretrained_model_cls = {}
     _enhanced_models: Dict[str, Dict] = {}
+    _afd_role_to_suffix = {
+        "attn": "_AFDAttn",
+        "ffn": "_AFDFFN",
+    }
 
     def __init__(self):
         self.models: Dict[str, BaseRegisteredModel] = {}
@@ -360,6 +365,19 @@ class ModelRegistry:
         if name not in cls._arch_to_model_cls:
             raise ValueError(f"Model '{name}' is not registered!")
         return cls._arch_to_model_cls[name]
+
+    @classmethod
+    def resolve_runtime_architecture(cls, architecture: str, fd_config: FDConfig) -> str:
+        scheduler_config = getattr(fd_config, "scheduler_config", None)
+        afd_role = getattr(scheduler_config, "afd_role", None)
+        afd_suffix = cls._afd_role_to_suffix.get(afd_role)
+        if afd_suffix is None:
+            return architecture
+
+        runtime_architecture = f"{architecture}{afd_suffix}"
+        if runtime_architecture in cls._arch_to_model_cls:
+            return runtime_architecture
+        return architecture
 
     @classmethod
     def get_pretrain_cls(cls, architectures: str):

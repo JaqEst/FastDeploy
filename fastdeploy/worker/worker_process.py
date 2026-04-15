@@ -658,6 +658,10 @@ class PaddleDisWorkerProc:
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if self.scheduler_config.afd_role == "ffn":
+            logger.info("Skip KV cache initialization/profile for AFD FFN worker.")
+            return
+
         if self.fd_config.parallel_config.do_profile:
             # 1. Get available memory(bytes)
             available_kv_cache_memory = self.worker.determine_available_memory()

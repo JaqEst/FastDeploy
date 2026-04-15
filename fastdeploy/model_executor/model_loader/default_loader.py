@@ -67,6 +67,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def load_model(self, fd_config: FDConfig) -> nn.Layer:
         architectures = fd_config.model_config.architectures[0]
+        architectures = ModelRegistry.resolve_runtime_architecture(architectures, fd_config)
         logger.info(f"Starting to load model {architectures}")
         if fd_config.load_config.dynamic_load_weight:
             # register rl model

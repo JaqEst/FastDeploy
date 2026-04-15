@@ -233,6 +233,10 @@ class EngineService:
             # Add worker management attributes
             self.worker_proc = None
             self.do_profile = 1 if self.cfg.cache_config.num_gpu_blocks_override is None else 0
+            
+            if self.cfg.scheduler_config.afd_role == "ffn":
+                self.do_profile = 0
+                
             self.ipc_signal_suffix = None
             self.cache_manager_processes = None
 
@@ -272,7 +276,11 @@ class EngineService:
         self.launch_components()
 
         # If block number is specified and model is deployed in splitwise mode, start cache manager first
-        if not self.do_profile and self.cfg.scheduler_config.splitwise_role != "mixed":
+        if (
+            not self.do_profile
+            and self.cfg.scheduler_config.splitwise_role != "mixed"
+            and self.cfg.scheduler_config.afd_role != "ffn"
+        ):
             device_ids = self.cfg.parallel_config.device_ids.split(",")
             self.cache_manager_processes = self.start_cache_service(device_ids, self.ipc_signal_suffix)
 
@@ -2542,7 +2550,10 @@ class EngineService:
         num_gpu_blocks = self.get_profile_block_num_signal.value[0]
         self.cfg.cache_config.reset(num_gpu_blocks)
         self.resource_manager.reset_cache_config(self.cfg.cache_config)
-        if self.cfg.cache_config.enable_prefix_caching or self.cfg.scheduler_config.splitwise_role != "mixed":
+        if (
+            self.cfg.scheduler_config.afd_role != "ffn"
+            and (self.cfg.cache_config.enable_prefix_caching or self.cfg.scheduler_config.splitwise_role != "mixed")
+        ):
             device_ids = self.cfg.parallel_config.device_ids.split(",")
             self.cache_manager_processes = self.start_cache_service(device_ids, self.ipc_signal_suffix)
 

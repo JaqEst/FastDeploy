@@ -73,6 +73,7 @@ class DummyModelLoader(BaseModelLoader):
     def load_model(self, fd_config: FDConfig) -> nn.Layer:
         start_dummy_weight_time = time.time()
         architectures = fd_config.model_config.architectures[0]
+        architectures = ModelRegistry.resolve_runtime_architecture(architectures, fd_config)
         context = paddle.LazyGuard()
         if fd_config.load_config.dynamic_load_weight:
             import fastdeploy.rl  # noqa
