@@ -1431,7 +1431,7 @@ class GPUModelRunner(ModelRunnerBase):
             indexer_cache_shape = []
         if kv_cache_quant_type == "block_wise_fp8":
             kv_cache_scale_shape = [key_cache_shape[0], key_cache_shape[1], key_cache_shape[2]]
-        local_rank = self.local_rank % self.parallel_config.tensor_parallel_size
+        tp_rank = self.parallel_config.tensor_parallel_rank
 
         # Check if gpu runner needs to create kv cache
         # 1. During profiling, it creates its own kv cache.
@@ -1445,7 +1445,7 @@ class GPUModelRunner(ModelRunnerBase):
         cache_ready_signal = self.cache_ready_signal
         if not create_cache_tensor:
             logger.info(f"Waiting for cache managers to create kv cache.. {cache_ready_signal.value}")
-            while cache_ready_signal.value[local_rank] != 1:
+            while cache_ready_signal.value[tp_rank] != 1:
                 time.sleep(1)
             logger.info(f"OK! Stop waiting. {cache_ready_signal.value}")
 
@@ -1454,13 +1454,13 @@ class GPUModelRunner(ModelRunnerBase):
 
         for i in range(self.model_config.num_hidden_layers):
             # init key cache
-            key_cache_name = f"key_caches_{i}_rank{local_rank}.device{self.device_id}"
-            key_cache_scales_name = f"key_cache_scales_{i}_rank{local_rank}.device{self.device_id}"
+            key_cache_name = f"key_caches_{i}_rank{tp_rank}.device{self.device_id}"
+            key_cache_scales_name = f"key_cache_scales_{i}_rank{tp_rank}.device{self.device_id}"
             if value_cache_shape:
-                val_cache_name = f"value_caches_{i}_rank{local_rank}.device{self.device_id}"
-                value_cache_scales_name = f"value_cache_scales_{i}_rank{local_rank}.device{self.device_id}"
+                val_cache_name = f"value_caches_{i}_rank{tp_rank}.device{self.device_id}"
+                value_cache_scales_name = f"value_cache_scales_{i}_rank{tp_rank}.device{self.device_id}"
             elif indexer_cache_shape:
-                indexer_cache_name = f"indexer_caches_{i}_rank{local_rank}.device{self.device_id}"
+                indexer_cache_name = f"indexer_caches_{i}_rank{tp_rank}.device{self.device_id}"
             if create_cache_tensor:
                 logger.info(
                     f"..creating kv cache for layer {i}: key:{key_cache_shape}, value:{value_cache_shape}, indexer:{indexer_cache_shape}"
@@ -1533,7 +1533,7 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["caches"] = cache_kvs_list
 
         if not profile and create_cache_tensor:
-            cache_ready_signal.value[local_rank] = 1
+            cache_ready_signal.value[tp_rank] = 1
             logger.info(f"✅ kv cache is ready! {cache_ready_signal.value}")
 
         paddle.device.cuda.empty_cache()
@@ -1705,6 +1705,10 @@ class GPUModelRunner(ModelRunnerBase):
     ) -> paddle.Tensor:
         logits = self.model.compute_logits(hidden_states, self.forward_meta)
 
+        broadcast_src = self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size
+        if self.fd_config.afd_config.enable_afd:
+            broadcast_src = self.fd_config.afd_config.afd_node_srank
+            
         if not self.speculative_decoding:
             set_value_by_flags_and_idx(
                 self.share_inputs["token_ids_all"],
@@ -1720,7 +1724,7 @@ class GPUModelRunner(ModelRunnerBase):
             if self.parallel_config.tensor_parallel_size > 1:
                 paddle.distributed.broadcast(
                     sampler_output.sampled_token_ids,
-                    self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                    broadcast_src,
                     group=self.parallel_config.tp_group,
                 )
         else:
@@ -1737,22 +1741,22 @@ class GPUModelRunner(ModelRunnerBase):
             if self.parallel_config.tensor_parallel_size > 1:
                 paddle.distributed.broadcast(
                     self.share_inputs["accept_tokens"],
-                    self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                    broadcast_src,
                     group=self.parallel_config.tp_group,
                 )
                 paddle.distributed.broadcast(
                     self.share_inputs["accept_num"],
-                    self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                    broadcast_src,
                     group=self.parallel_config.tp_group,
                 )
                 paddle.distributed.broadcast(
                     self.share_inputs["step_idx"],
-                    self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                    broadcast_src,
                     group=self.parallel_config.tp_group,
                 )
                 paddle.distributed.broadcast(
                     self.share_inputs["stop_flags"],
-                    self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                    broadcast_src,
                     group=self.parallel_config.tp_group,
                 )
         # 5. post process
@@ -2084,7 +2088,7 @@ class GPUModelRunner(ModelRunnerBase):
             intermediate_tensors:
             num_running_requests: batch_size
         """
-        if self.scheduler_config.afd_role == "ffn":
+        if self.fd_config.afd_config.afd_role == "ffn":
             self.model(None, None)
             return
         
@@ -2314,6 +2318,10 @@ class GPUModelRunner(ModelRunnerBase):
                 self.deterministic_logger.log_tensor_md5s(
                     {"logits": logits}, forward_batch_reqs_list=self.forward_batch_reqs_list, stage="logits"
                 )
+            
+            broadcast_src = self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size
+            if self.fd_config.afd_config.enable_afd:
+                broadcast_src = self.fd_config.afd_config.afd_node_srank
 
             if not self.speculative_decoding:
                 set_value_by_flags_and_idx(
@@ -2355,7 +2363,7 @@ class GPUModelRunner(ModelRunnerBase):
                 if self.parallel_config.tensor_parallel_size > 1:
                     paddle.distributed.broadcast(
                         sampler_output.sampled_token_ids,
-                        self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                        broadcast_src,
                         group=self.parallel_config.tp_group,
                     )
             else:
@@ -2370,22 +2378,22 @@ class GPUModelRunner(ModelRunnerBase):
                 if self.parallel_config.tensor_parallel_size > 1:
                     paddle.distributed.broadcast(
                         self.share_inputs["accept_tokens"],
-                        self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                        broadcast_src,
                         group=self.parallel_config.tp_group,
                     )
                     paddle.distributed.broadcast(
                         self.share_inputs["accept_num"],
-                        self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                        broadcast_src,
                         group=self.parallel_config.tp_group,
                     )
                     paddle.distributed.broadcast(
                         self.share_inputs["step_idx"],
-                        self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                        broadcast_src,
                         group=self.parallel_config.tp_group,
                     )
                     paddle.distributed.broadcast(
                         self.share_inputs["stop_flags"],
-                        self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size,
+                        broadcast_src,
                         group=self.parallel_config.tp_group,
                     )
             # 5. Post Process
@@ -2716,12 +2724,12 @@ class GPUModelRunner(ModelRunnerBase):
             or self.fd_config.cache_config.kvcache_storage_backend
             or self.fd_config.scheduler_config.splitwise_role != "mixed"
         )
-        local_rank = self.local_rank % self.parallel_config.tensor_parallel_size
+        tp_rank = self.parallel_config.tensor_parallel_rank
 
         if not create_cache_tensor:
             for name, tensor in self.cache_kvs_map.items():
                 unset_data_ipc(tensor, name, True, False)
-            self.cache_ready_signal.value[local_rank] = 0
+            self.cache_ready_signal.value[tp_rank] = 0
         self.cache_kvs_map.clear()
         self.share_inputs.pop("caches", None)
         if self.forward_meta is not None:

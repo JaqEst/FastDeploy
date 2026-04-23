@@ -100,7 +100,7 @@ class LLMEngine:
         else:
             self.do_profile = 0
         
-        if self.cfg.scheduler_config.afd_role == "ffn":
+        if self.cfg.afd_config.afd_role == "ffn":
             self.do_profile = 0
         
         self._finalizer = weakref.finalize(self, self._exit_sub_services)
@@ -151,7 +151,7 @@ class LLMEngine:
         if (
             not self.do_profile
             and self.cfg.scheduler_config.splitwise_role != "mixed"
-            and self.cfg.scheduler_config.afd_role != "ffn"
+            and self.cfg.afd_config.afd_role != "ffn"
         ):
             if not current_platform.is_intel_hpu():
                 device_ids = self.cfg.parallel_config.device_ids.split(",")
@@ -602,7 +602,6 @@ class LLMEngine:
             f" --engine_pid {self.cfg.parallel_config.engine_worker_queue_port[0]}"
             f" --max_num_batched_tokens {self.cfg.scheduler_config.max_num_batched_tokens}"
             f" --splitwise_role {self.cfg.scheduler_config.splitwise_role}"
-            f" --afd_role {self.cfg.scheduler_config.afd_role}"
             f" --kv_cache_ratio {self.cfg.cache_config.kv_cache_ratio}"
             f" --expert_parallel_size {self.cfg.parallel_config.expert_parallel_size}"
             f" --chunked_moe_size {self.cfg.parallel_config.chunked_moe_size}"
@@ -624,7 +623,6 @@ class LLMEngine:
             f" --load_choices {self.cfg.load_config.load_choices}"
             f" --model_loader_extra_config '{json.dumps(self.cfg.load_config.model_loader_extra_config)}'"
             f" --plas_attention_config '{self.cfg.plas_attention_config.to_json_string()}'"
-            f" --ips {ips}"
             f" --max_encoder_cache {self.cfg.cache_config.max_encoder_cache}"
             f" --cache-transfer-protocol {self.cfg.cache_config.cache_transfer_protocol}"
             f" --runner {self.cfg.model_config.runner}"
@@ -670,6 +668,17 @@ class LLMEngine:
             if value:
                 arguments = arguments + f" --{worker_flag}"
 
+        if self.cfg.afd_config.enable_afd:
+            arguments += f" --afd_role {self.cfg.afd_config.afd_role}"
+            if self.cfg.afd_config.afd_master is not None:
+                arguments += (
+                    f" --afd_master {self.cfg.afd_config.afd_master}"
+                    f" --afd_nnodes {self.cfg.afd_config.afd_nnodes}"
+                    f" --afd_nnode_rank {self.cfg.afd_config.afd_nnode_rank}"
+                )
+        if ips is not None:
+            arguments += f" --ips {ips}"
+
         worker_default_none_flag = {
             "num_gpu_blocks_override": self.cfg.cache_config.num_gpu_blocks_override,
             "kvcache_storage_backend": self.cfg.cache_config.kvcache_storage_backend,
@@ -678,7 +687,14 @@ class LLMEngine:
             if value:
                 arguments = arguments + f" --{worker_flag} {value}"
 
-        if self.cfg.nnode > 1:
+        if self.cfg.afd_config.enable_afd:
+            pd_cmd = (
+                pd_cmd
+                + f" --master {self.cfg.afd_config.afd_master}"
+                + f" --nnodes {self.cfg.afd_config.afd_nnodes}"
+                + f" --rank {self.cfg.afd_config.afd_nnode_rank}"
+            )
+        elif self.cfg.nnode > 1:
             pd_cmd = pd_cmd + f" --ips {ips} --nnodes {len(self.cfg.ips)}"
         pd_cmd = pd_cmd + arguments + f" 2>{log_dir}/launch_worker.log"
         llm_logger.info(f"Launch worker service command: {pd_cmd}")
@@ -773,7 +789,7 @@ class LLMEngine:
         self.cfg.cache_config.reset(num_gpu_blocks)
         self.engine.resource_manager.reset_cache_config(self.cfg.cache_config)
         if (
-            self.cfg.scheduler_config.afd_role != "ffn"
+            self.cfg.afd_config.afd_role != "ffn"
             and (self.cfg.cache_config.enable_prefix_caching or self.cfg.scheduler_config.splitwise_role != "mixed")
         ):
             if not current_platform.is_intel_hpu():

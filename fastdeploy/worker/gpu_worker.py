@@ -63,7 +63,8 @@ class GpuWorker(WorkerBase):
         if self.device_config.device_type == "cuda" and paddle.device.is_compiled_with_cuda():
             # Set environment variable
             self.device_ids = self.parallel_config.device_ids.split(",")
-            self.device = f"gpu:{self.local_rank % self.max_chips_per_node}"
+            local_device = self.local_rank % len(self.device_ids)
+            self.device = f"gpu:{local_device}"
             paddle.device.set_device(self.device)
             paddle.set_default_dtype(self.model_config.dtype)
 
@@ -88,7 +89,7 @@ class GpuWorker(WorkerBase):
         self.model_runner: ModelRunnerBase = ModelRunner(
             fd_config=self.fd_config,
             device=self.device,
-            device_id=int(self.device_ids[self.local_rank % self.max_chips_per_node]),
+            device_id=int(self.device_ids[local_device]),
             rank=self.rank,
             local_rank=self.local_rank,
         )
@@ -115,14 +116,14 @@ class GpuWorker(WorkerBase):
         # 1. Record memory state before profile run
         start_time = time.perf_counter()
         Gb = 1024**3
-        local_rank = self.local_rank % self.max_chips_per_node
-        paddle.device.cuda.reset_max_memory_reserved(local_rank)
-        paddle.device.cuda.reset_max_memory_allocated(local_rank)
-        paddle_reserved_mem_before_run = paddle.device.cuda.max_memory_reserved(local_rank)
-        paddle_allocated_mem_before_run = paddle.device.cuda.max_memory_allocated(local_rank)  # not reserved
+        local_device = self.local_rank % len(self.parallel_config.device_ids.split(","))
+        paddle.device.cuda.reset_max_memory_reserved(local_device)
+        paddle.device.cuda.reset_max_memory_allocated(local_device)
+        paddle_reserved_mem_before_run = paddle.device.cuda.max_memory_reserved(local_device)
+        paddle_allocated_mem_before_run = paddle.device.cuda.max_memory_allocated(local_device)  # not reserved
 
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_ids[local_rank]))
+        handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_ids[local_device]))
         before_run_meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
         logger.info(
@@ -139,8 +140,8 @@ class GpuWorker(WorkerBase):
         set_random_seed(self.fd_config.model_config.seed)
 
         # 3. Statistical memory information
-        paddle_reserved_mem_after_run = paddle.device.cuda.max_memory_reserved(local_rank)
-        paddle_allocated_mem_after_run = paddle.device.cuda.max_memory_allocated(local_rank)
+        paddle_reserved_mem_after_run = paddle.device.cuda.max_memory_reserved(local_device)
+        paddle_allocated_mem_after_run = paddle.device.cuda.max_memory_allocated(local_device)
 
         model_block_memory_used = self.cal_theortical_kvcache()
         paddle_peak_increase = paddle_allocated_mem_after_run - paddle_allocated_mem_before_run
@@ -230,8 +231,12 @@ class GpuWorker(WorkerBase):
         | Static Full Graph (full=True)     | Dynamic                  | Static + CUDAGraph       |
         | Static Split Graph (full=False)   | Static + CUDAGraph       | Dynamic + CUDAGraph      |
         """
-        if self.fd_config.scheduler_config.afd_role == "ffn":
-            logger.info("Skip graph warmup/cudagraph capture for AFD FFN worker.")
+        if self.fd_config.afd_config.afd_role == "ffn":
+            logger.info(
+                "Skip standalone graph warmup for AFD FFN worker. "
+                "FFN graph capture/replay is driven by the AFD participant loop "
+                "so its DeepEP collectives stay aligned with ATTN workers."
+            )
             return
 
         if self.fd_config.graph_opt_config.graph_opt_level >= 1 and not self.model_runner.use_cudagraph:
@@ -243,6 +248,7 @@ class GpuWorker(WorkerBase):
         if (
             self.fd_config.graph_opt_config.graph_opt_level >= 1
             and not self.fd_config.graph_opt_config.full_cuda_graph
+            and not self.fd_config.afd_config.enable_afd
         ):
             self.model_runner.capture_model_prefill_and_mixed()
 

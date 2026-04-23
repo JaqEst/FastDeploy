@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastdeploy import envs
 from fastdeploy.config import (
+    AFDConfig,
     CacheConfig,
     ConvertOption,
     DeployModality,
@@ -305,6 +306,21 @@ class EngineArgs:
     splitwise_role: str = "mixed"
     """
     Splitwise role: prefill, decode or mixed
+    """
+
+    afd_master: Optional[str] = None
+    """
+    Paddle launcher master endpoint for instance-level AFD world, e.g. 10.0.0.1:29500.
+    """
+
+    afd_nnodes: int = 1
+    """
+    Number of api_server instances participating in the AFD world.
+    """
+
+    afd_nnode_rank: int = 0
+    """
+    Rank of the current api_server instance in the AFD world.
     """
 
     afd_role: Optional[str] = None
@@ -613,12 +629,20 @@ class EngineArgs:
 
         if self.afd_role is not None:
             if self.afd_role not in ("attn", "ffn"):
-                raise ValueError(
-                    f"afd_role must be 'attn' or 'ffn', got: '{self.afd_role}'"
-                )
+                raise ValueError(f"afd_role must be 'attn' or 'ffn', got: '{self.afd_role}'")
             if self.splitwise_role != "decode":
+                raise ValueError(f"When afd_role is set to '{self.afd_role}', splitwise_role must be 'decode'")
+            if self.afd_master is None:
+                raise ValueError("afd_master must be set when afd_role is enabled")
+            if self.afd_nnodes is None:
+                raise ValueError("afd_nnodes must be set when afd_role is enabled")
+            if self.afd_nnode_rank is None:
+                raise ValueError("afd_nnode_rank must be set when afd_role is enabled")
+            if self.afd_nnodes < 1:
+                raise ValueError(f"afd_nnodes must be >= 1, got {self.afd_nnodes}")
+            if self.afd_nnode_rank < 0 or self.afd_nnode_rank >= self.afd_nnodes:
                 raise ValueError(
-                    f"When afd_role is set to '{self.afd_role}', splitwise_role must be 'decode'"
+                    f"afd_nnode_rank must be in [0, {self.afd_nnodes}), got {self.afd_nnode_rank}"
                 )
 
         if not (
@@ -1237,17 +1261,36 @@ class EngineArgs:
         )
 
         splitwise_group.add_argument(
-            "--afd-role",
-            type=str,
-            default=EngineArgs.afd_role,
-            help="Role of attn-ffn disaggregation. Default is None. (attn, ffn)",
-        )
-
-        splitwise_group.add_argument(
             "--cache-transfer-protocol",
             type=str,
             default=EngineArgs.cache_transfer_protocol,
             help="support protocol list (ipc or rdma), comma separated, default is ipc",
+        )
+
+        afd_group = parser.add_argument_group("AFD Configuration")
+        afd_group.add_argument(
+            "--afd-role",
+            type=str,
+            default=EngineArgs.afd_role,
+            help="Role of AFD. Default is None. (attn, ffn)",
+        )
+        afd_group.add_argument(
+            "--afd-master",
+            type=str,
+            default=EngineArgs.afd_master,
+            help="Paddle launcher master endpoint for instance-level AFD world.",
+        )
+        afd_group.add_argument(
+            "--afd-nnodes",
+            type=int,
+            default=EngineArgs.afd_nnodes,
+            help="Number of api_server instances in the AFD world.",
+        )
+        afd_group.add_argument(
+            "--afd-nnode-rank",
+            type=int,
+            default=EngineArgs.afd_nnode_rank,
+            help="Current api_server instance rank in the AFD world.",
         )
 
         splitwise_group.add_argument(
@@ -1541,6 +1584,7 @@ class EngineArgs:
         eplb_cfg = self.create_eplb_config()
         routing_replay_config = self.create_routing_repaly_config()
         router_config = RouterConfig(all_dict)
+        afd_config = AFDConfig(all_dict)
 
         early_stop_cfg = self.create_early_stop_config()
         early_stop_cfg.update_enable_early_stop(self.enable_early_stop)
@@ -1549,6 +1593,7 @@ class EngineArgs:
         return FDConfig(
             model_config=model_cfg,
             scheduler_config=scheduler_cfg,
+            afd_config=afd_config,
             tokenizer=self.tokenizer,
             cache_config=cache_cfg,
             load_config=load_cfg,

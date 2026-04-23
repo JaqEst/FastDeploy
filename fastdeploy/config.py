@@ -632,6 +632,7 @@ class ParallelConfig:
     def __init__(
         self,
         args,
+        world_size: Optional[int] = None
     ):
         self.sequence_parallel = False  # Whether to enable sequence parallelism.
         self.use_ep = False  # Whether to enable Expert Parallelism
@@ -682,6 +683,10 @@ class ParallelConfig:
             self.expert_parallel_size = self.data_parallel_size * self.tensor_parallel_size
         else:
             self.expert_parallel_size = 1
+
+        if args.get("afd_role") is not None and world_size is not None:
+            self.enable_expert_parallel = True
+            self.expert_parallel_size = world_size
         self.use_ep = self.expert_parallel_size > 1
 
         if self.shutdown_comm_group_if_worker_idle is None:
@@ -713,22 +718,36 @@ class ParallelConfig:
         )
         logger.info(f"use_sequence_parallel_moe: {self.use_sequence_parallel_moe}")
 
-    def set_communicate_group(self):
+    def set_communicate_group(self, afd_config: AFDConfig=None):
         # different tp group id
         # prevent different tp_groups using the same group_id
         tp_gid_offset = envs.FD_TP_GROUP_GID_OFFSET
-        dist.collective._set_custom_gid(self.data_parallel_rank + tp_gid_offset)
-
-        self.tp_group = dist.new_group(
-            range(
+        if afd_config is not None and afd_config.enable_afd:
+            if afd_config.afd_node_srank is None:
+                raise ValueError("afd_node_srank must be set before creating AFD tp_group")
+            tp_group_ranks = range(
+                afd_config.afd_node_srank,
+                afd_config.afd_node_srank + self.tensor_parallel_size,
+            )
+            tp_group_gid = afd_config.afd_nnode_rank + tp_gid_offset
+        else:
+            tp_group_ranks = range(
                 self.data_parallel_rank * self.tensor_parallel_size,
                 (self.data_parallel_rank + 1) * self.tensor_parallel_size,
             )
-        )
+            tp_group_gid = self.data_parallel_rank + tp_gid_offset
+
+        dist.collective._set_custom_gid(tp_group_gid)
+        self.tp_group = dist.new_group(tp_group_ranks)
         dist.collective._set_custom_gid(None)
         # same ep group id
         if self.enable_expert_parallel:
-            dist.collective._set_custom_gid(self.data_parallel_size + tp_gid_offset)
+            ep_group_gid = (
+                afd_config.afd_nnodes + tp_gid_offset
+                if afd_config is not None and afd_config.enable_afd
+                else self.data_parallel_size + tp_gid_offset
+            )
+            dist.collective._set_custom_gid(ep_group_gid)
             self.ep_group = dist.new_group(range(self.expert_parallel_size))
             dist.collective._set_custom_gid(None)
         logger.info(
@@ -741,6 +760,38 @@ class ParallelConfig:
 
         """
         logger.info("Parallel Configuration Information :")
+        for k, v in self.__dict__.items():
+            logger.info("{:<20}:{:<6}{}".format(k, "", v))
+        logger.info("=============================================================")
+
+
+class AFDConfig:
+    """
+    Configuration for AFD.
+    """
+
+    def __init__(
+        self,
+        args,
+        afd_node_srank: int = 0,
+    ):
+        self.afd_role = None
+        self.afd_master = None
+        self.afd_nnodes: int = 1
+        self.afd_nnode_rank: int = 0
+        self.afd_node_srank: int = afd_node_srank
+
+        if args is not None:
+            for key, value in args.items():
+                if hasattr(self, key) and value != "None":
+                    setattr(self, key, value)
+
+    @property
+    def enable_afd(self) -> bool:
+        return self.afd_role is not None
+
+    def print(self):
+        logger.info("AFD Configuration Information :")
         for k, v in self.__dict__.items():
             logger.info("{:<20}:{:<6}{}".format(k, "", v))
         logger.info("=============================================================")
@@ -1882,6 +1933,7 @@ class FDConfig:
         eplb_config: EPLBConfig = None,
         structured_outputs_config: StructuredOutputsConfig = None,
         router_config: RouterConfig = None,
+        afd_config: AFDConfig = None,
         tokenizer: str = None,
         ips: str = None,
         use_warmup: bool = False,
@@ -1912,6 +1964,7 @@ class FDConfig:
         self.router_config: RouterConfig = router_config
         self.routing_replay_config = routing_replay_config
         self.deploy_modality: DeployModality = deploy_modality
+        self.afd_config: AFDConfig = afd_config
         # Initialize cuda graph capture list
         max_capture_shape = self.scheduler_config.max_num_seqs
         if self.graph_opt_config.cudagraph_only_prefill:
@@ -1955,7 +2008,10 @@ class FDConfig:
 
         self.host_ip = get_host_ip()
 
-        if self.ips is None:
+        if self.afd_config.enable_afd and self.afd_config.afd_master is not None:
+            self.nnode = self.afd_config.afd_nnodes
+            self.node_rank = self.afd_config.afd_nnode_rank
+        elif self.ips is None:
             self.nnode = 1
             self.node_rank = 0
         else:
@@ -1990,7 +2046,12 @@ class FDConfig:
 
         num_ranks = self.parallel_config.tensor_parallel_size * self.parallel_config.data_parallel_size
         self.max_chips_per_node = 16 if current_platform.is_iluvatar() else 8
-        if num_ranks > self.max_chips_per_node and self.load_config and self.load_config.load_strategy != "meta":
+        if (
+            not self.afd_config.enable_afd
+            and num_ranks > self.max_chips_per_node
+            and self.load_config
+            and self.load_config.load_strategy != "meta"
+        ):
             self.worker_num_per_node = self.max_chips_per_node
             nnode = ceil_div(num_ranks, self.worker_num_per_node)
             assert nnode == self.nnode, f"nnode: {nnode}, but got {self.nnode}"
@@ -2053,7 +2114,10 @@ class FDConfig:
             # The first moe layer id of GLM4.5 model
             self.model_config.moe_layer_start_index = self.model_config.first_k_dense_replace
 
-        if self.parallel_config.tensor_parallel_size <= self.worker_num_per_node or self.node_rank == 0:
+        if self.afd_config.enable_afd and self.afd_config.afd_master is not None:
+            self.is_master = self.node_rank == 0
+            self.master_ip = self.afd_config.afd_master.split(":")[0]
+        elif self.parallel_config.tensor_parallel_size <= self.worker_num_per_node or self.node_rank == 0:
             self.is_master = True
             self.master_ip = "0.0.0.0"
         else:
@@ -2254,6 +2318,22 @@ class FDConfig:
         )
         assert self.scheduler_config.splitwise_role in ["mixed", "prefill", "decode"]
 
+        if self.afd_config.enable_afd:
+            assert self.afd_config.afd_role in ["attn", "ffn"], (
+                f"afd_role must be 'attn' or 'ffn', got: '{self.afd_config.afd_role}'"
+            )
+            assert self.scheduler_config.splitwise_role == "decode", (
+                f"When afd_role is set to '{self.afd_config.afd_role}', splitwise_role must be 'decode'"
+            )
+            assert self.afd_config.afd_master is not None, "afd_master must be set when afd_role is enabled"
+            assert self.afd_config.afd_nnodes >= 1, (
+                f"afd_nnodes must be >= 1, got {self.afd_config.afd_nnodes}"
+            )
+            assert 0 <= self.afd_config.afd_nnode_rank < self.afd_config.afd_nnodes, (
+                f"afd_nnode_rank must be in [0, {self.afd_config.afd_nnodes}), "
+                f"got {self.afd_config.afd_nnode_rank}"
+            )
+
         if not self.cache_config.enable_chunked_prefill:
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 assert self.scheduler_config.max_num_batched_tokens >= self.model_config.max_model_len, (
@@ -2340,6 +2420,7 @@ class FDConfig:
                 k == "cache_config"
                 or k == "model_config"
                 or k == "scheduler_config"
+                or k == "afd_config"
                 or k == "parallel_config"
                 or k == "commit_config"
             ):
@@ -2370,7 +2451,7 @@ class FDConfig:
             self.cache_config.cache_transfer_protocol.split(",") if self.cache_config.cache_transfer_protocol else []
         )
         self.register_info = {
-            "role": self.scheduler_config.afd_role if self.scheduler_config.afd_role is not None else self.scheduler_config.splitwise_role,
+            "role": self.afd_config.afd_role if self.afd_config.enable_afd else self.scheduler_config.splitwise_role,
             "host_ip": self.host_ip,
             "port": port,
             "metrics_port": metrics_port,

@@ -368,8 +368,8 @@ class ModelRegistry:
 
     @classmethod
     def resolve_runtime_architecture(cls, architecture: str, fd_config: FDConfig) -> str:
-        scheduler_config = getattr(fd_config, "scheduler_config", None)
-        afd_role = getattr(scheduler_config, "afd_role", None)
+        afd_config = getattr(fd_config, "afd_config", None)
+        afd_role = getattr(afd_config, "afd_role", None)
         afd_suffix = cls._afd_role_to_suffix.get(afd_role)
         if afd_suffix is None:
             return architecture

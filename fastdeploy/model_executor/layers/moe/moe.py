@@ -258,7 +258,7 @@ class FusedMoE(nn.Layer):
         assert self.quant_method is not None, "self.quant_method should not be None"
         self.redundant_table_manger = redundant_table_manger
         self.is_rearrange = False
-        if self.ep_size > 1:
+        if self.ep_size > 1 and not fd_config.afd_config.enable_afd:
             self.quant_method.init_ep(self)
         self.enable_routing_replay = fd_config.routing_replay_config.enable_routing_replay
         # Merge normal and RL build model

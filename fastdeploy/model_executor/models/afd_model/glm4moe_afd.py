@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Dict, List, Set
 
 import paddle
@@ -25,10 +27,14 @@ from paddle import nn
 from paddleformers.utils.log import logger
 
 from fastdeploy.config import FDConfig
+from fastdeploy.model_executor.afd import AFDDecodeRunner, AFDExpertLayout
 from fastdeploy.model_executor.forward_meta import ForwardMeta
+from fastdeploy.model_executor.graph_optimization.decorator import (
+    support_graph_optimization,
+)
 from fastdeploy.model_executor.layers.embeddings import VocabParallelEmbedding
 from fastdeploy.model_executor.layers.lm_head import ParallelLMHead
-from fastdeploy.model_executor.layers.moe.moe import FusedMoE
+from fastdeploy.model_executor.layers.moe.moe import FusedMoE, get_moe_scores
 from fastdeploy.model_executor.layers.normalization import RMSNorm
 from fastdeploy.model_executor.models.glm4_moe import (
     Glm4MoeAttention,
@@ -38,6 +44,33 @@ from fastdeploy.model_executor.models.glm4_moe import (
 from fastdeploy.model_executor.models.model_base import ModelForCasualLM
 
 import fastdeploy
+
+
+# ---------------------------------------------------------------------------
+#  Diagnostic helpers
+# ---------------------------------------------------------------------------
+
+def _local_device_from_config(fd_config: FDConfig) -> str:
+    """Resolve the Paddle device used by this worker process."""
+    if fd_config.device_config.device_type != "cuda":
+        return paddle.device.get_device()
+
+    selected_gpus = os.getenv("FLAGS_selected_gpus")
+    if selected_gpus:
+        selected = [gpu.strip() for gpu in selected_gpus.split(",") if gpu.strip()]
+        if len(selected) == 1:
+            return f"gpu:{selected[0]}"
+
+    device_ids = str(fd_config.parallel_config.device_ids).split(",")
+    local_rank = int(
+        os.getenv(
+            "PADDLE_LOCAL_RANK",
+            fd_config.parallel_config.data_parallel_rank * fd_config.parallel_config.tensor_parallel_size
+            + fd_config.parallel_config.tensor_parallel_rank,
+        )
+    )
+    local_device = local_rank % max(1, len(device_ids))
+    return f"gpu:{local_device}"
 
 
 def _component_name(weight_name: str) -> str:
@@ -113,13 +146,37 @@ def _log_actual_loaded_layers(
     logger.info("\n".join(lines))
 
 
-class Glm4AFDAttnMoeBlock(nn.Layer):
-    """The MoE-part that remains on the AFD ATTN worker."""
+# =====================================================================
+#  ATTN worker layers
+# =====================================================================
 
-    def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str) -> None:
+class Glm4AFDAttnMoeBlock(nn.Layer):
+    """MoE block on the ATTN worker.
+
+    Holds the *gate* (router) and *shared experts*.  Routed expert
+    computation is offloaded to FFN workers via DeepEP dispatch / combine.
+    """
+
+    def __init__(
+        self,
+        fd_config: FDConfig,
+        layer_id: int,
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.hidden_size = fd_config.model_config.hidden_size
         self.n_shared_experts = fd_config.model_config.n_shared_experts
+
+        # Routing parameters (needed by get_moe_scores)
+        self.top_k = fd_config.model_config.num_experts_per_tok
+        self.n_group = fd_config.model_config.n_group
+        self.topk_group = fd_config.model_config.topk_group
+        self.routed_scaling_factor = fd_config.model_config.routed_scaling_factor
+        self.renormalize = fd_config.model_config.norm_topk_prob
+
+        # Obtain AFD singletons directly
+        self.afd_runner = AFDDecodeRunner()
+        self.afd_layout = AFDExpertLayout()
 
         from fastdeploy.model_executor.layers.linear import ReplicatedLinear
 
@@ -140,7 +197,9 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
 
         self.shared_experts = None
         if self.n_shared_experts > 0:
-            shared_experts_intermediate_size = self.n_shared_experts * fd_config.model_config.moe_intermediate_size
+            shared_experts_intermediate_size = (
+                self.n_shared_experts * fd_config.model_config.moe_intermediate_size
+            )
             self.shared_experts = Glm4MoeMLP(
                 fd_config=fd_config,
                 intermediate_size=shared_experts_intermediate_size,
@@ -150,14 +209,46 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
             )
 
     def forward(self, x: paddle.Tensor, forward_meta: ForwardMeta = None) -> paddle.Tensor:
-        _ = self.gate(x)
-        if self.shared_experts is None:
-            return paddle.zeros_like(x)
-        return self.shared_experts(x, forward_meta)
+        # --- 1. routing ---
+        gate_out = self.gate(x)
+        gate_out = gate_out.cast("float32")
+
+        _score, topk_weights, topk_idx = get_moe_scores(
+            gate_out,
+            self.n_group,
+            self.topk_group,
+            self.top_k,
+            self.routed_scaling_factor,
+            self.gate.e_score_correction_bias,
+            self.renormalize,
+        )
+
+        # --- 2. dispatch tokens to FFN workers ---
+        # DeepEP dispatch/combine must use the same physical expert id space.
+        physical_topk_idx = self.afd_runner.logical_to_physical(topk_idx)
+        recv_hidden, recv_count, handle = self.afd_runner.dispatch_physical(
+            x, physical_topk_idx, topk_weights,
+        )
+
+        # ATTN rank has only phantom experts, produce zero FFN output
+        ffn_out = paddle.zeros_like(recv_hidden)
+
+        # --- 3. combine results from FFN workers ---
+        routed_out = self.afd_runner.combine(ffn_out, physical_topk_idx, topk_weights, handle)
+
+        # --- 4. shared experts ---
+        if self.shared_experts is not None:
+            routed_out = routed_out + self.shared_experts(x, forward_meta)
+
+        return routed_out
 
 
 class Glm4AFDAttnDecoderLayer(nn.Layer):
-    def __init__(self, fd_config: FDConfig, prefix: str) -> None:
+    def __init__(
+        self,
+        fd_config: FDConfig,
+        prefix: str,
+    ) -> None:
         super().__init__()
 
         layer_id = int(prefix.split(sep=".")[-1])
@@ -167,8 +258,15 @@ class Glm4AFDAttnDecoderLayer(nn.Layer):
             prefix=f"{prefix}.self_attn",
         )
 
-        if fd_config.model_config.n_routed_experts is not None and layer_id >= fd_config.model_config.first_k_dense_replace:
-            self.mlp = Glm4AFDAttnMoeBlock(fd_config, layer_id=layer_id, prefix=f"{prefix}.mlp")
+        if (
+            fd_config.model_config.n_routed_experts is not None
+            and layer_id >= fd_config.model_config.first_k_dense_replace
+        ):
+            self.mlp = Glm4AFDAttnMoeBlock(
+                fd_config,
+                layer_id=layer_id,
+                prefix=f"{prefix}.mlp",
+            )
         else:
             self.mlp = Glm4MoeMLP(
                 fd_config,
@@ -203,19 +301,23 @@ class Glm4AFDAttnDecoderLayer(nn.Layer):
             hidden_states, residual_input=residual, forward_meta=forward_meta, proxy_rmsnorm=proxy_rmsnorm
         )
         hidden_states = self.self_attn(
-            hidden_states=hidden_states, 
-            forward_meta=forward_meta
+            hidden_states=hidden_states,
+            forward_meta=forward_meta,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual, proxy_rmsnorm=proxy_rmsnorm)
-        
+
         hidden_states = self.mlp(hidden_states, forward_meta)
-        
+
         return hidden_states, residual
 
 
+@support_graph_optimization
 class Glm4AFDAttnModel(nn.Layer):
-    def __init__(self, fd_config: FDConfig) -> None:
+    def __init__(
+        self,
+        fd_config: FDConfig,
+    ) -> None:
         super().__init__()
         self.num_layers = fd_config.model_config.num_hidden_layers
         fd_config.model_config.pretrained_config.prefix_name = "model"
@@ -243,11 +345,45 @@ class Glm4AFDAttnModel(nn.Layer):
             prefix=f"{fd_config.model_config.pretrained_config.prefix_name}.norm",
         )
 
+    def forward(
+        self,
+        ids_remove_padding: paddle.Tensor,
+        forward_meta: ForwardMeta,
+    ):
+        hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
+
+        residual = None
+
+        for layer_id in range(self.num_layers):
+            hidden_states, residual = self.layers[layer_id](forward_meta, hidden_states, residual)
+
+        out = self.norm(hidden_states, residual, forward_meta=forward_meta)[0]
+
+        if self.norm.is_last_norm and self.norm.fd_config.parallel_config.use_sequence_parallel_moe:
+            out = self.norm.allgather(out, forward_meta.ids_remove_padding.shape[0])
+
+        return out
+
+
+# =====================================================================
+#  FFN worker layers
+# =====================================================================
 
 class Glm4AFDFFNMoeBlock(nn.Layer):
-    """The routed expert weights owned by the AFD FFN worker."""
+    """Routed-expert weights for one MoE layer on the FFN worker.
 
-    def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str) -> None:
+    ``FusedMoE`` is created with *physical* expert count so that the
+    weight tensor sizing and ``expert_id_offset`` are consistent with the
+    inflated expert space used by DeepEP.
+    """
+
+    def __init__(
+        self,
+        fd_config: FDConfig,
+        layer_id: int,
+        prefix: str,
+        num_physical_experts: int,
+    ) -> None:
         super().__init__()
         self.experts = FusedMoE(
             fd_config,
@@ -255,7 +391,7 @@ class Glm4AFDFFNMoeBlock(nn.Layer):
             reduce_results=True,
             renormalize=fd_config.model_config.norm_topk_prob,
             moe_intermediate_size=fd_config.model_config.moe_intermediate_size,
-            num_experts=fd_config.model_config.n_routed_experts,
+            num_experts=num_physical_experts,
             top_k=fd_config.model_config.num_experts_per_tok,
             topk_method="noaux_tc",
             topk_group=fd_config.model_config.topk_group,
@@ -271,14 +407,124 @@ class Glm4AFDFFNMoeBlock(nn.Layer):
         )
 
 
+@support_graph_optimization
+class Glm4AFDFFNModel(nn.Layer):
+    """Executable FFN participant body for AFD.
+
+    The outer CausalLM owns loading/logits APIs.  This inner layer owns the
+    per-layer dispatch -> local expert compute -> combine sequence so it can be
+    captured and replayed independently from the ATTN worker graph.
+    """
+
+    def __init__(
+        self,
+        fd_config: FDConfig,
+        afd_runner: AFDDecodeRunner,
+        moe_layer_ids: List[int],
+        num_physical_experts: int,
+    ) -> None:
+        super().__init__()
+        self._device = _local_device_from_config(fd_config)
+        paddle.device.set_device(self._device)
+        self._afd_runner = afd_runner
+        self._moe_layer_ids = moe_layer_ids
+        self.moe_blocks = nn.LayerDict(
+            {
+                str(layer_id): Glm4AFDFFNMoeBlock(
+                    fd_config=fd_config,
+                    layer_id=layer_id,
+                    prefix=f"model.layers.{layer_id}.mlp",
+                    num_physical_experts=num_physical_experts,
+                )
+                for layer_id in self._moe_layer_ids
+            }
+        )
+
+        self._hidden_size = fd_config.model_config.hidden_size
+        self._top_k = fd_config.model_config.num_experts_per_tok
+        self._empty_x = paddle.zeros([0, self._hidden_size], dtype=paddle.get_default_dtype(), device=self._device)
+        self._empty_topk_idx = paddle.zeros([0, self._top_k], dtype=paddle.int64, device=self._device)
+        self._empty_topk_weights = paddle.zeros([0, self._top_k], dtype=paddle.float32, device=self._device)
+
+    def forward(
+        self,
+        ids_remove_padding: paddle.Tensor = None,
+        forward_meta: ForwardMeta = None,
+    ) -> paddle.Tensor:
+        paddle.device.set_device(self._device)
+        # ids_remove_padding/forward_meta are graph-shape selectors for the
+        # generic GraphOptBackend.  AFD FFN itself originates no tokens.
+        for layer_id in self._moe_layer_ids:
+            recv_hidden, recv_count, handle = self._afd_runner.dispatch_physical(
+                self._empty_x,
+                self._empty_topk_idx,
+                self._empty_topk_weights,
+            )
+            ffn_out = self._compute_local_experts(layer_id, recv_hidden, recv_count)
+            self._afd_runner.combine(
+                ffn_out,
+                self._empty_topk_idx,
+                self._empty_topk_weights,
+                handle,
+            )
+
+        return paddle.zeros([1], dtype=paddle.int32, device=self._device)
+
+    def _compute_local_experts(
+        self,
+        layer_id: int,
+        recv_hidden: paddle.Tensor,
+        recv_count: paddle.Tensor,
+    ) -> paddle.Tensor:
+        """Run local routed experts on tokens received from ATTN ranks."""
+        layer = self.moe_blocks[str(layer_id)].experts
+
+        dequant_scale = None
+        permute_input = recv_hidden
+        if isinstance(recv_hidden, (list, tuple)):
+            permute_input, dequant_scale = recv_hidden
+
+        num_local_experts = permute_input.shape[0]
+        max_num = permute_input.shape[1]
+        estimate_total = max_num * num_local_experts
+
+        moe_quant_type = getattr(layer.quant_method, "moe_quant_type", None)
+        if moe_quant_type in ["w4a8", "w4afp8"] or layer.with_bias:
+            expert_idx_per_token = paddle.arange(num_local_experts, device=permute_input.place)[:, None].tile(
+                [1, max_num]
+            )
+        else:
+            expert_idx_per_token = None
+
+        return layer.quant_method.compute_ffn(
+            layer,
+            permute_input,
+            recv_count.cast("int64"),
+            expert_idx_per_token,
+            True,
+            estimate_total,
+            dequant_scale,
+        )
+
+
+# =====================================================================
+#  ATTN worker CausalLM
+# =====================================================================
+
 class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
+        self._device = _local_device_from_config(fd_config)
+        paddle.device.set_device(self._device)
+
+        # Initialise AFD singletons (first call creates, subsequent calls reuse)
+        self._afd_layout = AFDExpertLayout(fd_config.model_config.n_routed_experts)
+        self._afd_runner = AFDDecodeRunner(fd_config, self._afd_layout)
 
         self.model = Glm4AFDAttnModel(fd_config)
 
         self.ori_vocab_size = fd_config.model_config.ori_vocab_size
-        
+
         self.lm_head = ParallelLMHead(
             fd_config,
             embedding_dim=fd_config.model_config.hidden_size,
@@ -360,17 +606,9 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
         pass
 
     def forward(self, inputs: Dict, forward_meta: ForwardMeta):
+        paddle.device.set_device(self._device)
         ids_remove_padding = inputs["ids_remove_padding"]
-        hidden_states = self.model.embed_tokens(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
-        residual = None
-
-        for layer_id in range(self.model.num_layers):
-            hidden_states, residual = self.model.layers[layer_id](forward_meta, hidden_states, residual)
-
-        out = self.model.norm(hidden_states, residual, forward_meta=forward_meta)[0]
-        if self.model.norm.is_last_norm and self.model.norm.fd_config.parallel_config.use_sequence_parallel_moe:
-            out = self.model.norm.allgather(out, forward_meta.ids_remove_padding.shape[0])
-        return out
+        return self.model(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
 
     def compute_logits(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
         logits = self.lm_head(hidden_states)
@@ -381,32 +619,83 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
     def empty_input_forward(self, forward_meta):
         return None
 
+    def clear_grpah_opt_backend(self):
+        self.model.clear_grpah_opt_backend(fd_config=self.fd_config)
+
+
+# =====================================================================
+#  FFN worker CausalLM
+# =====================================================================
 
 class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
+        self._device = _local_device_from_config(fd_config)
+        paddle.device.set_device(self._device)
+
+        # Initialise AFD singletons (first call creates, subsequent calls reuse)
+        self._afd_layout = AFDExpertLayout(fd_config.model_config.n_routed_experts)
+        self._afd_runner = AFDDecodeRunner(fd_config, self._afd_layout)
+
+        num_physical = self._afd_layout.num_physical_experts
+
         self._moe_layer_ids = list(
             range(fd_config.model_config.first_k_dense_replace, fd_config.model_config.num_hidden_layers)
         )
-        self.moe_blocks = nn.LayerDict(
-            {
-                str(layer_id): Glm4AFDFFNMoeBlock(
-                    fd_config=fd_config,
-                    layer_id=layer_id,
-                    prefix=f"model.layers.{layer_id}.mlp",
-                )
-                for layer_id in self._moe_layer_ids
-            }
+        self.model = Glm4AFDFFNModel(
+            fd_config,
+            afd_runner=self._afd_runner,
+            moe_layer_ids=self._moe_layer_ids,
+            num_physical_experts=num_physical,
         )
+
+        self._afd_ffn_graph_metas = self._build_afd_ffn_graph_metas()
+        self._afd_ffn_graph_meta_index = 0
+
+    def _build_afd_ffn_graph_metas(self):
+        capture_sizes = getattr(self.fd_config.graph_opt_config, "cudagraph_capture_sizes", None) or [1]
+        capture_sizes = sorted({int(size) for size in capture_sizes if int(size) > 0}, reverse=True)
+        if not capture_sizes:
+            capture_sizes = [1]
+
+        metas = []
+        device = _local_device_from_config(self.fd_config)
+        for capture_size in capture_sizes:
+            ids_remove_padding = paddle.zeros([capture_size], dtype=paddle.int64, device=device)
+            forward_meta = SimpleNamespace(
+                ids_remove_padding=ids_remove_padding,
+                exist_prefill=False,
+                step_use_cudagraph=True,
+            )
+            metas.append((ids_remove_padding, forward_meta))
+        return metas
+
+    def _select_afd_ffn_graph_inputs(self):
+        use_graph_capture_sequence = (
+            getattr(self.model, "use_graph_opt", False)
+            and self.fd_config.graph_opt_config.use_cudagraph
+            and self._afd_ffn_graph_meta_index < len(self._afd_ffn_graph_metas)
+        )
+        if use_graph_capture_sequence:
+            ids_remove_padding, forward_meta = self._afd_ffn_graph_metas[self._afd_ffn_graph_meta_index]
+            return ids_remove_padding, forward_meta, True
+
+        ids_remove_padding, forward_meta = self._afd_ffn_graph_metas[0]
+        return ids_remove_padding, forward_meta, False
 
     @classmethod
     def name(cls):
         return "Glm4MoeForCausalLM_AFDFFN"
 
+    # ------------------------------------------------------------------
+    #  Weight loading – map logical expert id → physical expert id
+    # ------------------------------------------------------------------
     @paddle.no_grad()
     def load_weights(self, weights_iterator):
         from fastdeploy.model_executor.utils import process_weights_after_loading
 
+        # Mapping uses *logical* num_experts so that weight_name patterns
+        # match checkpoint filenames  (experts.0.gate_proj, … experts.63…)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             num_experts=self.fd_config.model_config.n_routed_experts,
             ckpt_gate_proj_name="gate_proj",
@@ -419,6 +708,8 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
         process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()), self.fd_config)
         loaded_names: List[str] = []
 
+        afd_layout = self._afd_layout
+
         for loaded_weight_name, loaded_weight in weights_iterator:
             if ".mlp.experts." not in loaded_weight_name:
                 continue
@@ -427,12 +718,18 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
                 if weight_name not in loaded_weight_name:
                     continue
                 model_param_name = loaded_weight_name.replace(weight_name, param_name)
-                model_param_name = model_param_name.replace("model.layers.", "moe_blocks.")
+                model_param_name = model_param_name.replace("model.layers.", "model.moe_blocks.")
                 model_param_name = model_param_name.replace(".mlp.experts.", ".experts.")
                 if model_param_name not in params_dict:
                     continue
                 param = params_dict[model_param_name]
-                param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
+
+                # expert_id from checkpoint is *logical* (0 .. n_routed-1).
+                # Convert to *physical* so the FusedMoE weight_loader places
+                # it at the correct local offset for this rank.
+                physical_expert_id = afd_layout.router_log2phy(expert_id)
+                param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=physical_expert_id)
+
                 loaded_names.append(loaded_weight_name)
                 model_sublayer_name = re.sub(
                     r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name
@@ -452,10 +749,22 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
         pass
 
     def forward(self, inputs: Dict, forward_meta: ForwardMeta):
-        return None
+        paddle.device.set_device(self._device)
+        ids_remove_padding, graph_forward_meta, should_advance = self._select_afd_ffn_graph_inputs()
+        output = self.model(
+            ids_remove_padding=ids_remove_padding,
+            forward_meta=graph_forward_meta,
+        )
+        if should_advance:
+            self._afd_ffn_graph_meta_index += 1
+        return output
 
     def compute_logits(self, hidden_states, forward_meta=None):
         return None
 
     def empty_input_forward(self, forward_meta):
-        return None
+        return self.forward(None, forward_meta)
+
+    def clear_grpah_opt_backend(self):
+        self.model.clear_grpah_opt_backend(fd_config=self.fd_config)
+        self._afd_ffn_graph_meta_index = 0

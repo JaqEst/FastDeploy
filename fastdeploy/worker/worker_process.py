@@ -18,13 +18,15 @@ import argparse
 import asyncio
 import json
 import os
+import threading
 import time
 import traceback
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
 
 from fastdeploy.logger.logger import intercept_paddle_loggers
+from fastdeploy.model_executor.afd.afd import AFDWorldTopology
 
 with intercept_paddle_loggers():
     import paddle
@@ -33,6 +35,7 @@ with intercept_paddle_loggers():
 
 from fastdeploy import envs
 from fastdeploy.config import (
+    AFDConfig,
     CacheConfig,
     DeployModality,
     DeviceConfig,
@@ -112,14 +115,14 @@ def get_worker(fd_config: FDConfig, local_rank: int, rank: int) -> WorkerBase:
 
 
 def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
-    """Initialize Paddle Fleet and get rank of worker"""
-    # Global rank
-    ranks = dist.get_world_size()
+    """Initialize Paddle Fleet and return world size and global rank."""
+
+    world_size = dist.get_world_size()
     dist_strategy = fleet.DistributedStrategy()
-    if ranks > 0:
+    if world_size > 0:
         dist_strategy.hybrid_configs = {
             "dp_degree": 1,
-            "mp_degree": ranks,
+            "mp_degree": world_size,
             "pp_degree": 1,
             "sharding_degree": 1,
         }
@@ -127,12 +130,96 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
         # Set control in tensor parallel
         dist_strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
         fleet.init(is_collective=True, strategy=dist_strategy)
-
-        # Local rank
-        local_rank = fleet.worker_index()
+        
+        global_rank = fleet.worker_index()
     else:
-        local_rank = 0
-    return ranks, local_rank
+        global_rank = 0
+    
+    return world_size, global_rank
+
+def init_afd_environment(world_size: int, attn_ranks: List[int], ffn_ranks: List[int]):
+    AFDWorldTopology(world_size, attn_ranks, ffn_ranks)
+
+
+def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int, int, List[int], List[int], int]:
+    """Collect per-rank AFD topology and return node start rank and node-local rank."""
+    info = {
+        "afd_role": args.afd_role,
+        "afd_nnode_rank": args.afd_nnode_rank,
+        "global_rank": global_rank,
+        "tp_size": args.tensor_parallel_size,
+    }
+    infos = []
+    dist.all_gather_object(infos, info)
+    infos = sorted(infos, key=lambda item: item["global_rank"])
+    if len(infos) != world_size:
+        raise ValueError(
+            "AFD topology mismatch: gathered rank count does not match world_size. "
+            f"world_size={world_size}, gathered_ranks={len(infos)}"
+        )
+
+    ranks_map = {}
+    tp_map = {}
+    role_map = {}
+    attn_ranks = []
+    ffn_ranks = []
+    for item in infos:
+        if item["afd_role"] == "attn":
+            attn_ranks.append(item["global_rank"])
+        elif item["afd_role"] == "ffn":
+            ffn_ranks.append(item["global_rank"])
+        else:
+            raise ValueError(f"Unknown AFD role: {item['afd_role']}")
+        
+        node_ranks = ranks_map.setdefault(item["afd_nnode_rank"], [])
+        node_ranks.append(item["global_rank"])
+
+        node_role = role_map.setdefault(item["afd_nnode_rank"], item["afd_role"])
+        if node_role != item["afd_role"]:
+            raise ValueError(
+                "AFD topology mismatch: ranks from the same node report different afd_role. "
+                f"afd_nnode_rank={item['afd_nnode_rank']}, ranks={infos}"
+            )
+
+        tp_size = tp_map.setdefault(item["afd_nnode_rank"], item["tp_size"])
+        if tp_size != item["tp_size"]:
+            raise ValueError(
+                "AFD topology mismatch: ranks from the same node report different tp_size. "
+                f"afd_nnode_rank={item['afd_nnode_rank']}, ranks={infos}"
+            )
+
+    if len(ranks_map) != args.afd_nnodes:
+        raise ValueError(
+            "AFD topology mismatch: gathered node count does not match afd_nnodes. "
+            f"afd_nnodes={args.afd_nnodes}, gathered_nodes={len(ranks_map)}, "
+            f"afd_nnode_ranks={sorted(ranks_map)}"
+        )
+
+    for afd_nnode_rank, node_ranks in ranks_map.items():
+        tp_size = tp_map[afd_nnode_rank]
+        if len(node_ranks) != tp_size:
+            raise ValueError(
+                "AFD topology mismatch: gathered global ranks do not match tensor_parallel_size. "
+                f"afd_nnode_rank={afd_nnode_rank}, tp={tp_size}, ranks={node_ranks}"
+            )
+        expect_ranks = list(range(node_ranks[0], node_ranks[0] + tp_size))
+        if node_ranks != expect_ranks:
+            raise ValueError(
+                "AFD topology mismatch: ranks inside one node must be contiguous. "
+                f"afd_nnode_rank={afd_nnode_rank}, expected={expect_ranks}, got={node_ranks}"
+            )
+
+    if not attn_ranks or not ffn_ranks:
+        raise ValueError(f"AFD requires both ATTN and FFN ranks, got attn={attn_ranks}, ffn={ffn_ranks}")
+
+    curr_node_ranks = ranks_map.get(args.afd_nnode_rank)
+    if curr_node_ranks is None:
+        raise ValueError(f"Can not resolve AFD instance ranks for afd_nnode_rank={args.afd_nnode_rank}")
+
+    afd_node_srank = curr_node_ranks[0]
+    local_rank = global_rank - afd_node_srank
+    ranks = len(curr_node_ranks)
+    return ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank
 
 
 def update_fd_config_for_mm(fd_config: FDConfig) -> None:
@@ -151,7 +238,7 @@ class PaddleDisWorkerProc:
         in the task queue. Control flow is transmitted by IPC.
     """
 
-    def __init__(self, fd_config: FDConfig, ranks: int = 1, local_rank: int = 0) -> None:
+    def __init__(self, fd_config: FDConfig, world_size: int = 1, ranks: int = 1, global_rank: int = 0, local_rank: int = 0) -> None:
         """
         Initialize a distributed worker and task queue for single-node multi-GPU setup.
         Args:
@@ -159,7 +246,9 @@ class PaddleDisWorkerProc:
                 attributes such as weight_dtype, act_dtype, mp_size, hidden_size, head_dim,
                 num_attention_heads, and ffn_hidden_size.
         """
+        self.world_size = world_size
         self.ranks = ranks
+        self.global_rank = global_rank
         self.local_rank = local_rank
         self.fd_config = fd_config
         self.parallel_config = fd_config.parallel_config
@@ -173,6 +262,7 @@ class PaddleDisWorkerProc:
         self.max_chips_per_node = 16 if current_platform.is_iluvatar() else 8
         self.enable_overlap_schedule = self.scheduler_config.enable_overlap_schedule
         self.cached_control_reqs = []
+        self._afd_ffn_thread = None
 
     def init_control(self):
         engine_worker_queue_port = self.parallel_config.local_engine_worker_queue_port
@@ -223,7 +313,8 @@ class PaddleDisWorkerProc:
             suffix=self.parallel_config.engine_pid,
             create=False,
         )
-        self.worker_ready_signal.value[self.local_rank % self.max_chips_per_node] = 1
+        local_device_rank = self.local_rank % array_size
+        self.worker_ready_signal.value[local_device_rank] = 1
         # init worker_healthy_live_signal
         workers_alive = np.zeros(shape=[min(array_size, self.parallel_config.tensor_parallel_size)], dtype=np.int32)
         self.worker_healthy_live_signal = IPCSignal(
@@ -233,8 +324,8 @@ class PaddleDisWorkerProc:
             suffix=self.parallel_config.local_engine_worker_queue_port,
             create=False,
         )
-        local_rank = self.local_rank % self.parallel_config.tensor_parallel_size
-        self.worker_healthy_live_signal.value[local_rank % self.max_chips_per_node] = int(time.time())
+        tp_rank = self.parallel_config.tensor_parallel_rank
+        self.worker_healthy_live_signal.value[tp_rank] = int(time.time())
 
         # init model_weights_status
         workers_model_weights = np.zeros(shape=[1], dtype=np.int32)
@@ -336,11 +427,10 @@ class PaddleDisWorkerProc:
         if not self.eplb_config.enable_eplb:
             return
 
-        local_rank = self.local_rank % self.parallel_config.tensor_parallel_size
         self.last_dump_expert_workload_ts = 0
         self.experts_manager = RedundantExpertManager(
-            rank=self.local_rank,
-            ep_size=self.ranks,
+            rank=self.parallel_config.expert_parallel_rank,
+            ep_size=self.parallel_config.expert_parallel_size,
             fd_config=self.fd_config,
             ipc_signal_suffix=self.parallel_config.local_engine_worker_queue_port,
         )
@@ -348,7 +438,8 @@ class PaddleDisWorkerProc:
         dp_ipc_signal_suffix = (
             f"{self.parallel_config.local_engine_worker_queue_port}_dp{self.parallel_config.local_data_parallel_id}"
         )
-        if local_rank == 0:  # master rank0
+        tp_rank = self.parallel_config.tensor_parallel_rank
+        if tp_rank == 0:  # master rank0
             signal_update_weight_from_tensor = np.zeros([1], dtype=np.int32)
             self.signal_update_weight_from_tensor_array = IPCSignal(
                 name="signal_update_weight_from_tensor",
@@ -367,7 +458,7 @@ class PaddleDisWorkerProc:
                 create=False,
             )
 
-        tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{local_rank}"
+        tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{tp_rank}"
         experts_token_stats = np.zeros(
             (self.fd_config.model_config.num_hidden_layers, self.fd_config.model_config.moe_num_experts),
             dtype=np.int32,
@@ -391,8 +482,8 @@ class PaddleDisWorkerProc:
 
         self.mmap_infos = create_mmap(
             [MODEL_MAIN_NAME],
-            self.local_rank,
-            self.ranks,
+            self.parallel_config.expert_parallel_rank,
+            self.parallel_config.expert_parallel_size,
             shm_uuid=self.parallel_config.local_engine_worker_queue_port,
             eplb_config=self.eplb_config,
             logger=logger,
@@ -452,7 +543,7 @@ class PaddleDisWorkerProc:
         # Currently, only support single node
         self.nnode = (tp_size + self.max_chips_per_node) // self.max_chips_per_node
         max_occupied_batch_index = 0
-        tp_rank = self.local_rank % tp_size
+        tp_rank = self.parallel_config.tensor_parallel_rank
 
         # TODO: Unify status variables model_weights_status (shared memory) and model_weights_signal (numpy array) to one
         self.model_weights_signal = np.zeros([1], dtype=np.int32)
@@ -463,7 +554,7 @@ class PaddleDisWorkerProc:
                     self.model_weights_signal[0] = self._broadcast_model_weights_signal(src=0, group=None)
 
             req_dicts = None
-            self.worker_healthy_live_signal.value[tp_rank % self.max_chips_per_node] = int(time.time())
+            self.worker_healthy_live_signal.value[tp_rank] = int(time.time())
 
             # The first worker detects whether there are tasks in the task queue
             if tp_rank == 0:
@@ -484,7 +575,7 @@ class PaddleDisWorkerProc:
                     paddle.distributed.barrier()
                 if self.model_weights_signal[0] != ModelWeightsStatus.NORMAL:
                     logger.info(
-                        f"Rank: {self.local_rank} to update or clear parameters, signal is {self.model_weights_signal[0]}, [-1:clear, 1:update]"
+                        f"Global rank: {self.global_rank}, Local rank: {self.local_rank} to update or clear parameters, signal is {self.model_weights_signal[0]}, [-1:clear, 1:update]"
                     )
                     from fastdeploy.rl.dynamic_weight_manager import (
                         DynamicWeightManager,
@@ -509,12 +600,12 @@ class PaddleDisWorkerProc:
 
                     if self.model_weights_signal[0] == ModelWeightsStatus.UPDATING:
                         logger.info(
-                            f"Rank: {self.local_rank} has updated parameters. {self.model_weights_status.value[0]}"
+                            f"Global rank: {self.global_rank}, Local rank: {self.local_rank} has updated parameters. {self.model_weights_status.value[0]}"
                         )
                         self.model_weights_signal[0] = ModelWeightsStatus.NORMAL
                     elif self.model_weights_signal[0] == ModelWeightsStatus.CLEARING:
                         logger.info(
-                            f"Rank: {self.local_rank} has cleared parameters. {self.model_weights_status.value[0]}"
+                            f"Global rank: {self.global_rank}, Local rank: {self.local_rank} has cleared parameters. {self.model_weights_status.value[0]}"
                         )
                         # 如果清理权重后不关闭通信组，那么将推理进程统一阻塞在下面的循环中，否则信号量可能同步混乱；直到下次权重更新时唤醒
                         if not self.fd_config.parallel_config.shutdown_comm_group_if_worker_idle:
@@ -533,7 +624,7 @@ class PaddleDisWorkerProc:
                     continue
 
             if self.exist_task_signal.value[0] == ExistTaskStatus.EXIST or self.task_queue.read_finish_flag.get() == 1:
-                logger.debug(f"Rank: {self.local_rank} Detected new requests.")
+                logger.debug(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} detected new requests.")
                 self.engine_forward_signal.value[0] = 1
                 tasks, read_finish = self.task_queue.get_tasks()
                 # Only one of all tp_size client will get read_finish == True.
@@ -568,11 +659,13 @@ class PaddleDisWorkerProc:
 
                     # todo: run control request async
                     if len(control_reqs) > 0:
-                        logger.info(f"Rank: {self.local_rank} received {len(control_reqs)} control request.")
+                        logger.info(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} received {len(control_reqs)} control request.")
                         for control_req in control_reqs:
                             if self.parallel_config.use_ep:
                                 self.cached_control_reqs.append(control_req)
-                                logger.info(f"Rank: {self.local_rank} cached ep control request: {control_req}")
+                                logger.info(
+                                    f"Global rank: {self.global_rank}, Local rank: {self.local_rank} cached ep control request: {control_req}"
+                                )
                             else:
                                 self.run_control_method(control_req)
                                 self._tp_barrier_wait() if tp_size > 1 else None
@@ -583,7 +676,7 @@ class PaddleDisWorkerProc:
                     num_scheduled_requests = len(req_dicts)
                     scheduled_request_ids = [req.request_id for req in req_dicts]
                     logger.info(
-                        f"Rank: {self.local_rank}, num_prefill_requests: {num_prefill_requests}, "
+                        f"Global rank: {self.global_rank}, Local rank: {self.local_rank}, num_prefill_requests: {num_prefill_requests}, "
                         f"max_occupied_batch_index: {max_occupied_batch_index}, "
                         f"num_scheduled_requests: {num_scheduled_requests}, "
                         f"scheduled_request_ids: {scheduled_request_ids}"
@@ -602,7 +695,7 @@ class PaddleDisWorkerProc:
             if envs.FD_ENABLE_V1_UPDATE_WEIGHTS and self.parallel_config.use_ep:
                 pendings = all_gather_values(len(self.cached_control_reqs), self.parallel_config.ep_group)
                 if all([p > 0 for p in pendings]):
-                    logger.info(f"Rank: {self.local_rank} Detected all ep ranks have pending control tasks.")
+                    logger.info(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} detected all ep ranks have pending control tasks.")
                     self.run_control_method(self.cached_control_reqs.pop(0))
 
             if (
@@ -658,7 +751,7 @@ class PaddleDisWorkerProc:
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if self.scheduler_config.afd_role == "ffn":
+        if self.fd_config.afd_config.afd_role == "ffn":
             logger.info("Skip KV cache initialization/profile for AFD FFN worker.")
             return
 
@@ -682,10 +775,12 @@ class PaddleDisWorkerProc:
 
             if self.ranks > 1:
                 num_blocks_local = paddle.full(shape=[1], fill_value=num_blocks_local, dtype="int32")
-                dist.all_reduce(num_blocks_local, op=dist.ReduceOp.MIN)
+                group = self.parallel_config.tp_group if self.fd_config.afd_config.enable_afd else None
+                dist.all_reduce(num_blocks_local, op=dist.ReduceOp.MIN, group=group)
                 num_blocks_local = num_blocks_local.item()
 
-            if self.local_rank % self.max_chips_per_node == 0:
+            local_device_rank = self.local_rank % len(self.parallel_config.device_ids.split(","))
+            if local_device_rank == 0:
                 # 3. Send IPCSignal
                 get_profile_block_num = np.zeros(shape=[1], dtype=np.int32)
                 self.get_profile_block_num_signal = IPCSignal(
@@ -750,18 +845,53 @@ class PaddleDisWorkerProc:
             create=False,
         )
         if self.ranks > 1:
-            paddle.distributed.barrier()
+            if self.fd_config.afd_config.enable_afd:
+                paddle.distributed.barrier(self.parallel_config.tp_group)
+            else:
+                paddle.distributed.barrier()
         self.loaded_model_signal.value[0] = 1
 
+    def start_afd_ffn_service(self) -> None:
+        """Start the background FFN participant loop for AFD."""
+        if self.fd_config.afd_config.afd_role != "ffn":
+            return
+        if self._afd_ffn_thread is not None:
+            return
+
+        self._afd_ffn_thread = threading.Thread(
+            target=self._afd_ffn_service_loop,
+            name=f"afd_ffn_loop_rank_{self.global_rank}",
+            daemon=True,
+        )
+        self._afd_ffn_thread.start()
+        logger.info(
+            f"Started AFD FFN participant loop. global_rank={self.global_rank}, local_rank={self.local_rank}"
+        )
+
+    def _afd_ffn_service_loop(self) -> None:
+        if hasattr(self.worker, "device"):
+            paddle.device.set_device(self.worker.device)
+
+        while True:
+            try:
+                with paddle.no_grad():
+                    self.worker.execute_model(None, 0)
+            except Exception:
+                logger.error(
+                    "AFD FFN participant loop failed. "
+                    f"global_rank={self.global_rank}, local_rank={self.local_rank}\n{traceback.format_exc()}"
+                )
+                os._exit(1)
+
     def run_control_method(self, control_request: ControlRequest) -> None:
-        logger.info(f"Rank: {self.local_rank} Start to run control request: {control_request}")
+        logger.info(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} start to run control request: {control_request}")
         request_id = control_request.request_id
         method = control_request.method
         kwargs = control_request.args
 
         handler = getattr(self.worker, method, None)
         if handler is None or not callable(handler):
-            error_msg = f"Rank: {self.local_rank} Unknown control method {method}"
+            error_msg = f"Global rank: {self.global_rank}, Local rank: {self.local_rank} unknown control method {method}"
             error_result = ControlResponse(request_id, 400, error_msg)
             asyncio.run(self._ctrl_output.put(error_result))
             return
@@ -770,11 +900,11 @@ class PaddleDisWorkerProc:
             result = handler(**kwargs)
             succ_result = ControlResponse(request_id, 200, "Success", result)
             logger.info(
-                f"Rank: {self.local_rank} Successfully run control request: {control_request}, response: {succ_result}"
+                f"Global rank: {self.global_rank}, Local rank: {self.local_rank} successfully ran control request: {control_request}, response: {succ_result}"
             )
             asyncio.run(self._ctrl_output.put(succ_result, shm_threshold=100 * 1024 * 1024))
         except Exception as e:
-            error_msg = f"Rank: {self.local_rank} Failed to run control method {method}: {str(e)}"
+            error_msg = f"Global rank: {self.global_rank}, Local rank: {self.local_rank} failed to run control method {method}: {str(e)}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             error_result = ControlResponse(request_id, 500, error_msg)
             asyncio.run(self._ctrl_output.put(error_result))
@@ -858,6 +988,9 @@ def parse_args():
     )
     parser.add_argument("--splitwise_role", type=str, default="mixed", help="splitwise role")
     parser.add_argument("--afd_role", type=str, default=None, help="AFD role: attn, ffn, or None (disabled)")
+    parser.add_argument("--afd_master", type=str, default=None, help="AFD master endpoint.")
+    parser.add_argument("--afd_nnodes", type=int, default=1, help="AFD instance count.")
+    parser.add_argument("--afd_nnode_rank", type=int, default=0, help="AFD instance rank.")
     parser.add_argument(
         "--tensor_parallel_size",
         type=int,
@@ -1134,7 +1267,14 @@ def parse_args():
     return args
 
 
-def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
+def initialize_fd_config(
+    args,
+    world_size: int = 1,
+    ranks: int = 1,
+    global_rank: int = 0,
+    local_rank: int = 0,
+    afd_node_srank: int = 0,
+) -> FDConfig:
     """Initialize FDConfig from either RolloutModelConfig or argparse.Namespace
 
     Args:
@@ -1148,10 +1288,11 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
     model_config = ModelConfig(vars(args))
     device_config = DeviceConfig(vars(args))
     speculative_config = SpeculativeConfig(args.speculative_config)
-    parallel_config = ParallelConfig(vars(args))
+    parallel_config = ParallelConfig(vars(args), world_size)
     cache_config = CacheConfig(vars(args))
     scheduler_config = SchedulerConfig(vars(args))
     eplb_config = EPLBConfig(args.eplb_config)
+    afd_config = AFDConfig(vars(args), afd_node_srank)
 
     parallel_config.tensor_parallel_rank = local_rank % parallel_config.tensor_parallel_size
     parallel_config.data_parallel_rank = local_rank // parallel_config.tensor_parallel_size
@@ -1161,9 +1302,9 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         parallel_config.local_data_parallel_id = parallel_config.data_parallel_rank % (
             max_chips_per_node // parallel_config.tensor_parallel_size
         )
-    # config for EP
+    # config for EP, may be need change
     if parallel_config.expert_parallel_size > 1:
-        expert_parallel_rank = int(local_rank % parallel_config.expert_parallel_size)
+        expert_parallel_rank = global_rank if afd_config.enable_afd else local_rank % parallel_config.expert_parallel_size
         if isinstance(model_config.moe_num_experts, list):
             num_experts = model_config.moe_num_experts[0] + eplb_config.redundant_experts_num
         elif hasattr(model_config, "num_local_experts") and model_config.num_local_experts is not None:
@@ -1176,7 +1317,7 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         parallel_config.num_experts_per_rank = num_experts_per_rank
         parallel_config.num_experts_start_offset = num_experts_start_offset
 
-    parallel_config.set_communicate_group()
+    parallel_config.set_communicate_group(afd_config)
 
     load_config = LoadConfig(vars(args))
 
@@ -1255,6 +1396,7 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         early_stop_config=early_stop_config,
         cache_config=cache_config,
         scheduler_config=scheduler_config,
+        afd_config=afd_config,
         ips=args.ips,
         plas_attention_config=plas_attention_config,
         structured_outputs_config=structured_outputs_config,
@@ -1285,10 +1427,35 @@ def run_worker_proc() -> None:
     # Get args form Engine
     args = parse_args()
 
-    ranks, local_rank = init_distributed_environment()
+    # Note:
+    # world_size: 全部 AFD world 的 rank 数
+    # global_rank: 当前 worker 在整个 world 中的 rank
+    # local_rank: 当前 worker 在当前 api_server 实例内的 rank
+    # ranks: 当前 api_server 实例内的 worker 数
+    # afd_node_srank: 当前 api_server 实例在整个 world 中的起始 rank
+
+    world_size, global_rank = init_distributed_environment()
+    
+    local_rank = global_rank
+    ranks = world_size
+    afd_node_srank = 0
+    
+    if args.afd_role is not None:
+        ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank = collect_afd_rank_info(args, world_size, global_rank)
 
     # Get fd_config
-    fd_config = initialize_fd_config(args, ranks, local_rank)
+    fd_config = initialize_fd_config(
+        args,
+        world_size=world_size,
+        ranks=ranks,
+        global_rank=global_rank,
+        local_rank=local_rank,
+        afd_node_srank=afd_node_srank,
+    )
+
+    # init AFD environment
+    if fd_config.afd_config.enable_afd:
+        init_afd_environment(world_size, attn_ranks, ffn_ranks)
 
     # Create worker process
     if current_platform.is_iluvatar():
@@ -1296,7 +1463,7 @@ def run_worker_proc() -> None:
 
         worker_proc = IluvatarPaddleDisWorkerProc(fd_config, ranks, local_rank)
     else:
-        worker_proc = PaddleDisWorkerProc(fd_config, ranks, local_rank)
+        worker_proc = PaddleDisWorkerProc(fd_config, world_size, ranks, global_rank, local_rank)
         worker_proc.init_control()
 
     # Enable batch-invariant mode for deterministic inference.
@@ -1317,6 +1484,7 @@ def run_worker_proc() -> None:
 
     # Load model
     worker_proc.load_model()
+    worker_proc.start_afd_ffn_service()
     # Initialize KV Cache
     worker_proc.initialize_kv_cache()
 
