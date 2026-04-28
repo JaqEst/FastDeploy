@@ -603,7 +603,7 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
 
     @paddle.no_grad()
     def set_state_dict(self, state_dict):
-        pass
+        raise NotImplementedError("AFD models only support loading weights with the default_v1 loader.")
 
     def forward(self, inputs: Dict, forward_meta: ForwardMeta):
         paddle.device.set_device(self._device)
@@ -746,7 +746,7 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
 
     @paddle.no_grad()
     def set_state_dict(self, state_dict):
-        pass
+        raise NotImplementedError("AFD models only support loading weights with the default_v1 loader.")
 
     def forward(self, inputs: Dict, forward_meta: ForwardMeta):
         paddle.device.set_device(self._device)
