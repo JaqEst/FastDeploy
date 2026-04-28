@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import json
 import os
-import threading
 import time
 import traceback
 from typing import List, Tuple
@@ -262,7 +261,6 @@ class PaddleDisWorkerProc:
         self.max_chips_per_node = 16 if current_platform.is_iluvatar() else 8
         self.enable_overlap_schedule = self.scheduler_config.enable_overlap_schedule
         self.cached_control_reqs = []
-        self._afd_ffn_thread = None
 
     def init_control(self):
         engine_worker_queue_port = self.parallel_config.local_engine_worker_queue_port
@@ -547,6 +545,10 @@ class PaddleDisWorkerProc:
 
         # TODO: Unify status variables model_weights_status (shared memory) and model_weights_signal (numpy array) to one
         self.model_weights_signal = np.zeros([1], dtype=np.int32)
+        if self.fd_config.afd_config.afd_role == "ffn":
+            self._event_loop_afd_ffn(tp_rank)
+            return
+
         while True:
             if self.fd_config.load_config.dynamic_load_weight and not envs.FD_ENABLE_V1_UPDATE_WEIGHTS:
                 self.model_weights_signal[0] = int(self.model_weights_status.value[0])
@@ -739,6 +741,27 @@ class PaddleDisWorkerProc:
                 self._tp_barrier_wait() if tp_size > 1 else None
                 time.sleep(0.001)
 
+    def _event_loop_afd_ffn(self, tp_rank: int) -> None:
+        """Run the AFD FFN participant loop on the normal worker event-loop thread."""
+        if hasattr(self.worker, "device"):
+            paddle.device.set_device(self.worker.device)
+
+        logger.info(
+            "Start AFD FFN participant loop in event_loop_normal. "
+            f"global_rank={self.global_rank}, local_rank={self.local_rank}"
+        )
+        while True:
+            try:
+                self.worker_healthy_live_signal.value[tp_rank] = int(time.time())
+                with paddle.no_grad():
+                    self.worker.execute_model(None, 0)
+            except Exception:
+                logger.error(
+                    "AFD FFN participant loop failed. "
+                    f"global_rank={self.global_rank}, local_rank={self.local_rank}\n{traceback.format_exc()}"
+                )
+                os._exit(1)
+
     def initialize_kv_cache(self) -> None:
         """Profiles the peak memory usage of the model to determine how many
         KV blocks may be allocated without OOMs.
@@ -850,38 +873,6 @@ class PaddleDisWorkerProc:
             else:
                 paddle.distributed.barrier()
         self.loaded_model_signal.value[0] = 1
-
-    def start_afd_ffn_service(self) -> None:
-        """Start the background FFN participant loop for AFD."""
-        if self.fd_config.afd_config.afd_role != "ffn":
-            return
-        if self._afd_ffn_thread is not None:
-            return
-
-        self._afd_ffn_thread = threading.Thread(
-            target=self._afd_ffn_service_loop,
-            name=f"afd_ffn_loop_rank_{self.global_rank}",
-            daemon=True,
-        )
-        self._afd_ffn_thread.start()
-        logger.info(
-            f"Started AFD FFN participant loop. global_rank={self.global_rank}, local_rank={self.local_rank}"
-        )
-
-    def _afd_ffn_service_loop(self) -> None:
-        if hasattr(self.worker, "device"):
-            paddle.device.set_device(self.worker.device)
-
-        while True:
-            try:
-                with paddle.no_grad():
-                    self.worker.execute_model(None, 0)
-            except Exception:
-                logger.error(
-                    "AFD FFN participant loop failed. "
-                    f"global_rank={self.global_rank}, local_rank={self.local_rank}\n{traceback.format_exc()}"
-                )
-                os._exit(1)
 
     def run_control_method(self, control_request: ControlRequest) -> None:
         logger.info(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} start to run control request: {control_request}")
@@ -1484,7 +1475,6 @@ def run_worker_proc() -> None:
 
     # Load model
     worker_proc.load_model()
-    worker_proc.start_afd_ffn_service()
     # Initialize KV Cache
     worker_proc.initialize_kv_cache()
 
