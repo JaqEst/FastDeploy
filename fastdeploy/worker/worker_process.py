@@ -133,7 +133,12 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
         global_rank = fleet.worker_index()
     else:
         global_rank = 0
-    
+
+    if envs.FD_USE_MOONCAKE_PG:
+        from mooncake.paddle_integration import init_mooncake_pg
+        ib_devices = envs.FD_MOONCAKE_IB_DEVICES.split(",") if envs.FD_MOONCAKE_IB_DEVICES else None
+        init_mooncake_pg(world_size, global_rank, ib_device_filter=ib_devices, clean_existed_groups=True, logger=logger)
+
     return world_size, global_rank
 
 def init_afd_environment(world_size: int, attn_ranks: List[int], ffn_ranks: List[int]):

@@ -730,26 +730,33 @@ class ParallelConfig:
                 afd_config.afd_node_srank + self.tensor_parallel_size,
             )
             tp_group_gid = afd_config.afd_nnode_rank + tp_gid_offset
+            ep_group_gid = afd_config.afd_nnodes + tp_gid_offset
         else:
             tp_group_ranks = range(
                 self.data_parallel_rank * self.tensor_parallel_size,
                 (self.data_parallel_rank + 1) * self.tensor_parallel_size,
             )
             tp_group_gid = self.data_parallel_rank + tp_gid_offset
+            ep_group_gid = self.data_parallel_size + tp_gid_offset
 
-        dist.collective._set_custom_gid(tp_group_gid)
-        self.tp_group = dist.new_group(tp_group_ranks)
-        dist.collective._set_custom_gid(None)
+        if envs.FD_MOE_A2A_BACKEND == "mooncake":
+            from mooncake.paddle_integration import new_mooncake_group
+            self.tp_group = new_mooncake_group(list(tp_group_ranks), tp_group_gid)
+        else:
+            dist.collective._set_custom_gid(tp_group_gid)
+            self.tp_group = dist.new_group(tp_group_ranks)
+            dist.collective._set_custom_gid(None)
+
         # same ep group id
         if self.enable_expert_parallel:
-            ep_group_gid = (
-                afd_config.afd_nnodes + tp_gid_offset
-                if afd_config is not None and afd_config.enable_afd
-                else self.data_parallel_size + tp_gid_offset
-            )
-            dist.collective._set_custom_gid(ep_group_gid)
-            self.ep_group = dist.new_group(range(self.expert_parallel_size))
-            dist.collective._set_custom_gid(None)
+            if envs.FD_MOE_A2A_BACKEND == "mooncake":
+                from mooncake.paddle_integration import new_mooncake_group
+                self.ep_group = new_mooncake_group(list(range(self.expert_parallel_size)), ep_group_gid)
+            else:
+                dist.collective._set_custom_gid(ep_group_gid)
+                self.ep_group = dist.new_group(range(self.expert_parallel_size))
+                dist.collective._set_custom_gid(None)
+
         logger.info(
             f"data_parallel_size: {self.data_parallel_size}, tensor_parallel_size: {self.tensor_parallel_size}, expert_parallel_size: {self.expert_parallel_size}, data_parallel_rank: {self.data_parallel_rank}, tensor_parallel_rank: {self.tensor_parallel_rank}, expert_parallel_rank: {self.expert_parallel_rank}, tp_group: {self.tp_group}."
         )

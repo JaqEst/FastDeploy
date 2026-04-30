@@ -74,6 +74,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_SAMPLING_CLASS": lambda: os.getenv("FD_SAMPLING_CLASS", "base"),
     # Set moe backend."cutlass","marlin", "triton", "flashinfer-cutlass", "flashinfer-cutedsl" and "flashinfer-trtllm" can be set currently.
     "FD_MOE_BACKEND": lambda: os.getenv("FD_MOE_BACKEND", "cutlass"),
+    # set moe all-to-all backend. Supported values: "deepep" (default), "mooncake".
+    "FD_MOE_A2A_BACKEND": lambda: os.getenv("FD_MOE_A2A_BACKEND", "deepep"),
     # Set nvfp4 load interleaved weight scale.
     "FD_NVFP4_LOAD_BLOCKSCALE_LEAVE": lambda: bool(int(os.getenv("FD_NVFP4_LOAD_BLOCKSCALE_LEAVE", "0"))),
     # Set mxfp4 backend."flashinfer" can be set currently.
@@ -92,6 +94,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_USE_BLACKWELL_GEMM": lambda: bool(int(os.getenv("FD_USE_BLACKWELL_GEMM", "0"))),
     # Whether to use PFCCLab/DeepEP.
     "FD_USE_PFCC_DEEP_EP": lambda: bool(int(os.getenv("FD_USE_PFCC_DEEP_EP", "0"))),
+    # Max dispatch tokens per rank for Mooncake EP (must be <= 1024).
+    "FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": lambda: int(
+        os.getenv("FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "128")
+    ),
+    # InfiniBand devices for Mooncake EP, comma-separated (e.g. "mlx5_0,mlx5_1").
+    # Defaults to None for automatic device detection.
+    "FD_MOONCAKE_IB_DEVICES": lambda: os.getenv("FD_MOONCAKE_IB_DEVICES", None),
     # Whether to use aggregate send.
     "FD_USE_AGGREGATE_SEND": lambda: bool(int(os.getenv("FD_USE_AGGREGATE_SEND", "0"))),
     # Whether to open Trace.
@@ -118,6 +127,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_JOB_ID": lambda: os.getenv("FD_JOB_ID"),
     # support max connections
     "FD_SUPPORT_MAX_CONNECTIONS": lambda: int(os.getenv("FD_SUPPORT_MAX_CONNECTIONS", "1024")),
+    # enable mooncake process group. Defaults to 1 when MoE A2A backend is mooncake.
+    "FD_USE_MOONCAKE_PG": lambda: int(os.getenv("FD_USE_MOONCAKE_PG", "1" if os.getenv("FD_MOE_A2A_BACKEND", "deepep") == "mooncake" else "0")),
     # Offset for Tensor Parallelism group GID.
     "FD_TP_GROUP_GID_OFFSET": lambda: int(os.getenv("FD_TP_GROUP_GID_OFFSET", "1000")),
     # enable multi api server
