@@ -6,6 +6,7 @@ from typing import Dict, List
 import paddle
 from paddleformers.utils.log import logger
 
+from fastdeploy import envs
 from fastdeploy.utils import singleton
 
 
@@ -179,19 +180,46 @@ class AFDExpertLayout:
         ).reshape(orig_shape)
 
 
+class AFDA2ABackendBase:
+    """Communication backend used by AFD decode workers."""
+
+    name = "base"
+
+    def dispatch_physical(self, x, physical_topk_idx, topk_weights, **kwargs):
+        raise NotImplementedError
+
+    def combine(self, ffn_out, physical_topk_idx, topk_weights, handle, **kwargs):
+        raise NotImplementedError
+
+    def runtime_device_info(self):
+        return "unavailable"
+
+
+def _create_afd_a2a_backend(fd_config, afd_layout: AFDExpertLayout) -> AFDA2ABackendBase:
+    if envs.FD_MOE_A2A_BACKEND == "deepep":
+        from fastdeploy.model_executor.afd.deepep_backend import AFDDeepEPA2ABackend
+
+        return AFDDeepEPA2ABackend(fd_config, afd_layout)
+    if envs.FD_MOE_A2A_BACKEND == "mooncake":
+        from fastdeploy.model_executor.afd.mooncake_backend import AFDMooncakeM2NA2ABackend
+
+        return AFDMooncakeM2NA2ABackend(fd_config, afd_layout)
+    raise ValueError(
+        f"Unknown FD_MOE_A2A_BACKEND={envs.FD_MOE_A2A_BACKEND!r}. "
+        "Valid options for AFD are ['deepep', 'mooncake']."
+    )
+
+
 @singleton
 class AFDDecodeRunner:
-    """Decode-phase runner that drives DeepEP dispatch / combine for AFD.
+    """Decode-phase runner that drives dispatch / combine for AFD.
 
     Created once per worker process (both ATTN and FFN workers create one).
-    The underlying ``DeepEPEngine`` is a process-wide singleton so the buffer
-    is allocated only once.
+    The underlying communication backend is process-wide so buffers are
+    allocated only once.
     """
 
     def __init__(self, fd_config, afd_layout: AFDExpertLayout):
-        from fastdeploy.config import MoEPhase
-        from fastdeploy.model_executor.layers.moe.ep import DeepEPEngine
-
         self.fd_config = fd_config
         self.device = _worker_device_from_config(fd_config)
         self._device_touch_tensor = None
@@ -204,21 +232,11 @@ class AFDDecodeRunner:
         self.num_local_physical_experts = afd_layout.num_local_physical_experts
         self._logged_dispatch_device = False
 
-        self.ep_engine = DeepEPEngine(
-            num_max_dispatch_tokens_per_rank=fd_config.model_config.num_max_dispatch_tokens_per_rank,
-            hidden_size=self.hidden_size,
-            num_experts=self.num_physical_experts,
-            ep_size=afd_layout.world_size,
-            ep_rank=fd_config.parallel_config.expert_parallel_rank,
-            splitwise_role=fd_config.scheduler_config.splitwise_role,
-            moe_phase=MoEPhase("decode"),
-            group=fd_config.parallel_config.ep_group,
-            use_internode_ll_two_stage=False,
-            top_k=self.top_k,
-        )
+        self.a2a_backend = _create_afd_a2a_backend(fd_config, afd_layout)
 
         logger.info(
             f"AFDDecodeRunner created: physical_experts={self.num_physical_experts}, "
+            f"a2a_backend={self.a2a_backend.name}, "
             f"ep_rank={fd_config.parallel_config.expert_parallel_rank}, "
             f"device={self.device}, current_device={paddle.device.get_device()}, "
             f"FLAGS_selected_gpus={os.getenv('FLAGS_selected_gpus')}, "
@@ -246,18 +264,15 @@ class AFDDecodeRunner:
         if self._logged_dispatch_device:
             return
         self._logged_dispatch_device = True
-        runtime_local_device_id = None
-        try:
-            runtime_local_device_id = self.ep_engine.deepep_engine.runtime.get_local_device_id()
-        except Exception as exc:  # pragma: no cover - diagnostic only
-            runtime_local_device_id = f"unavailable: {exc}"
+        runtime_local_device_id = self.a2a_backend.runtime_device_info()
         logger.info(
             "AFD dispatch device check: "
             f"runner_device={self.device}, current_device={paddle.device.get_device()}, "
             f"x_place={getattr(x, 'place', None)}, "
             f"topk_idx_place={getattr(physical_topk_idx, 'place', None)}, "
             f"topk_weights_place={getattr(topk_weights, 'place', None)}, "
-            f"deepep_runtime_local_device_id={runtime_local_device_id}, "
+            f"a2a_backend={self.a2a_backend.name}, "
+            f"backend_runtime_device_info={runtime_local_device_id}, "
             f"FLAGS_selected_gpus={os.getenv('FLAGS_selected_gpus')}, "
             f"CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES')}, "
             f"PADDLE_LOCAL_RANK={os.getenv('PADDLE_LOCAL_RANK')}"
@@ -269,35 +284,17 @@ class AFDDecodeRunner:
         return self.afd_layout.batch_log2phy(topk_idx)
 
     def dispatch_physical(self, x, physical_topk_idx, topk_weights, **kwargs):
-        """Low-latency dispatch via DeepEP using physical expert IDs."""
+        """Low-latency dispatch using physical expert IDs."""
         self._ensure_device("dispatch")
         self._log_dispatch_device_once(x, physical_topk_idx, topk_weights)
-
-        expertwise_scale = kwargs.get("expertwise_scale", None)
-        use_fp8 = kwargs.get("use_fp8", False)
-        quant_group_size = kwargs.get("quant_group_size", 128)
-        use_ue8m0 = kwargs.get("use_ue8m0", False)
-
-        recv_hidden, recv_count, handle, dispatch_hook = (
-            self.ep_engine.low_latency_dispatch(
-                x, physical_topk_idx, expertwise_scale, use_fp8, quant_group_size, use_ue8m0
-            )
-        )
-        if dispatch_hook is not None:
-            dispatch_hook()
-        return recv_hidden, recv_count, handle
+        return self.a2a_backend.dispatch_physical(x, physical_topk_idx, topk_weights, **kwargs)
 
     def dispatch(self, x, topk_idx, topk_weights, **kwargs):
-        """Low-latency dispatch via DeepEP using logical expert IDs."""
+        """Low-latency dispatch using logical expert IDs."""
         physical_topk_idx = self.logical_to_physical(topk_idx)
         return self.dispatch_physical(x, physical_topk_idx, topk_weights, **kwargs)
 
     def combine(self, ffn_out, physical_topk_idx, topk_weights, handle, **kwargs):
-        """Low-latency combine via DeepEP using physical expert IDs."""
+        """Low-latency combine using physical expert IDs."""
         self._ensure_device("combine")
-        combined, combine_hook = self.ep_engine.low_latency_combine(
-            ffn_out, physical_topk_idx, topk_weights, handle
-        )
-        if combine_hook is not None:
-            combine_hook()
-        return combined
+        return self.a2a_backend.combine(ffn_out, physical_topk_idx, topk_weights, handle, **kwargs)
