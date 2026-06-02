@@ -207,8 +207,16 @@ class FusedMoE(nn.Layer):
 
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        self.redundant_table_manger = redundant_table_manger
+        self.num_physical_experts = self.num_experts
+        if self.redundant_table_manger is not None:
+            self.num_physical_experts += fd_config.eplb_config.redundant_experts_num
 
-        self.num_local_experts = self.num_experts // self.ep_size
+        assert self.num_physical_experts % self.ep_size == 0, (
+            f"num_physical_experts must be divisible by ep_size, "
+            f"but got num_physical_experts={self.num_physical_experts}, ep_size={self.ep_size}"
+        )
+        self.num_local_experts = self.num_physical_experts // self.ep_size
 
         self.moe_intermediate_size = moe_intermediate_size // self.tp_size
 
@@ -256,7 +264,6 @@ class FusedMoE(nn.Layer):
             # unquantized quant_method
             self.quant_method = get_moe_method(self)
         assert self.quant_method is not None, "self.quant_method should not be None"
-        self.redundant_table_manger = redundant_table_manger
         self.is_rearrange = False
         if self.ep_size > 1 and not fd_config.afd_config.enable_afd:
             self.quant_method.init_ep(self)
@@ -276,7 +283,8 @@ class FusedMoE(nn.Layer):
         )
 
         logger.info(
-            f"{moe_tag}MoE config is {num_experts=}[{expert_id_offset}, {expert_id_offset + self.num_local_experts}), \
+            f"{moe_tag}MoE config is {num_experts=}, num_physical_experts={self.num_physical_experts}"
+            f"[{expert_id_offset}, {expert_id_offset + self.num_local_experts}), \
         {top_k=}, hidden_size={self.hidden_size}, {moe_intermediate_size=}, \
             , ep_size={self.ep_size}, \
             tp_size={self.tp_size}."
@@ -300,7 +308,8 @@ class FusedMoE(nn.Layer):
         else:
             SHARD_ID_TO_SHARDED_DIM = {"gate": 0, "down": 1, "up": 0}
 
-        if not (expert_id - self.expert_id_offset >= 0 and expert_id - self.expert_id_offset < self.num_local_experts):
+        local_expert_slots = self._get_local_expert_slots(expert_id)
+        if not local_expert_slots:
             return
 
         if not param._is_initialized():
@@ -316,7 +325,7 @@ class FusedMoE(nn.Layer):
 
         if shard_id is None:
             # 1.gate up fused in disk
-            output_size = param[expert_id - self.expert_id_offset].shape[SHARD_ID_TO_SHARDED_DIM["gate"]]
+            output_size = param[local_expert_slots[0]].shape[SHARD_ID_TO_SHARDED_DIM["gate"]]
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
                 ("gate", 0, output_size // 2 * self.tp_size),
@@ -327,25 +336,43 @@ class FusedMoE(nn.Layer):
                 loaded_weight_shard = slice_fn(
                     loaded_weight, SHARD_ID_TO_SHARDED_DIM[shard_id], shard_offset, shard_offset + shard_size
                 )
-                self._load_expert_weight(
-                    param=param,
-                    expert_id=expert_id,
-                    loaded_weight=loaded_weight_shard,
-                    shard_id=shard_id,
-                    shard_dim=SHARD_ID_TO_SHARDED_DIM[shard_id],
-                )
+                for local_expert_slot in local_expert_slots:
+                    self._load_expert_weight(
+                        param=param,
+                        local_expert_slot=local_expert_slot,
+                        loaded_weight=loaded_weight_shard,
+                        shard_id=shard_id,
+                        shard_dim=SHARD_ID_TO_SHARDED_DIM[shard_id],
+                    )
         else:
             # 2.gate up splited in disk
             assert shard_id in ["gate", "down", "up"]
-            self._load_expert_weight(
-                param=param,
-                expert_id=expert_id,
-                loaded_weight=loaded_weight,
-                shard_id=shard_id,
-                shard_dim=SHARD_ID_TO_SHARDED_DIM[shard_id],
-            )
+            for local_expert_slot in local_expert_slots:
+                self._load_expert_weight(
+                    param=param,
+                    local_expert_slot=local_expert_slot,
+                    loaded_weight=loaded_weight,
+                    shard_id=shard_id,
+                    shard_dim=SHARD_ID_TO_SHARDED_DIM[shard_id],
+                )
 
-    def _load_gate_up_weight(self, param, expert_id, loaded_weight, shard_id, shard_dim=None):
+    def _get_local_expert_slots(self, expert_id: int) -> list[int]:
+        if self.redundant_table_manger is None:
+            local_expert_slot = expert_id - self.expert_id_offset
+            if 0 <= local_expert_slot < self.num_local_experts:
+                return [local_expert_slot]
+            return []
+
+        ep_rank_to_expert_id_list, _, _, _ = self.redundant_table_manger.get_ep_rank_to_expert_id_list_by_layer(
+            self.layer_idx
+        )
+        local_expert_ids = ep_rank_to_expert_id_list[
+            self.expert_id_offset : self.expert_id_offset + self.num_local_experts
+        ]
+        local_expert_ids = local_expert_ids.cpu().numpy().tolist()
+        return [idx for idx, logical_expert_id in enumerate(local_expert_ids) if logical_expert_id == expert_id]
+
+    def _load_gate_up_weight(self, param, local_expert_slot, loaded_weight, shard_id, shard_dim=None):
         if self.tp_size > 1 and not self.fd_config.load_config.is_pre_sharded:
             tp_shard_dim = shard_dim
             weight_dim = -1 if tp_shard_dim else 0
@@ -354,7 +381,7 @@ class FusedMoE(nn.Layer):
             shard_offset = self.tp_rank * block_size
             shard_size = (self.tp_rank + 1) * block_size
             loaded_weight = slice_fn(loaded_weight, tp_shard_dim, shard_offset, shard_size)
-        expert_param = param[expert_id - self.expert_id_offset]
+        expert_param = param[local_expert_slot]
         dim = -1 if shard_dim else 0
         param_shard_size = expert_param.shape[dim] // 2
         if shard_id == "gate":
@@ -369,7 +396,7 @@ class FusedMoE(nn.Layer):
             param.tensor_track.mark(
                 start=param_shard_offset,
                 end=param_shard_offset + param_shard_size,
-                batch_id=expert_id - self.expert_id_offset,
+                batch_id=local_expert_slot,
             )
 
         # To ensure compatibility across backends, apply an extra transpose for GCU and XPU
@@ -399,7 +426,7 @@ class FusedMoE(nn.Layer):
                 loaded_weight = loaded_weight.cast(expert_param.dtype)
         h2d_copy(dst=expert_param, src=loaded_weight)
 
-    def _load_down_weight(self, param, expert_id, loaded_weight, shard_id, shard_dim=None):
+    def _load_down_weight(self, param, local_expert_slot, loaded_weight, shard_id, shard_dim=None):
         if self.tp_size > 1 and shard_dim is not None and not self.fd_config.load_config.is_pre_sharded:
             tp_shard_dim = shard_dim
             dim = -1 if tp_shard_dim else 0
@@ -408,10 +435,10 @@ class FusedMoE(nn.Layer):
             shard_offset = self.tp_rank * block_size
             shard_size = (self.tp_rank + 1) * block_size
             loaded_weight = slice_fn(loaded_weight, tp_shard_dim, shard_offset, shard_size)
-        expert_param = param[expert_id - self.expert_id_offset]
+        expert_param = param[local_expert_slot]
         if hasattr(param, "tensor_track"):
             # for dyn quant
-            param.tensor_track.mark(start=0, batch_id=expert_id - self.expert_id_offset)
+            param.tensor_track.mark(start=0, batch_id=local_expert_slot)
         # To ensure compatibility across backends, apply an extra transpose for GCU and XPU and opensource weight
         if expert_param.shape != loaded_weight.shape:
             loaded_weight = loaded_weight.transpose([1, 0])
@@ -455,7 +482,26 @@ class FusedMoE(nn.Layer):
         shard_id,
     ):
         loaded_weight = get_tensor(loaded_weight)
-        expert_param = param[expert_id - self.expert_id_offset]
+        local_expert_slots = self._get_local_expert_slots(expert_id)
+        if not local_expert_slots:
+            return
+        if shard_id in ["gate", "up"]:
+            idx = 0 if shard_id == "gate" else 1
+            for local_expert_slot in local_expert_slots:
+                param[local_expert_slot][idx].set_value(loaded_weight)
+        elif shard_id == "down":
+            for local_expert_slot in local_expert_slots:
+                param[local_expert_slot].set_value(loaded_weight)
+
+    def _load_per_tensor_weight_scale_to_slot(
+        self,
+        param,
+        local_expert_slot,
+        loaded_weight,
+        shard_id,
+    ):
+        loaded_weight = get_tensor(loaded_weight)
+        expert_param = param[local_expert_slot]
         if shard_id in ["gate", "up"]:
             idx = 0 if shard_id == "gate" else 1
             expert_param[idx].set_value(loaded_weight)
@@ -465,18 +511,18 @@ class FusedMoE(nn.Layer):
     def _load_expert_weight(
         self,
         param,
-        expert_id,
+        local_expert_slot,
         loaded_weight,
         shard_id,
         shard_dim=None,
     ):
         weight_type = getattr(param, "weight_type", None)
         if weight_type in ["weight_scale_2", "input_scale"]:
-            self._load_per_tensor_weight_scale(param, expert_id, loaded_weight, shard_id)
+            self._load_per_tensor_weight_scale_to_slot(param, local_expert_slot, loaded_weight, shard_id)
         elif shard_id == "down":
-            self._load_down_weight(param, expert_id, loaded_weight, shard_id, shard_dim)
+            self._load_down_weight(param, local_expert_slot, loaded_weight, shard_id, shard_dim)
         elif shard_id in ["gate", "up"]:
-            self._load_gate_up_weight(param, expert_id, loaded_weight, shard_id, shard_dim)
+            self._load_gate_up_weight(param, local_expert_slot, loaded_weight, shard_id, shard_dim)
 
     @classmethod
     def make_expert_params_mapping(

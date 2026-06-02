@@ -15,6 +15,7 @@
 """
 
 import ctypes
+import json
 import os
 import time
 import traceback
@@ -215,6 +216,7 @@ class AsyncEPLoader(object):
         expert_per_rank=8,
         moe_layer_start_index=3,
         moe_quant_type="",
+        model_type="",
         logger=None,
     ):
         """
@@ -227,6 +229,7 @@ class AsyncEPLoader(object):
         self.moe_layer_start_index = moe_layer_start_index
         self.ep_rank = rank
         self.moe_quant_type = moe_quant_type
+        self.model_type = model_type
 
         self.old_model_ep_rank_to_expert_id_list = None
         self.new_model_ep_rank_to_expert_id_list = None
@@ -236,6 +239,34 @@ class AsyncEPLoader(object):
         self.moe_file_names = []
 
         self.logger = logger
+        self.weight_prefix = self._get_weight_prefix()
+
+    def _get_weight_prefix(self) -> str:
+        if "glm" in str(self.model_type).lower():
+            return "model"
+        return "ernie"
+
+    def _get_safetensor_weight_names(self, layer_id: int, expert_id: int) -> List[str]:
+        prefix = f"{self.weight_prefix}.layers.{layer_id}.mlp.experts.{expert_id}"
+        if self.moe_quant_type in ["tensor_wise_fp8", "block_wise_fp8", "w4a8", "w4afp8", "w4w2"]:
+            return [
+                f"{prefix}.{proj_name}.{quant_name}"
+                for proj_name in ["up_gate_proj", "down_proj"]
+                for quant_name in ["quant_weight", "weight_scale"]
+            ]
+        return [
+            f"{prefix}.gate_proj.weight",
+            f"{prefix}.up_proj.weight",
+            f"{prefix}.down_proj.weight",
+        ]
+
+    def _get_bf16_safetensor_weight_names(self, layer_id: int, expert_id: int) -> List[str]:
+        prefix = f"{self.weight_prefix}.layers.{layer_id}.mlp.experts.{expert_id}"
+        return [
+            f"{prefix}.gate_proj.weight",
+            f"{prefix}.up_proj.weight",
+            f"{prefix}.down_proj.weight",
+        ]
 
     def reset(self):
         """
@@ -279,7 +310,7 @@ class AsyncEPLoader(object):
             message = ""
             if len(need_to_reload) > 0:
                 if self.eplb_config.model_use_safetensors:
-                    succ, message = self.load_safetensor_fp8_from_disk(need_to_reload)
+                    succ, message = self.load_safetensor_weight_from_disk(need_to_reload)
                 else:
                     succ, message = self.load_weight_bf16_from_disk(need_to_reload)
             if not succ:
@@ -303,7 +334,9 @@ class AsyncEPLoader(object):
             ckpt_down_proj_name = "down_proj"
             for layer_id, expert_id in need_to_reload:
                 for weight_name in [ckpt_up_gate_proj_name, ckpt_down_proj_name]:
-                    ckpt_file_name = f"ernie.layers.{layer_id}.mlp.experts.{expert_id}.{weight_name}.weight"
+                    ckpt_file_name = (
+                        f"{self.weight_prefix}.layers.{layer_id}.mlp.experts.{expert_id}.{weight_name}.weight"
+                    )
                     if ckpt_file_name not in self.moe_file_names:
                         self.logger.info(f"record redundant_expert: {ckpt_file_name}")
                         self.moe_file_names.append(ckpt_file_name)
@@ -326,23 +359,26 @@ class AsyncEPLoader(object):
             message = f"redundant_expert: Failed to get weights iterator: {e}."
             return False, message
 
-    def load_safetensor_fp8_from_disk(self, need_to_reload: List[Tuple[int, int]]):
-        """load_safetensor_fp8_from_disk"""
-        """
-        ernie.layers.52.mlp.experts.58.up_gate_proj.quant_weight
-        ernie.layers.52.mlp.experts.58.up_gate_proj.weight_scale
-        ernie.layers.52.mlp.experts.58.down_proj.quant_weight
-        ernie.layers.52.mlp.experts.58.down_proj.weight_scale
-        """
-        up_gate_down = ["up_gate_proj", "down_proj"]
-        quant_weight_scale = ["quant_weight", "weight_scale"]
+    def load_safetensor_weight_from_disk(self, need_to_reload: List[Tuple[int, int]]):
+        """load_safetensor_weight_from_disk"""
         ckpt_name = [
-            (f"ernie.layers.{layer_id}.mlp.experts.{expert_id}.{proj_name}.{quant_name}")
+            name
             for layer_id, expert_id in need_to_reload
-            for proj_name in up_gate_down
-            for quant_name in quant_weight_scale
+            for name in self._get_safetensor_weight_names(layer_id, expert_id)
         ]
         ckpt_name_to_safetensor_file = load_ep_checkpoint(self.model_path)
+        missing_keys = [name for name in ckpt_name if name not in ckpt_name_to_safetensor_file]
+        if missing_keys:
+            bf16_ckpt_name = [
+                name
+                for layer_id, expert_id in need_to_reload
+                for name in self._get_bf16_safetensor_weight_names(layer_id, expert_id)
+            ]
+            bf16_missing_keys = [name for name in bf16_ckpt_name if name not in ckpt_name_to_safetensor_file]
+            if bf16_missing_keys:
+                return False, f"missing safetensor keys: {missing_keys[:8]}"
+            self.logger.info("redundant_expert: quant expert keys missing, fallback to bf16 safetensor keys.")
+            ckpt_name = bf16_ckpt_name
         hf_weights_files = list(set(ckpt_name_to_safetensor_file.values()))
         state_dicts = {}
 
@@ -373,12 +409,21 @@ def load_ep_checkpoint(model_path):
     file_path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.exists(file_path):
         return {}
-    import json
-
     with open(file_path, "r") as f:
         weight_map = json.load(f)["weight_map"]
         state_dict = {k: os.path.join(model_path, v) for k, v in weight_map.items()}
     return state_dict
+
+
+def load_model_type(model_path: str) -> str:
+    """
+    load model type from config
+    """
+    file_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(file_path):
+        return ""
+    with open(file_path, "r") as f:
+        return json.load(f).get("model_type", "")
 
 
 def load_model_weights_process(
@@ -413,6 +458,7 @@ def load_model_weights_process(
         expert_per_rank=expert_per_rank,
         moe_layer_start_index=moe_layer_start_index,
         moe_quant_type=moe_quant_type,
+        model_type=load_model_type(model_dir),
         logger=logger,
         eplb_config=eplb_config,
     )

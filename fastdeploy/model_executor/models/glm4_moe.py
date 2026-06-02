@@ -50,6 +50,7 @@ from fastdeploy.model_executor.models.model_base import (
     ModelForCasualLM,
     ModelRegistry,
 )
+from fastdeploy.worker.experts_manager import RedundantExpertManger
 
 
 class Glm4MoeMLP(nn.Layer):
@@ -123,6 +124,7 @@ class Glm4Moe(nn.Layer):
         fd_config: FDConfig,
         layer_id: int = -1,
         prefix: str = "",
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
 
@@ -181,6 +183,7 @@ class Glm4Moe(nn.Layer):
             routed_scaling_factor=fd_config.model_config.routed_scaling_factor,
             layer_idx=layer_id,
             gate_correction_bias=self.gate.e_score_correction_bias,
+            redundant_table_manger=redundant_table_manger,
             weight_key_map=weight_key_map,
             topk_reduce_func=lambda x: x.sum(axis=-1, keepdim=True) + 1e-20,
         )
@@ -203,6 +206,9 @@ class Glm4Moe(nn.Layer):
             # Both branches produced partial sums; combine first, then single all-reduce.
             out = tensor_model_parallel_all_reduce(out, self.tp_group)
         return out
+
+    def update_state_dict(self, state_dict):
+        self.experts.load_state_dict(state_dict, True)
 
 
 class Glm4MoeAttention(nn.Layer):
@@ -282,6 +288,7 @@ class Glm4MoeDecoderLayer(nn.Layer):
         fd_config: FDConfig,
         prefix: str = "",
         is_mtp: bool = False,
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
 
@@ -295,7 +302,12 @@ class Glm4MoeDecoderLayer(nn.Layer):
         if fd_config.model_config.n_routed_experts is not None and (
             layer_id >= fd_config.model_config.first_k_dense_replace or is_mtp
         ):
-            self.mlp = Glm4Moe(fd_config, layer_id, prefix=f"{prefix}.mlp")
+            self.mlp = Glm4Moe(
+                fd_config,
+                layer_id,
+                prefix=f"{prefix}.mlp",
+                redundant_table_manger=redundant_table_manger,
+            )
         else:
             self.mlp = Glm4MoeMLP(
                 fd_config,
@@ -345,6 +357,10 @@ class Glm4MoeDecoderLayer(nn.Layer):
 
         return hidden_states, residual
 
+    def update_state_dict(self, state_dict):
+        if hasattr(self.mlp, "update_state_dict"):
+            self.mlp.update_state_dict(state_dict)
+
 
 @support_graph_optimization
 class Glm4MoeModel(nn.Layer):
@@ -363,7 +379,16 @@ class Glm4MoeModel(nn.Layer):
         super().__init__()
 
         self.num_layers = fd_config.model_config.num_hidden_layers
+        self.fd_config = fd_config
         fd_config.model_config.pretrained_config.prefix_name = "model"
+        self.redundant_table_manger = None
+        if fd_config.eplb_config.enable_eplb is True:
+            self.redundant_table_manger = RedundantExpertManger(
+                n_routed_experts=fd_config.model_config.n_routed_experts,
+                num_hidden_layers=fd_config.model_config.num_hidden_layers,
+                redundant_experts_num=fd_config.eplb_config.redundant_experts_num,
+                ep_size=fd_config.parallel_config.expert_parallel_size,
+            )
 
         self.embed_tokens = VocabParallelEmbedding(
             fd_config,
@@ -378,6 +403,7 @@ class Glm4MoeModel(nn.Layer):
                 Glm4MoeDecoderLayer(
                     fd_config,
                     prefix=f"{fd_config.model_config.pretrained_config.prefix_name}.layers.{i}",
+                    redundant_table_manger=self.redundant_table_manger,
                 )
                 for i in range(self.num_layers)
             ]
@@ -409,6 +435,15 @@ class Glm4MoeModel(nn.Layer):
 
         return out
 
+    def update_state_dict(self, state_dict):
+        for i in range(
+            self.fd_config.model_config.first_k_dense_replace,
+            self.fd_config.model_config.num_hidden_layers,
+        ):
+            logger.info(f"Start update layer {i}")
+            self.layers[i].update_state_dict(state_dict)
+            logger.info(f"Finish update layer {i}")
+
 
 @ModelRegistry.register_model_class(
     architecture="Glm4MoeForCausalLM",
@@ -429,6 +464,7 @@ class Glm4MoeForCausalLM(ModelForCasualLM):
         super(Glm4MoeForCausalLM, self).__init__(fd_config)
 
         self.model = Glm4MoeModel(fd_config)
+        self.redundant_table_manger = self.model.redundant_table_manger
 
         self.ori_vocab_size = fd_config.model_config.ori_vocab_size
 
@@ -474,15 +510,40 @@ class Glm4MoeForCausalLM(ModelForCasualLM):
             stacked_params_mapping.append(("qk_norm.q_norm", "q_norm", None))
             stacked_params_mapping.append(("qk_norm.k_norm", "k_norm", None))
 
+        def get_expert_ids_for_loading():
+            if self.redundant_table_manger is None:
+                return list(range(self.fd_config.model_config.n_routed_experts))
+
+            expert_ids = set()
+            start = self.fd_config.parallel_config.num_experts_start_offset
+            end = start + self.fd_config.parallel_config.num_experts_per_rank
+            for layer_id in range(
+                self.fd_config.model_config.first_k_dense_replace,
+                self.fd_config.model_config.num_hidden_layers,
+            ):
+                ep_rank_to_expert_id_list, _, _, _ = (
+                    self.redundant_table_manger.get_ep_rank_to_expert_id_list_by_layer(layer_id)
+                )
+                local_expert_ids = ep_rank_to_expert_id_list[start:end].cpu().numpy().tolist()
+                expert_ids.update(local_expert_ids)
+            return sorted(expert_ids)
+
+        expert_ids_for_loading = get_expert_ids_for_loading()
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            num_experts=self.fd_config.model_config.n_routed_experts,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            param_gate_up_proj_name="experts.up_gate_proj_",
-            param_down_proj_name="experts.down_proj_",
-        )
+        expert_params_mapping = [
+            (param_name, weight_name.replace(f"experts.{idx}.", f"experts.{expert_id}."), expert_id, shard_id)
+            for idx, expert_id in enumerate(expert_ids_for_loading)
+            for param_name, weight_name, _, shard_id in FusedMoE.make_expert_params_mapping(
+                num_experts=1,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                param_gate_up_proj_name="experts.up_gate_proj_",
+                param_down_proj_name="experts.down_proj_",
+                experts_offset=idx,
+                num_experts_start_offset=0,
+            )
+        ]
         params_dict = dict(self.named_parameters())
         process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()), self.fd_config)
         for loaded_weight_name, loaded_weight in weights_iterator:
@@ -528,6 +589,10 @@ class Glm4MoeForCausalLM(ModelForCasualLM):
         glm4_moe only support loader_v1.
         """
         assert False, "glm4_moe only support --load-choices default_v1."
+
+    @paddle.no_grad()
+    def update_state_dict(self, state_dict):
+        self.model.update_state_dict(state_dict)
 
     def compute_logits(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
         """ """

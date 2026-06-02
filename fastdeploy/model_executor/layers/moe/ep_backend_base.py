@@ -38,6 +38,7 @@ class EPRunnerBase:
     def __init__(self, top_k: int, num_experts: int, redundant_experts_num: int = 0):
         self.top_k = top_k
         self.num_experts = num_experts
+        self.num_physical_experts = num_experts + redundant_experts_num
         self.redundant_experts_num = redundant_experts_num
 
     def moe_select(self, layer: nn.Layer, gate_out: paddle.Tensor):

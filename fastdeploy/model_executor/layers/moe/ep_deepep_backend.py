@@ -470,7 +470,7 @@ class DeepEPRunner(EPRunnerBase):
         self.ep_engine = DeepEPEngine(
             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             hidden_size=hidden_size,
-            num_experts=num_experts + redundant_experts_num,
+            num_experts=self.num_physical_experts,
             ep_size=ep_size,
             ep_rank=ep_rank,
             splitwise_role=splitwise_role,
@@ -558,7 +558,7 @@ class DeepEPPrefillRunner(DeepEPRunner):
             event,
         ) = buffer.get_dispatch_layout(
             topk_idx,
-            self.num_experts,
+            self.num_physical_experts,
             previous_event=kwargs.get("previous_event", None),
             allocate_on_comm_stream=DeepEPPrefillRunner.allocate_on_comm_stream,
             async_finish=self.ep_engine.async_finish,

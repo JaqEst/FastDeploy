@@ -310,7 +310,7 @@ class RedundantExpertManager:
         self.model_expert_in_rank_num_list[:] = expert_count[:]
 
         if self.local_rank == 0:
-            workload = RedundantExpertWorkload()
+            workload = RedundantExpertWorkload(self.eplb_config.redundant_expert_meta_dir)
             workload.tokens_per_expert_stats_list = self.model_tokens_per_expert_stats_list.tolist()
             workload.ep_rank_to_expert_id_list = rank_expert_list.tolist()
             workload.expert_id_to_ep_rank_array = logical_to_physical_map.tolist()
