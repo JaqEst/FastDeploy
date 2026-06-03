@@ -253,11 +253,10 @@ def load_reordered_experts(model_path: str, key_name: str):
     with open(os.path.join(model_path, "model.safetensors.index.json"), "r") as f:
         weight_list = json.load(f)["weight_map"]
     safetensor_path = os.path.join(model_path, weight_list[key_name])
-    with safe_open(safetensor_path, framework="paddle", device="cpu") as f:
+    with safe_open(safetensor_path, framework="np", device="cpu") as f:
         if key_name in f.keys():
             weight = f.get_tensor(key_name)
-            if not isinstance(weight, paddle.Tensor):
-                weight = paddle.Tensor(weight, zero_copy=True)
+            weight = paddle.Tensor(weight, zero_copy=True)
             weight = weight._copy_to(paddle.framework._current_expected_place(), False)
             return weight
 
