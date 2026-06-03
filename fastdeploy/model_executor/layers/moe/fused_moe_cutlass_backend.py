@@ -59,37 +59,12 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
     This method is the oldest way to compute MoE in Paddle.
     """
 
-    @staticmethod
-    def _align_reloaded_weight_to_param(weight: paddle.Tensor, param: paddle.Tensor) -> paddle.Tensor:
-        """Match the batched reload layout to the existing parameter layout."""
-        weight_shape = list(weight.shape)
-        param_shape = list(param.shape)
-        if weight_shape == param_shape:
-            return weight
-        if len(weight_shape) == 3 and weight_shape == [param_shape[0], param_shape[2], param_shape[1]]:
-            return weight.transpose([0, 2, 1])
-        if (
-            len(weight_shape) == 3
-            and weight_shape[0] == param_shape[0]
-            and weight_shape[1] * 2 == param_shape[2]
-            and weight_shape[2] == param_shape[1] * 2
-        ):
-            gate_weight, up_weight = paddle.split(weight, num_or_sections=2, axis=2)
-            return paddle.concat([gate_weight, up_weight], axis=1).transpose([0, 2, 1])
-        return weight
-
     def process_loaded_weights(self, layer: nn.Layer, state_dict):
         up_gate_proj_weights, down_proj_weights, logical_expert_ids, ep_rank_to_expert_id_list = (
             layer.extract_moe_ffn_weights(state_dict)
         )
         stacked_up_gate_proj_weights = paddle.stack(up_gate_proj_weights, axis=0)
         stacked_down_proj_weights = paddle.stack(down_proj_weights, axis=0)
-        stacked_up_gate_proj_weights = self._align_reloaded_weight_to_param(
-            stacked_up_gate_proj_weights, layer.up_gate_proj_weight
-        )
-        stacked_down_proj_weights = self._align_reloaded_weight_to_param(
-            stacked_down_proj_weights, layer.down_proj_weight
-        )
 
         layer.up_gate_proj_weight.set_value(stacked_up_gate_proj_weights)
         layer.down_proj_weight.set_value(stacked_down_proj_weights)

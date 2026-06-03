@@ -208,15 +208,16 @@ class FusedMoE(nn.Layer):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.redundant_table_manger = redundant_table_manger
-        self.num_physical_experts = self.num_experts
+        num_experts_with_redundant = self.num_experts
         if self.redundant_table_manger is not None:
-            self.num_physical_experts += fd_config.eplb_config.redundant_experts_num
+            num_experts_with_redundant += fd_config.eplb_config.redundant_experts_num
 
-        assert self.num_physical_experts % self.ep_size == 0, (
-            f"num_physical_experts must be divisible by ep_size, "
-            f"but got num_physical_experts={self.num_physical_experts}, ep_size={self.ep_size}"
+        assert num_experts_with_redundant % self.ep_size == 0, (
+            f"num_experts + redundant_experts_num must be divisible by ep_size, "
+            f"but got num_experts={self.num_experts}, "
+            f"redundant_experts_num={fd_config.eplb_config.redundant_experts_num}, ep_size={self.ep_size}"
         )
-        self.num_local_experts = self.num_physical_experts // self.ep_size
+        self.num_local_experts = num_experts_with_redundant // self.ep_size
 
         self.moe_intermediate_size = moe_intermediate_size // self.tp_size
 
@@ -283,7 +284,8 @@ class FusedMoE(nn.Layer):
         )
 
         logger.info(
-            f"{moe_tag}MoE config is {num_experts=}, num_physical_experts={self.num_physical_experts}"
+            f"{moe_tag}MoE config is {num_experts=}, "
+            f"redundant_experts_num={fd_config.eplb_config.redundant_experts_num}"
             f"[{expert_id_offset}, {expert_id_offset + self.num_local_experts}), \
         {top_k=}, hidden_size={self.hidden_size}, {moe_intermediate_size=}, \
             , ep_size={self.ep_size}, \

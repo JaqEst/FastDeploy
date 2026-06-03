@@ -241,6 +241,9 @@ class AsyncEPLoader(object):
         self.logger = logger
         self.weight_prefix = self._get_weight_prefix()
 
+    def _is_glm_model(self) -> bool:
+        return "glm" in str(self.model_type).lower()
+
     def _get_weight_prefix(self) -> str:
         if "glm" in str(self.model_type).lower():
             return "model"
@@ -248,20 +251,18 @@ class AsyncEPLoader(object):
 
     def _get_safetensor_weight_names(self, layer_id: int, expert_id: int) -> List[str]:
         prefix = f"{self.weight_prefix}.layers.{layer_id}.mlp.experts.{expert_id}"
+        if self._is_glm_model():
+            return [
+                f"{prefix}.gate_proj.weight",
+                f"{prefix}.up_proj.weight",
+                f"{prefix}.down_proj.weight",
+            ]
         if self.moe_quant_type in ["tensor_wise_fp8", "block_wise_fp8", "w4a8", "w4afp8", "w4w2"]:
             return [
                 f"{prefix}.{proj_name}.{quant_name}"
                 for proj_name in ["up_gate_proj", "down_proj"]
                 for quant_name in ["quant_weight", "weight_scale"]
             ]
-        return [
-            f"{prefix}.gate_proj.weight",
-            f"{prefix}.up_proj.weight",
-            f"{prefix}.down_proj.weight",
-        ]
-
-    def _get_bf16_safetensor_weight_names(self, layer_id: int, expert_id: int) -> List[str]:
-        prefix = f"{self.weight_prefix}.layers.{layer_id}.mlp.experts.{expert_id}"
         return [
             f"{prefix}.gate_proj.weight",
             f"{prefix}.up_proj.weight",
@@ -369,16 +370,7 @@ class AsyncEPLoader(object):
         ckpt_name_to_safetensor_file = load_ep_checkpoint(self.model_path)
         missing_keys = [name for name in ckpt_name if name not in ckpt_name_to_safetensor_file]
         if missing_keys:
-            bf16_ckpt_name = [
-                name
-                for layer_id, expert_id in need_to_reload
-                for name in self._get_bf16_safetensor_weight_names(layer_id, expert_id)
-            ]
-            bf16_missing_keys = [name for name in bf16_ckpt_name if name not in ckpt_name_to_safetensor_file]
-            if bf16_missing_keys:
-                return False, f"missing safetensor keys: {missing_keys[:8]}"
-            self.logger.info("redundant_expert: quant expert keys missing, fallback to bf16 safetensor keys.")
-            ckpt_name = bf16_ckpt_name
+            return False, f"missing safetensor keys: {missing_keys[:8]}"
         hf_weights_files = list(set(ckpt_name_to_safetensor_file.values()))
         state_dicts = {}
 
