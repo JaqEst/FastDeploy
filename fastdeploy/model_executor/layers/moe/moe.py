@@ -479,21 +479,17 @@ class FusedMoE(nn.Layer):
     def _load_per_tensor_weight_scale(
         self,
         param,
-        expert_id,
+        local_expert_slot,
         loaded_weight,
         shard_id,
     ):
         loaded_weight = get_tensor(loaded_weight)
-        local_expert_slots = self._get_local_expert_slots(expert_id)
-        if not local_expert_slots:
-            return
+        expert_param = param[local_expert_slot]
         if shard_id in ["gate", "up"]:
             idx = 0 if shard_id == "gate" else 1
-            for local_expert_slot in local_expert_slots:
-                param[local_expert_slot][idx].set_value(loaded_weight)
+            expert_param[idx].set_value(loaded_weight)
         elif shard_id == "down":
-            for local_expert_slot in local_expert_slots:
-                param[local_expert_slot].set_value(loaded_weight)
+            expert_param.set_value(loaded_weight)
 
     def _load_expert_weight(
         self,
@@ -505,12 +501,7 @@ class FusedMoE(nn.Layer):
     ):
         weight_type = getattr(param, "weight_type", None)
         if weight_type in ["weight_scale_2", "input_scale"]:
-            loaded_weight = get_tensor(loaded_weight)
-            if shard_id in ["gate", "up"]:
-                idx = 0 if shard_id == "gate" else 1
-                param[local_expert_slot][idx].set_value(loaded_weight)
-            elif shard_id == "down":
-                param[local_expert_slot].set_value(loaded_weight)
+            self._load_per_tensor_weight_scale(param, local_expert_slot, loaded_weight, shard_id)
         elif shard_id == "down":
             self._load_down_weight(param, local_expert_slot, loaded_weight, shard_id, shard_dim)
         elif shard_id in ["gate", "up"]:
