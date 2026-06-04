@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from fastdeploy.config import (
+    AFDConfig,
     CacheConfig,
     EPLBConfig,
     FDConfig,
@@ -74,6 +75,7 @@ class TestRedundantExpertManager(unittest.TestCase):
             "redundant_expert_enable_schedule_cordon": False,
         }
         eplb_config = EPLBConfig(eplb_args)
+        afd_config = AFDConfig(args)
 
         self.fd_config = FDConfig(
             model_config=model_cfg,
@@ -83,6 +85,7 @@ class TestRedundantExpertManager(unittest.TestCase):
             speculative_config=speculative_cfg,
             scheduler_config=scheduler_cfg,
             eplb_config=eplb_config,
+            afd_config=afd_config,
         )
         self.fd_config.parallel_config.local_data_parallel_id = 0
         self.fd_config.splitwise_role = "decode"
@@ -292,6 +295,32 @@ class TestRedundantExpertManager(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(mock_requests.call_count, 2)
+
+    @patch("fastdeploy.eplb.experts_manager.get_logger")
+    @patch("fastdeploy.eplb.experts_manager.Process")
+    @patch("fastdeploy.eplb.experts_manager.threading.Thread")
+    @patch("fastdeploy.eplb.experts_manager.requests.post")
+    def test_broadcast_update_weight_from_tensor(self, mock_requests, mock_thread, mock_process, mock_get_logger):
+        """Test broadcast update_weight_from_tensor notification."""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+
+        manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.dp_rank_address = ["127.0.0.1:8000", "127.0.0.1:8001"]
+
+        mock_response1 = MagicMock()
+        mock_response1.status_code = 200
+        mock_response2 = MagicMock()
+        mock_response2.status_code = 200
+        mock_requests.side_effect = [mock_response1, mock_response2]
+
+        result = manager.broadcast_update_weight_from_tensor()
+
+        self.assertTrue(result)
+        self.assertEqual(mock_requests.call_count, 2)
+        for call_args in mock_requests.call_args_list:
+            self.assertEqual(call_args.kwargs["json"]["action"], "update_weight_from_tensor")
+            self.assertTrue(call_args.kwargs["json"]["from_controller"])
 
     @patch("fastdeploy.eplb.experts_manager.get_logger")
     @patch("fastdeploy.eplb.experts_manager.Process")

@@ -210,7 +210,10 @@ class FusedMoE(nn.Layer):
         self.redundant_table_manger = redundant_table_manger
         num_experts_with_redundant = self.num_experts
         if self.redundant_table_manger is not None:
-            num_experts_with_redundant += fd_config.eplb_config.redundant_experts_num
+            if fd_config.afd_config.enable_afd:
+                num_experts_with_redundant = self.redundant_table_manger.num_replicas
+            else:
+                num_experts_with_redundant += fd_config.eplb_config.redundant_experts_num
 
         assert num_experts_with_redundant % self.ep_size == 0, (
             f"num_experts + redundant_experts_num must be divisible by ep_size, "
@@ -580,13 +583,15 @@ class FusedMoE(nn.Layer):
         if self.redundant_table_manger is not None:
             (
                 ep_rank_to_expert_id_list,
-                expert_id_to_ep_rank_array,
-                expert_in_rank_num_list,
-                tokens_per_expert_stats_list,
+                _,
+                _,
+                _,
             ) = self.redundant_table_manger.get_ep_rank_to_expert_id_list_by_layer(self.layer_idx)
             logical_expert_ids = ep_rank_to_expert_id_list[
                 self.expert_id_offset : self.expert_id_offset + self.num_local_experts
             ]
+            if isinstance(logical_expert_ids, paddle.Tensor):
+                logical_expert_ids = logical_expert_ids.cpu().numpy().astype("int64").tolist()
         up_gate_proj_weights = []
         down_proj_weights = []
         if isinstance(state_dict, list):

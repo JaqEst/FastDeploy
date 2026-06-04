@@ -903,13 +903,35 @@ class EngineClient:
                 status_code = HTTPStatus.OK
             return content, status_code
         elif action == "update_weight_from_tensor":
-            if self.fd_config.scheduler_config.splitwise_role != "prefill" and content is None:
+            afd_config = getattr(self.fd_config, "afd_config", None)
+            is_afd_controller_update = (
+                getattr(afd_config, "enable_afd", False) is True and request_dict.get("from_controller", False)
+            )
+            if (
+                self.fd_config.scheduler_config.splitwise_role != "prefill"
+                and not is_afd_controller_update
+                and content is None
+            ):
                 content = {
                     "code": 1,
                     "msg": f"actual role {self.fd_config.scheduler_config.splitwise_role}, expect role prefill",
                 }
                 status_code = HTTPStatus.BAD_REQUEST
-            if self.rearrange_experts_signal.value[0] != RearrangeExpertStatus.LOAD_SUCC.value and content is None:
+            if (
+                is_afd_controller_update
+                and self.rearrange_experts_signal.value[0] == RearrangeExpertStatus.DOING.value
+                and content is None
+            ):
+                content = {
+                    "code": 1,
+                    "msg": f"actual status {self.rearrange_experts_signal.value[0]}, expect status not {RearrangeExpertStatus.DOING.value}",
+                }
+                status_code = HTTPStatus.BAD_REQUEST
+            if (
+                not is_afd_controller_update
+                and self.rearrange_experts_signal.value[0] != RearrangeExpertStatus.LOAD_SUCC.value
+                and content is None
+            ):
                 content = {
                     "code": 1,
                     "msg": f"actual status {self.rearrange_experts_signal.value[0]}, expect status {RearrangeExpertStatus.LOAD_SUCC.value}",

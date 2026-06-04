@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import unittest
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from fastdeploy.config import FDConfig
 from fastdeploy.worker.gpu_worker import GpuWorker
@@ -93,6 +94,32 @@ class TestGpuWorkerSleepWakeup(unittest.TestCase):
 
         # Verify model_runner.wakeup was called with kwargs
         worker.model_runner.wakeup.assert_called_once_with(tags="kv_cache", async_load=True)
+
+    def test_mooncake_requires_disable_custom_all_reduce(self):
+        """Mooncake process groups cannot be combined with custom all-reduce."""
+        worker = GpuWorker.__new__(GpuWorker)
+        worker.local_rank = 0
+        worker.device_config = SimpleNamespace(device_type="cuda")
+        worker.parallel_config = SimpleNamespace(
+            device_ids="0",
+            disable_custom_all_reduce=False,
+            tensor_parallel_size=2,
+        )
+        worker.model_config = SimpleNamespace(dtype="float32")
+        worker.fd_config = SimpleNamespace(
+            parallel_config=worker.parallel_config,
+            model_config=worker.model_config,
+        )
+
+        with (
+            patch("fastdeploy.worker.gpu_worker.envs.FD_MOE_A2A_BACKEND", "mooncake"),
+            patch("fastdeploy.worker.gpu_worker.paddle.device.is_compiled_with_cuda", return_value=True),
+            patch("fastdeploy.worker.gpu_worker.paddle.device.set_device"),
+            patch("fastdeploy.worker.gpu_worker.paddle.set_default_dtype"),
+            patch("fastdeploy.worker.gpu_worker.paddle.device.cuda.empty_cache"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "--disable-custom-all-reduce"):
+                worker.init_device()
 
 
 if __name__ == "__main__":

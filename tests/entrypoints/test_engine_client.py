@@ -1609,6 +1609,30 @@ class TestEngineClientValidParameters(unittest.TestCase):
         self.assertEqual(content["code"], 0)
         self.assertEqual(status_code, 200)
 
+    async def test_rearrange_experts_afd_controller_update_weight_from_tensor(self):
+        """Test AFD controller can notify decode roles to update tensor/table."""
+        mock_config = create_mock_fd_config(enable_eplb=True, splitwise_role="decode")
+        mock_config.afd_config = Mock()
+        mock_config.afd_config.enable_afd = True
+
+        self.engine_client.config = mock_config
+        self.engine_client.fd_config = mock_config
+        self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.LOAD_SUCC.value]))
+        self.engine_client.signal_update_weight_from_tensor_array = Mock(value=np.array([0]))
+
+        content, status_code = await self.engine_client.rearrange_experts(
+            {
+                "user": "test_user",
+                "passwd": "test_pass",
+                "action": "update_weight_from_tensor",
+                "from_controller": True,
+            }
+        )
+
+        self.assertEqual(content["code"], 0)
+        self.assertEqual(status_code, 200)
+        self.assertEqual(self.engine_client.signal_update_weight_from_tensor_array.value[0], 1)
+
     async def test_rearrange_experts_invalid_action(self):
         """Test rearrange_experts with invalid action string."""
         mock_config = create_mock_fd_config(enable_eplb=True)

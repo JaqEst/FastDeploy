@@ -41,14 +41,11 @@ from fastdeploy.model_executor.models.glm4_moe import (
     Glm4MoeMLP,
     rms_norm_func,
 )
-from fastdeploy.model_executor.models.model_base import ModelForCasualLM
+from fastdeploy.model_executor.models.model_base import ModelCategory, ModelForCasualLM, ModelRegistry
+from fastdeploy.worker.experts_manager import RedundantExpertManger
 
 import fastdeploy
 
-
-# ---------------------------------------------------------------------------
-#  Diagnostic helpers
-# ---------------------------------------------------------------------------
 
 def _local_device_from_config(fd_config: FDConfig) -> str:
     """Resolve the Paddle device used by this worker process."""
@@ -71,6 +68,18 @@ def _local_device_from_config(fd_config: FDConfig) -> str:
     )
     local_device = local_rank % max(1, len(device_ids))
     return f"gpu:{local_device}"
+
+
+def _create_redundant_table_manager(fd_config: FDConfig):
+    if not fd_config.eplb_config.enable_eplb:
+        return None
+    return RedundantExpertManger(
+        n_routed_experts=fd_config.model_config.n_routed_experts,
+        num_hidden_layers=fd_config.model_config.num_hidden_layers,
+        redundant_experts_num=fd_config.eplb_config.redundant_experts_num,
+        ep_size=fd_config.parallel_config.expert_parallel_size,
+        enable_afd=fd_config.afd_config.enable_afd,
+    )
 
 
 def _component_name(weight_name: str) -> str:
@@ -162,8 +171,10 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
         fd_config: FDConfig,
         layer_id: int,
         prefix: str,
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = fd_config.model_config.hidden_size
         self.n_shared_experts = fd_config.model_config.n_shared_experts
 
@@ -174,9 +185,8 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
         self.routed_scaling_factor = fd_config.model_config.routed_scaling_factor
         self.renormalize = fd_config.model_config.norm_topk_prob
 
-        # Obtain AFD singletons directly
         self.afd_runner = AFDDecodeRunner()
-        self.afd_layout = AFDExpertLayout()
+        self.redundant_table_manger = redundant_table_manger
 
         from fastdeploy.model_executor.layers.linear import ReplicatedLinear
 
@@ -221,12 +231,16 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
             self.routed_scaling_factor,
             self.gate.e_score_correction_bias,
             self.renormalize,
+            **self._redundant_routing_kwargs(),
         )
 
         # --- 2. dispatch tokens to FFN workers ---
-        # DeepEP dispatch/combine must use the same physical expert id space.
-        physical_topk_idx = self.afd_runner.logical_to_physical(topk_idx)
-        recv_hidden, recv_count, handle = self.afd_runner.dispatch_physical(
+        # EPLB topk returns AFD physical ids when redundant routing is enabled.
+        if self.redundant_table_manger is not None:
+            physical_topk_idx = topk_idx
+        else:
+            physical_topk_idx = self.afd_runner.logical_to_physical(topk_idx)
+        recv_hidden, _, handle = self.afd_runner.dispatch_physical(
             x, physical_topk_idx, topk_weights,
         )
 
@@ -242,12 +256,29 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
 
         return routed_out
 
+    def _redundant_routing_kwargs(self) -> Dict:
+        if self.redundant_table_manger is None:
+            return {}
+        (
+            _ep_rank_to_expert_id_list,
+            expert_id_to_ep_rank_array,
+            expert_in_rank_num_list,
+            tokens_per_expert_stats_list,
+        ) = self.redundant_table_manger.get_ep_rank_to_expert_id_list_by_layer(self.layer_id)
+        return {
+            "expert_id_to_ep_rank_array": expert_id_to_ep_rank_array,
+            "expert_in_rank_num_list": expert_in_rank_num_list,
+            "tokens_per_expert_stats_list": tokens_per_expert_stats_list,
+            "redundant_ep_rank_num_plus_one": self.redundant_table_manger.redundant_experts_num + 1,
+        }
+
 
 class Glm4AFDAttnDecoderLayer(nn.Layer):
     def __init__(
         self,
         fd_config: FDConfig,
         prefix: str,
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
 
@@ -266,6 +297,7 @@ class Glm4AFDAttnDecoderLayer(nn.Layer):
                 fd_config,
                 layer_id=layer_id,
                 prefix=f"{prefix}.mlp",
+                redundant_table_manger=redundant_table_manger,
             )
         else:
             self.mlp = Glm4MoeMLP(
@@ -317,6 +349,7 @@ class Glm4AFDAttnModel(nn.Layer):
     def __init__(
         self,
         fd_config: FDConfig,
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
         self.num_layers = fd_config.model_config.num_hidden_layers
@@ -334,6 +367,7 @@ class Glm4AFDAttnModel(nn.Layer):
                 Glm4AFDAttnDecoderLayer(
                     fd_config,
                     prefix=f"{fd_config.model_config.pretrained_config.prefix_name}.layers.{i}",
+                    redundant_table_manger=redundant_table_manger,
                 )
                 for i in range(self.num_layers)
             ]
@@ -372,9 +406,9 @@ class Glm4AFDAttnModel(nn.Layer):
 class Glm4AFDFFNMoeBlock(nn.Layer):
     """Routed-expert weights for one MoE layer on the FFN worker.
 
-    ``FusedMoE`` is created with *physical* expert count so that the
-    weight tensor sizing and ``expert_id_offset`` are consistent with the
-    inflated expert space used by DeepEP.
+    ``FusedMoE`` keeps the model's logical expert count for checkpoint name
+    matching.  When EPLB is enabled, the redundant table manager supplies the
+    inflated AFD physical expert space used by dispatch/combine.
     """
 
     def __init__(
@@ -382,16 +416,19 @@ class Glm4AFDFFNMoeBlock(nn.Layer):
         fd_config: FDConfig,
         layer_id: int,
         prefix: str,
-        num_physical_experts: int,
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
+        num_experts = fd_config.model_config.n_routed_experts
+        if fd_config.afd_config.enable_afd and redundant_table_manger is None:
+            num_experts = AFDExpertLayout(fd_config.model_config.n_routed_experts).num_physical_experts
         self.experts = FusedMoE(
             fd_config,
             hidden_size=fd_config.model_config.hidden_size,
             reduce_results=True,
             renormalize=fd_config.model_config.norm_topk_prob,
             moe_intermediate_size=fd_config.model_config.moe_intermediate_size,
-            num_experts=num_physical_experts,
+            num_experts=num_experts,
             top_k=fd_config.model_config.num_experts_per_tok,
             topk_method="noaux_tc",
             topk_group=fd_config.model_config.topk_group,
@@ -399,13 +436,13 @@ class Glm4AFDFFNMoeBlock(nn.Layer):
             routed_scaling_factor=fd_config.model_config.routed_scaling_factor,
             layer_idx=layer_id,
             gate_correction_bias=None,
+            redundant_table_manger=redundant_table_manger,
             weight_key_map={
                 "up_gate_proj_expert_weight_key": f"{prefix}.experts.{{}}.up_gate_proj.weight",
                 "down_proj_expert_weight_key": f"{prefix}.experts.{{}}.down_proj.weight",
             },
             topk_reduce_func=lambda x: x.sum(axis=-1, keepdim=True) + 1e-20,
         )
-
 
 @support_graph_optimization
 class Glm4AFDFFNModel(nn.Layer):
@@ -421,7 +458,7 @@ class Glm4AFDFFNModel(nn.Layer):
         fd_config: FDConfig,
         afd_runner: AFDDecodeRunner,
         moe_layer_ids: List[int],
-        num_physical_experts: int,
+        redundant_table_manger: RedundantExpertManger = None,
     ) -> None:
         super().__init__()
         self._device = _local_device_from_config(fd_config)
@@ -434,7 +471,7 @@ class Glm4AFDFFNModel(nn.Layer):
                     fd_config=fd_config,
                     layer_id=layer_id,
                     prefix=f"model.layers.{layer_id}.mlp",
-                    num_physical_experts=num_physical_experts,
+                    redundant_table_manger=redundant_table_manger,
                 )
                 for layer_id in self._moe_layer_ids
             }
@@ -506,7 +543,6 @@ class Glm4AFDFFNModel(nn.Layer):
             dequant_scale,
         )
 
-
 # =====================================================================
 #  ATTN worker CausalLM
 # =====================================================================
@@ -518,10 +554,14 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
         paddle.device.set_device(self._device)
 
         # Initialise AFD singletons (first call creates, subsequent calls reuse)
-        self._afd_layout = AFDExpertLayout(fd_config.model_config.n_routed_experts)
+        self.redundant_table_manger = _create_redundant_table_manager(fd_config)
+        self._afd_layout = AFDExpertLayout(
+            fd_config.model_config.n_routed_experts,
+            fd_config.eplb_config.redundant_experts_num if fd_config.eplb_config.enable_eplb else 0,
+        )
         self._afd_runner = AFDDecodeRunner(fd_config, self._afd_layout)
 
-        self.model = Glm4AFDAttnModel(fd_config)
+        self.model = Glm4AFDAttnModel(fd_config, redundant_table_manger=self.redundant_table_manger)
 
         self.ori_vocab_size = fd_config.model_config.ori_vocab_size
 
@@ -622,6 +662,10 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
     def clear_grpah_opt_backend(self):
         self.model.clear_grpah_opt_backend(fd_config=self.fd_config)
 
+    @paddle.no_grad()
+    def update_state_dict(self, state_dict):
+        return None
+
 
 # =====================================================================
 #  FFN worker CausalLM
@@ -634,10 +678,12 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
         paddle.device.set_device(self._device)
 
         # Initialise AFD singletons (first call creates, subsequent calls reuse)
-        self._afd_layout = AFDExpertLayout(fd_config.model_config.n_routed_experts)
+        self.redundant_table_manger = _create_redundant_table_manager(fd_config)
+        self._afd_layout = AFDExpertLayout(
+            fd_config.model_config.n_routed_experts,
+            fd_config.eplb_config.redundant_experts_num if fd_config.eplb_config.enable_eplb else 0,
+        )
         self._afd_runner = AFDDecodeRunner(fd_config, self._afd_layout)
-
-        num_physical = self._afd_layout.num_physical_experts
 
         self._moe_layer_ids = list(
             range(fd_config.model_config.first_k_dense_replace, fd_config.model_config.num_hidden_layers)
@@ -646,11 +692,19 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
             fd_config,
             afd_runner=self._afd_runner,
             moe_layer_ids=self._moe_layer_ids,
-            num_physical_experts=num_physical,
+            redundant_table_manger=self.redundant_table_manger,
         )
 
         self._afd_ffn_graph_metas = self._build_afd_ffn_graph_metas()
         self._afd_ffn_graph_meta_index = 0
+        self._expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            num_experts=self.fd_config.model_config.n_routed_experts,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            param_gate_up_proj_name="experts.up_gate_proj_",
+            param_down_proj_name="experts.down_proj_",
+        )
 
     def _build_afd_ffn_graph_metas(self):
         capture_sizes = getattr(self.fd_config.graph_opt_config, "cudagraph_capture_sizes", None) or [1]
@@ -687,34 +741,19 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
     def name(cls):
         return "Glm4MoeForCausalLM_AFDFFN"
 
-    # ------------------------------------------------------------------
-    #  Weight loading – map logical expert id → physical expert id
-    # ------------------------------------------------------------------
     @paddle.no_grad()
     def load_weights(self, weights_iterator):
         from fastdeploy.model_executor.utils import process_weights_after_loading
 
-        # Mapping uses *logical* num_experts so that weight_name patterns
-        # match checkpoint filenames  (experts.0.gate_proj, … experts.63…)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            num_experts=self.fd_config.model_config.n_routed_experts,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            param_gate_up_proj_name="experts.up_gate_proj_",
-            param_down_proj_name="experts.down_proj_",
-        )
         params_dict = dict(self.named_parameters())
         process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()), self.fd_config)
         loaded_names: List[str] = []
-
-        afd_layout = self._afd_layout
 
         for loaded_weight_name, loaded_weight in weights_iterator:
             if ".mlp.experts." not in loaded_weight_name:
                 continue
 
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            for param_name, weight_name, expert_id, shard_id in self._expert_params_mapping:
                 if weight_name not in loaded_weight_name:
                     continue
                 model_param_name = loaded_weight_name.replace(weight_name, param_name)
@@ -724,10 +763,9 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
                     continue
                 param = params_dict[model_param_name]
 
-                # expert_id from checkpoint is *logical* (0 .. n_routed-1).
-                # Convert to *physical* so the FusedMoE weight_loader places
-                # it at the correct local offset for this rank.
-                physical_expert_id = afd_layout.router_log2phy(expert_id)
+                physical_expert_id = expert_id
+                if self.redundant_table_manger is None:
+                    physical_expert_id = self._afd_layout.router_log2phy(expert_id)
                 param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=physical_expert_id)
 
                 loaded_names.append(loaded_weight_name)
@@ -768,3 +806,65 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
     def clear_grpah_opt_backend(self):
         self.model.clear_grpah_opt_backend(fd_config=self.fd_config)
         self._afd_ffn_graph_meta_index = 0
+
+    @paddle.no_grad()
+    def update_state_dict(self, state_dict):
+        from fastdeploy.model_executor.utils import process_weights_after_loading
+
+        if isinstance(state_dict, list):
+            state_dict = dict(state_dict)
+        if not any(key.startswith("model.layers.") and ".mlp.experts." in key for key in state_dict):
+            self.model.update_state_dict(state_dict)
+            return
+
+        params_dict = dict(self.named_parameters())
+        process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()), self.fd_config)
+        updated_layers = set()
+
+        for loaded_weight_name, loaded_weight in state_dict.items():
+            if ".mlp.experts." not in loaded_weight_name:
+                continue
+            layer_id = int(loaded_weight_name.split(".mlp.experts.", 1)[0].rsplit(".", 1)[-1])
+            if layer_id not in self._moe_layer_ids:
+                continue
+            if layer_id not in updated_layers:
+                logger.info(f"Start AFD FFN update layer {layer_id}")
+                updated_layers.add(layer_id)
+            for param_name, weight_name, expert_id, shard_id in self._expert_params_mapping:
+                if weight_name not in loaded_weight_name:
+                    continue
+                model_param_name = loaded_weight_name.replace(weight_name, param_name)
+                model_param_name = model_param_name.replace("model.layers.", "model.moe_blocks.")
+                model_param_name = model_param_name.replace(".mlp.experts.", ".experts.")
+                if model_param_name not in params_dict:
+                    continue
+                param = params_dict[model_param_name]
+                moe_block = self.model.moe_blocks[str(layer_id)]
+                weight_loader = getattr(param, "weight_loader", moe_block.experts.weight_loader)
+                physical_expert_id = expert_id
+                if self.redundant_table_manger is None:
+                    physical_expert_id = self._afd_layout.router_log2phy(expert_id)
+                weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=physical_expert_id)
+                model_sublayer_name = re.sub(
+                    r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name
+                )
+                process_weights_after_loading_fn(model_sublayer_name, param)
+                break
+        for layer_id in sorted(updated_layers):
+            logger.info(f"Finish AFD FFN update layer {layer_id}")
+
+
+ModelRegistry.register_model_class(
+    Glm4MoeForCausalLM_AFDAttn,
+    architecture="Glm4MoeForCausalLM_AFDAttn",
+    module_name="afd_model.glm4moe_afd",
+    category=ModelCategory.TEXT_GENERATION,
+    primary_use=ModelCategory.TEXT_GENERATION,
+)
+ModelRegistry.register_model_class(
+    Glm4MoeForCausalLM_AFDFFN,
+    architecture="Glm4MoeForCausalLM_AFDFFN",
+    module_name="afd_model.glm4moe_afd",
+    category=ModelCategory.TEXT_GENERATION,
+    primary_use=ModelCategory.TEXT_GENERATION,
+)

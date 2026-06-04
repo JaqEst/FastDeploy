@@ -74,21 +74,27 @@ class AFDExpertLayout:
                         + (logical_id % num_local_physical_experts)
     """
 
-    def __init__(self, n_routed_experts: int) -> None:
+    def __init__(self, n_routed_experts: int, redundant_experts_num: int = 0) -> None:
         self.afd_world_topology = AFDWorldTopology()
         self.num_attn_ranks = len(self.afd_world_topology.attn_ranks)
         self.num_ffn_ranks = len(self.afd_world_topology.ffn_ranks)
         self.world_size = self.afd_world_topology.world_size
 
         self.num_logical_experts = n_routed_experts
+        self.redundant_experts_num = redundant_experts_num
         if n_routed_experts <= 0:
             raise ValueError(f"n_routed_experts must be positive, got {n_routed_experts}")
-        if n_routed_experts % self.num_ffn_ranks != 0:
+        if redundant_experts_num < 0:
+            raise ValueError(f"redundant_experts_num must be non-negative, got {redundant_experts_num}")
+        self.num_ffn_physical_experts = n_routed_experts + redundant_experts_num
+        if self.num_ffn_physical_experts % self.num_ffn_ranks != 0:
             raise ValueError(
-                "AFD requires logical experts to be evenly sharded over FFN ranks: "
-                f"n_routed_experts={n_routed_experts}, num_ffn_ranks={self.num_ffn_ranks}"
+                "AFD requires logical + redundant experts to be evenly sharded over FFN ranks: "
+                f"n_routed_experts={n_routed_experts}, "
+                f"redundant_experts_num={redundant_experts_num}, "
+                f"num_ffn_ranks={self.num_ffn_ranks}"
             )
-        self.num_local_physical_experts = n_routed_experts // self.num_ffn_ranks
+        self.num_local_physical_experts = self.num_ffn_physical_experts // self.num_ffn_ranks
         self.num_physical_experts = self.num_local_physical_experts * self.world_size
 
         # log2phy: logical expert -> list of physical expert IDs
@@ -112,6 +118,7 @@ class AFDExpertLayout:
 
         logger.info(
             f"AFDExpertLayout: logical={n_routed_experts}, "
+            f"redundant={redundant_experts_num}, "
             f"physical={self.num_physical_experts}, "
             f"local_per_rank={self.num_local_physical_experts}, "
             f"attn_ranks={self.afd_world_topology.attn_ranks}, "

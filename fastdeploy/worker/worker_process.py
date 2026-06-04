@@ -400,6 +400,25 @@ class PaddleDisWorkerProc:
         """
         import time
 
+        if self.fd_config.afd_config.afd_role == "attn":
+            redundant_table_manger = self.worker.get_model().redundant_table_manger
+            if redundant_table_manger is None:
+                raise RuntimeError("AFD ATTN EPLB update requires a redundant table manager.")
+            rank_expert_list, logical_to_physical_map, expert_count = (
+                self.experts_manager.get_ep_rank_to_expert_id_list()
+            )
+            redundant_table_manger.update_expert_rank_table(rank_expert_list, logical_to_physical_map, expert_count)
+            valid_phy = rank_expert_list[rank_expert_list >= 0]
+            valid_log2phy = logical_to_physical_map[logical_to_physical_map >= 0]
+            logger.info(
+                "redundant_expert: AFD ATTN routing table updated, "
+                f"phy_shape={rank_expert_list.shape}, log2phy_shape={logical_to_physical_map.shape}, "
+                f"valid_phy={valid_phy.size}, valid_log2phy={valid_log2phy.size}, "
+                f"phy_sum={int(np.sum(valid_phy)) if valid_phy.size > 0 else 0}, "
+                f"log2phy_sum={int(np.sum(valid_log2phy)) if valid_log2phy.size > 0 else 0}"
+            )
+            return
+
         while True:
             if self.experts_manager.tensor_infos is None:
                 time.sleep(0.1)
@@ -413,6 +432,12 @@ class PaddleDisWorkerProc:
         # TO BE FIXED
         self.worker.get_model().update_state_dict(state_dicts)
         self.experts_manager.tensor_infos = None
+
+    def _get_eplb_update_group_and_src(self):
+        """Get the TP-local group/source for broadcasting EPLB update signals."""
+        if self.fd_config.afd_config.enable_afd:
+            return self.parallel_config.tp_group, self.fd_config.afd_config.afd_node_srank
+        return None, 0
 
     def _broadcast_model_weights_signal(self, src: int, group) -> int:
         model_weights_signal_tensor = paddle.full(shape=[1], fill_value=self.model_weights_signal[0], dtype="int32")
@@ -483,14 +508,17 @@ class PaddleDisWorkerProc:
             create=False,
         )
 
-        self.mmap_infos = create_mmap(
-            [MODEL_MAIN_NAME],
-            self.parallel_config.expert_parallel_rank,
-            self.parallel_config.expert_parallel_size,
-            shm_uuid=self.parallel_config.local_engine_worker_queue_port,
-            eplb_config=self.eplb_config,
-            logger=logger,
-        )
+        if self.fd_config.afd_config.afd_role == "attn":
+            self.mmap_infos = None
+        else:
+            self.mmap_infos = create_mmap(
+                [MODEL_MAIN_NAME],
+                self.parallel_config.expert_parallel_rank,
+                self.parallel_config.expert_parallel_size,
+                shm_uuid=self.parallel_config.local_engine_worker_queue_port,
+                eplb_config=self.eplb_config,
+                logger=logger,
+            )
 
     def _run_eplb(self, tp_rank):
         """internal call to run eplb"""
@@ -525,13 +553,14 @@ class PaddleDisWorkerProc:
             self.signal_update_weight_from_tensor_array.value[0] = 0
             broadcast_value = REARRANGE_EXPERT_MAGIC_NUM
         data = paddle.to_tensor([broadcast_value])
-        paddle.distributed.broadcast(data, 0)
+        group, src = self._get_eplb_update_group_and_src()
+        paddle.distributed.broadcast(data, src=src, group=group)
         if data[0] == REARRANGE_EXPERT_MAGIC_NUM:
             self.update_weights_from_tensor(self.mmap_infos)
             logger.info(
                 f"redundant_expert: update_weight_from_tensor success, cost {(time.time() - rearrange_time)*1000}ms"
             )
-            paddle.distributed.barrier()
+            paddle.distributed.barrier(group)
             if tp_rank == 0:
                 self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
             logger.info("redundant_expert: done")
@@ -760,6 +789,7 @@ class PaddleDisWorkerProc:
                 self.worker_healthy_live_signal.value[tp_rank] = int(time.time())
                 with paddle.no_grad():
                     self.worker.execute_model(None, 0)
+                self._run_eplb(tp_rank)
             except Exception:
                 logger.error(
                     "AFD FFN participant loop failed. "

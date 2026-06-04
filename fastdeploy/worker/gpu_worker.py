@@ -70,6 +70,8 @@ class GpuWorker(WorkerBase):
 
             gc.collect()
             paddle.device.cuda.empty_cache()
+            # if envs.FD_MOE_A2A_BACKEND == "mooncake" and not self.parallel_config.disable_custom_all_reduce:
+            #     raise RuntimeError("Mooncake backend requires --disable-custom-all-reduce.")
             if (
                 not self.parallel_config.disable_custom_all_reduce
                 and self.parallel_config.tensor_parallel_size > 1

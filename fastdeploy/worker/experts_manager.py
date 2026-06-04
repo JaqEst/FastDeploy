@@ -21,6 +21,10 @@ import numpy as np
 import paddle
 from paddleformers.utils.log import logger
 
+from fastdeploy.eplb.afd_utils import (
+    build_afd_redundant_expert_tables,
+    get_afd_expert_layout_sizes,
+)
 from .eplb import rebalance_experts
 
 
@@ -35,15 +39,33 @@ class RedundantExpertManger:
         num_hidden_layers: int,
         redundant_experts_num: int,
         ep_size: int,
+        enable_afd: bool = False,
     ) -> None:
         """Initialize a redundant expert manager"""
         self.num_expert = n_routed_experts if isinstance(n_routed_experts, int) else n_routed_experts[0]
         self.redundant_experts_num = redundant_experts_num
         self.num_hidden_layers = num_hidden_layers
 
-        self.num_replicas = self.num_expert + self.redundant_experts_num
-        self.num_nodes = max(ep_size // 8, 8)
-        self.num_gpus = ep_size
+        self._afd_world_topology = None
+        if enable_afd:
+            from fastdeploy.model_executor.afd import AFDWorldTopology
+
+            self._afd_world_topology = AFDWorldTopology()
+
+        if self._afd_world_topology is None:
+            self.num_replicas = self.num_expert + self.redundant_experts_num
+            self.num_nodes = max(ep_size // 8, 8)
+            self.num_gpus = ep_size
+        else:
+            _, _, global_physical_experts = get_afd_expert_layout_sizes(
+                num_logical_experts=self.num_expert,
+                redundant_experts_num=self.redundant_experts_num,
+                world_size=self._afd_world_topology.world_size,
+                ffn_ranks=self._afd_world_topology.ffn_ranks,
+            )
+            self.num_replicas = global_physical_experts
+            self.num_nodes = max(len(self._afd_world_topology.ffn_ranks) // 8, 1)
+            self.num_gpus = len(self._afd_world_topology.ffn_ranks)
         self.num_groups = 1
 
         self.export_per_rank = self.num_replicas // ep_size
@@ -55,7 +77,7 @@ class RedundantExpertManger:
         self.model_ep_rank_to_expert_id_list = paddle.full(
             shape=[
                 self.num_hidden_layers,
-                self.num_expert + self.redundant_experts_num,
+                self.num_replicas,
             ],
             fill_value=-1,
             dtype="int32",
@@ -89,12 +111,8 @@ class RedundantExpertManger:
             shape=[self.num_hidden_layers, self.num_expert], dtype="int32"
         )
 
-        rank_expert_list, logical_to_physical_map, expert_count = rebalance_experts(
-            self.model_tokens_per_expert_stats_list.cpu().numpy(),
-            self.num_replicas,
-            self.num_groups,
-            self.num_nodes,
-            self.num_gpus,
+        rank_expert_list, logical_to_physical_map, expert_count = self._rebalance_experts(
+            self.model_tokens_per_expert_stats_list.cpu().numpy()
         )
 
         self.update_expert_rank_table(rank_expert_list, logical_to_physical_map, expert_count, False)
@@ -102,6 +120,27 @@ class RedundantExpertManger:
         logger.info(
             f"moe experts table manager init successfully, ep_size {ep_size} \
             num_replicas {self.num_replicas} export_per_rank {self.export_per_rank}"
+        )
+
+    def _rebalance_experts(self, weight: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._afd_world_topology is None:
+            return rebalance_experts(
+                weight,
+                self.num_replicas,
+                self.num_groups,
+                self.num_nodes,
+                self.num_gpus,
+            )
+
+        return build_afd_redundant_expert_tables(
+            weight=weight,
+            num_replicas=self.num_replicas,
+            world_size=self._afd_world_topology.world_size,
+            ffn_ranks=self._afd_world_topology.ffn_ranks,
+            redundant_experts_num=self.redundant_experts_num,
+            num_groups=self.num_groups,
+            num_nodes=self.num_nodes,
+            num_gpus=self.num_gpus,
         )
 
     def get_ep_rank_to_expert_id_list_by_layer(
@@ -117,17 +156,14 @@ class RedundantExpertManger:
             self.model_tokens_per_expert_stats_list[layer_id],
         )
 
-    def get_ep_rank_to_expert_id_list(
-        self, layer_id: int
-    ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, paddle.Tensor]:
+    def get_ep_rank_to_expert_id_list(self) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
         """
         get_ep_rank_to_expert_id_list
         """
         return (
-            self.model_ep_rank_to_expert_id_list[layer_id],
-            self.model_expert_id_to_ep_rank_array[layer_id],
-            self.model_expert_in_rank_num_list[layer_id],
-            self.model_tokens_per_expert_stats_list[layer_id],
+            self.model_ep_rank_to_expert_id_list,
+            self.model_expert_id_to_ep_rank_array,
+            self.model_expert_in_rank_num_list,
         )
 
     def get_expert_tokens_stats(

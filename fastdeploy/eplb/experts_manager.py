@@ -24,9 +24,14 @@ import requests
 
 from fastdeploy.config import FDConfig
 from fastdeploy.eplb.async_expert_loader import load_model_weights_process
+from fastdeploy.eplb.afd_utils import (
+    build_afd_redundant_expert_tables,
+    get_afd_expert_layout_sizes,
+)
 from fastdeploy.eplb.eplb import rebalance_experts
 from fastdeploy.eplb.utils import RedundantExpertWorkload
 from fastdeploy.inter_communicator import IPCSignal, RearrangeExpertStatus
+from fastdeploy.model_executor.afd import AFDWorldTopology
 from fastdeploy.utils import get_logger
 
 
@@ -56,10 +61,26 @@ class RedundantExpertManager:
         self.ipc_signal_suffix = ipc_signal_suffix
         self.local_rank = self.rank % self.fd_config.parallel_config.tensor_parallel_size
 
-        self.num_replicas = self.num_logical_experts + self.num_redundant_experts
+        self._afd_world_topology = None
+        if self.fd_config.afd_config.enable_afd:
+            self._afd_world_topology = AFDWorldTopology()
+        self._is_afd_attn = self.fd_config.afd_config.enable_afd and self.fd_config.afd_config.afd_role == "attn"
+
+        if self._afd_world_topology is None:
+            self.num_replicas = self.num_logical_experts + self.num_redundant_experts
+            self.num_nodes = max(ep_size // 8, 1)
+            self.num_gpus = ep_size
+        else:
+            _, _, global_physical_experts = get_afd_expert_layout_sizes(
+                num_logical_experts=self.num_logical_experts,
+                redundant_experts_num=self.num_redundant_experts,
+                world_size=self._afd_world_topology.world_size,
+                ffn_ranks=self._afd_world_topology.ffn_ranks,
+            )
+            self.num_replicas = global_physical_experts
+            self.num_nodes = max(len(self._afd_world_topology.ffn_ranks) // 8, 1)
+            self.num_gpus = len(self._afd_world_topology.ffn_ranks)
         self.num_groups = self.num_logical_experts
-        self.num_nodes = max(ep_size // 8, 1)
-        self.num_gpus = ep_size
         self.expert_per_rank = self.num_replicas // ep_size
         assert (
             self.num_replicas % ep_size == 0
@@ -69,7 +90,7 @@ class RedundantExpertManager:
         self.model_ep_rank_to_expert_id_list = np.full(
             (
                 self.num_hidden_layers,
-                self.num_logical_experts + self.num_redundant_experts,
+                self.num_replicas,
             ),
             -1,
             dtype=np.int32,
@@ -91,7 +112,7 @@ class RedundantExpertManager:
         self.last_model_ep_rank_to_expert_id_list = np.full(
             (
                 self.num_hidden_layers,
-                self.num_logical_experts + self.num_redundant_experts,
+                self.num_replicas,
             ),
             -1,
             dtype=np.int32,
@@ -116,6 +137,7 @@ class RedundantExpertManager:
 
         self.dp_rank_address = None
         self.need_allgather_load_weight_result = False
+        self.need_update_weight_from_tensor = False
         self.load_weight_begin_ts = 0
         self.load_weight_timeout = 300  # 5min
         self.need_rearrange_expert = False
@@ -127,25 +149,26 @@ class RedundantExpertManager:
 
         self.tensor_infos = None
 
-        self.parent_data_conn, child_data_conn = Pipe()
-        self.parent_mg_conn, child_mg_conn = Pipe()
-        Process(
-            target=load_model_weights_process,
-            name=f"eplb::async_load_model_{rank}",
-            args=(
-                self.rank,
-                self.fd_config.model_config.model,
-                self.expert_per_rank,
-                self.fd_config.model_config.moe_layer_start_index,
-                self.eplb_config.moe_quant_type,
-                self.ipc_signal_suffix,
-                self.eplb_config,
-                child_data_conn,
-                child_mg_conn,
-            ),
-        ).start()
-        child_data_conn.close()
-        child_mg_conn.close()
+        if not self._is_afd_attn:
+            self.parent_data_conn, child_data_conn = Pipe()
+            self.parent_mg_conn, child_mg_conn = Pipe()
+            Process(
+                target=load_model_weights_process,
+                name=f"eplb::async_load_model_{rank}",
+                args=(
+                    self.rank,
+                    self.fd_config.model_config.model,
+                    self.expert_per_rank,
+                    self.fd_config.model_config.moe_layer_start_index,
+                    self.eplb_config.moe_quant_type,
+                    self.ipc_signal_suffix,
+                    self.eplb_config,
+                    child_data_conn,
+                    child_mg_conn,
+                ),
+            ).start()
+            child_data_conn.close()
+            child_mg_conn.close()
 
         listen_signal_thread = threading.Thread(target=self.listen_rearrange_expert_signal, args=(), daemon=True)
         listen_signal_thread.start()
@@ -247,6 +270,7 @@ class RedundantExpertManager:
                     self.logger.info(f"redundant_expert: all rank ips {address}")
                     rearrange_experts_ips_size_signal.value[0] = 0
                     rearrange_experts_signal.value[0] = RearrangeExpertStatus.DOING.value
+                    self.rearrange_end_ts = 0
 
                     self.dp_rank_address = address.strip().split(";")
                     if self.allreduce_experts_stat():
@@ -261,17 +285,27 @@ class RedundantExpertManager:
                     self.need_allgather_load_weight_result = False
                     rearrange_experts_signal.value[0] = RearrangeExpertStatus.LOAD_SUCC.value
                     self.rearrange_end_ts = now
-                if rearrange_experts_signal.value[0] > 1 and (
-                    now - self.rearrange_end_ts > self.rearrange_reset_interval
-                ):
-                    # reset rearrange status
-                    rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
+                    if self.need_update_weight_from_tensor:
+                        if self.notify_update_weight_from_tensor():
+                            self.need_update_weight_from_tensor = False
+                        else:
+                            self.need_allgather_load_weight_result = True
+                if rearrange_experts_signal.value[0] > 1:
+                    if self.rearrange_end_ts == 0:
+                        self.rearrange_end_ts = now
+                    if now - self.rearrange_end_ts > self.rearrange_reset_interval:
+                        # reset rearrange status
+                        rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
+                        self.rearrange_end_ts = 0
 
             if signal_update_weight_from_disk_array.value[0] == 1:
                 # step 2. async load weight: disk -> memory
                 self.model_tokens_per_expert_stats_list[:] = shm_all_experts_token_stats.value[:]
                 self.caculate_expert_rank_table()
-                self.update_weight_from_disk()
+                if self._is_afd_attn:
+                    self.update_weight_from_disk_result.value[0] = 1
+                else:
+                    self.update_weight_from_disk()
                 signal_update_weight_from_disk_array.value[0] = 0
             time.sleep(0.5)
 
@@ -285,18 +319,32 @@ class RedundantExpertManager:
         eplb_strategy = self.eplb_config.redundant_expert_eplb_strategy
         if is_init:
             num_groups = 1
-            num_nodes = 8
-            num_gpus = 8 * 8
             eplb_strategy = ""
+            if self._afd_world_topology is None:
+                num_nodes = 8
+                num_gpus = 8 * 8
         # eplb
-        rank_expert_list, logical_to_physical_map, expert_count = rebalance_experts(
-            self.model_tokens_per_expert_stats_list,
-            self.num_replicas,
-            num_groups,
-            num_nodes,
-            num_gpus,
-            eplb_strategy,
-        )
+        if self._afd_world_topology is None:
+            rank_expert_list, logical_to_physical_map, expert_count = rebalance_experts(
+                self.model_tokens_per_expert_stats_list,
+                self.num_replicas,
+                num_groups,
+                num_nodes,
+                num_gpus,
+                eplb_strategy,
+            )
+        else:
+            rank_expert_list, logical_to_physical_map, expert_count = build_afd_redundant_expert_tables(
+                weight=self.model_tokens_per_expert_stats_list,
+                num_replicas=self.num_replicas,
+                world_size=self._afd_world_topology.world_size,
+                ffn_ranks=self._afd_world_topology.ffn_ranks,
+                redundant_experts_num=self.num_redundant_experts,
+                num_groups=num_groups,
+                num_nodes=num_nodes,
+                num_gpus=num_gpus,
+                eplb_strategy=eplb_strategy,
+            )
 
         # backup info
         self.last_model_ep_rank_to_expert_id_list[:] = self.model_ep_rank_to_expert_id_list[:]
@@ -449,13 +497,67 @@ class RedundantExpertManager:
         if not exist_fail and all_success:
             # prefill需要等待调度屏蔽
             if (
-                self.fd_config.scheduler_config.splitwise_role == "mixed"
+                self.fd_config.afd_config.enable_afd
+                or self.fd_config.scheduler_config.splitwise_role == "mixed"
                 or self.fd_config.scheduler_config.splitwise_role == "decode"
                 or not self.eplb_config.redundant_expert_enable_schedule_cordon
             ):
-                self.logger.info("redundant_expert: allreduce_load_weight_result success, notify infer.py")
-                self.signal_update_weight_from_tensor_array.value[0] = 1
+                self.need_update_weight_from_tensor = True
         return True
+
+    def notify_update_weight_from_tensor(self):
+        """
+        Notify workers to apply loaded tensors and routing tables to the model.
+        """
+        if self.fd_config.afd_config.enable_afd:
+            return self.broadcast_update_weight_from_tensor()
+
+        if (
+            self.fd_config.scheduler_config.splitwise_role == "mixed"
+            or self.fd_config.scheduler_config.splitwise_role == "decode"
+            or not self.eplb_config.redundant_expert_enable_schedule_cordon
+        ):
+            self.logger.info("redundant_expert: allreduce_load_weight_result success, notify infer.py")
+            self.signal_update_weight_from_tensor_array.value[0] = 1
+        return True
+
+    def broadcast_update_weight_from_tensor(self):
+        """
+        Broadcast the final disk-to-model update signal to all rearrange participants.
+        """
+        success_count = 0
+        for addr in self.dp_rank_address:
+            try:
+                params = {
+                    "user": self.api_user,
+                    "passwd": self.api_passwd,
+                    "action": "update_weight_from_tensor",
+                    "from_controller": True,
+                }
+                res = requests.post(
+                    f"http://{addr}/rearrange_experts",
+                    json=params,
+                    timeout=self.http_timeout,
+                )
+                if res.status_code != HTTPStatus.OK:
+                    self.logger.warning(
+                        "redundant_expert: broadcast_update_weight_from_tensor fail. "
+                        + f"addr {addr}, res {res.status_code} {res.json()}"
+                    )
+                    break
+                success_count += 1
+            except Exception as e:
+                self.logger.error(
+                    f"redundant_expert: broadcast_update_weight_from_tensor request fail. addr {addr}, error {e}"
+                )
+        if success_count == len(self.dp_rank_address):
+            self.logger.info("redundant_expert: broadcast_update_weight_from_tensor success")
+            return True
+        self.logger.info(
+            "redundant_expert: broadcast_update_weight_from_tensor failed, "
+            + f"succ {success_count} total {len(self.dp_rank_address)}"
+        )
+        return False
 
     def allgather_load_weight_result(self):
         """
@@ -498,7 +600,7 @@ class RedundantExpertManager:
                     elif result == 0:
                         unfinish_count += 1
                         self.logger.debug(
-                            f"edundant_expert: allgather_load_weight_result unfinish. addr {addr}, result {result}"
+                            f"redundant_expert: allgather_load_weight_result unfinish. addr {addr}, result {result}"
                         )
             except Exception as e:
                 self.logger.error(f"redundant_expert: allgather_load_weight_result error. addr {addr}, error {e}")
