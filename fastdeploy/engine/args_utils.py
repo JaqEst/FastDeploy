@@ -586,6 +586,11 @@ class EngineArgs:
     Deployment modality for the serving engine. Options: mixed, text. Default is mixed.
     """
 
+    enable_fault_tolerant: bool = False
+    """
+    Enable worker-process fault tolerance. (Only available for FFN roles)
+    """
+
     def __post_init__(self):
         """
         Post-initialization processing to set default tokenizer if not provided.
@@ -710,29 +715,38 @@ class EngineArgs:
             return ports
 
         num_nodes = len(self.ips) if self.ips else 1
-        if self.data_parallel_size % num_nodes != 0:
-            raise ValueError(
-                f"data_parallel_size ({self.data_parallel_size}) must be divisible by num_nodes ({num_nodes})."
-            )
+        if self.afd_role is not None:
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    f"data_parallel_size must be 1 when using AFD, but got {self.data_parallel_size}."
+                )
+            local_data_parallel_size = 1
+        else:
+            if self.data_parallel_size % num_nodes != 0:
+                raise ValueError(
+                    f"data_parallel_size ({self.data_parallel_size}) must be divisible by num_nodes ({num_nodes})."
+                )
+            local_data_parallel_size = self.data_parallel_size // num_nodes
+
         self.engine_worker_queue_port = post_init_ports(
             "engine_worker_queue_port",
             self.engine_worker_queue_port,
-            self.data_parallel_size // num_nodes,
+            local_data_parallel_size,
         )
         self.cache_queue_port = post_init_ports(
             "cache_queue_port",
             self.cache_queue_port,
-            self.data_parallel_size // num_nodes,
+            local_data_parallel_size,
         )
         self.rdma_comm_ports = post_init_ports(
             "rdma_comm_ports",
             self.rdma_comm_ports,
-            self.tensor_parallel_size * self.data_parallel_size // num_nodes,
+            self.tensor_parallel_size * local_data_parallel_size,
         )
         self.pd_comm_port = post_init_ports(
             "pd_comm_port",
             self.pd_comm_port,
-            self.data_parallel_size // num_nodes,
+            local_data_parallel_size,
         )
 
     @staticmethod
@@ -1205,6 +1219,13 @@ class EngineArgs:
             help="IP addresses of all nodes participating in distributed inference.",
         )
 
+        system_group.add_argument(
+            "--enable-fault-tolerant",
+            action="store_true",
+            default=EngineArgs.enable_fault_tolerant,
+            help="Enable worker-process fault tolerance.",
+        )
+
         # Performance tuning parameters group
         perf_group = parser.add_argument_group("Performance Tuning")
         perf_group.add_argument(
@@ -1615,4 +1636,5 @@ class EngineArgs:
             early_stop_config=early_stop_cfg,
             routing_replay_config=routing_replay_config,
             deploy_modality=DeployModality.from_str(self.deploy_modality),
+            enable_fault_tolerant=self.enable_fault_tolerant,
         )

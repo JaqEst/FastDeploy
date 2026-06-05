@@ -70,7 +70,7 @@ from fastdeploy.model_executor.layers.quantization import parse_quant_config
 from fastdeploy.model_executor.utils import v1_loader_support
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
-from fastdeploy.utils import all_gather_values, get_logger, optional_type
+from fastdeploy.utils import all_gather_values, get_logger, optional_type, get_host_ip
 from fastdeploy.worker.worker_base import WorkerBase
 
 logger = get_logger("worker_process", "worker_process.log")
@@ -137,7 +137,7 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
         # Set control in tensor parallel
         dist_strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
         fleet.init(is_collective=True, strategy=dist_strategy)
-        
+
         global_rank = fleet.worker_index()
     else:
         global_rank = 0
@@ -145,7 +145,11 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
     if envs.FD_USE_MOONCAKE_PG:
         from mooncake.paddle_integration import init_mooncake_pg
         ib_devices = envs.FD_MOONCAKE_IB_DEVICES.split(",") if envs.FD_MOONCAKE_IB_DEVICES else None
-        init_mooncake_pg(world_size, global_rank, ib_device_filter=ib_devices, clean_existed_groups=True, logger=logger)
+        init_mooncake_pg(
+            world_size, global_rank,
+            host_ip=get_host_ip(),
+            ib_device_filter=ib_devices,
+            clean_existed_groups=True, logger=logger)
 
     return world_size, global_rank
 
@@ -179,7 +183,7 @@ def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int,
             ffn_ranks.append(item["global_rank"])
         else:
             raise ValueError(f"Unknown AFD role: {item['afd_role']}")
-        
+
         node_ranks = ranks_map.setdefault(item["afd_nnode_rank"], [])
         node_ranks.append(item["global_rank"])
 
@@ -1480,7 +1484,7 @@ def run_worker_proc() -> None:
     # afd_node_srank: 当前 api_server 实例在整个 world 中的起始 rank
 
     world_size, global_rank = init_distributed_environment()
-    
+
     local_rank = global_rank
     ranks = world_size
     afd_node_srank = 0

@@ -2001,6 +2001,7 @@ class FDConfig:
         test_mode=False,
         routing_replay_config: Optional[RoutingReplayConfig] = None,
         deploy_modality: DeployModality = DeployModality.MIXED,
+        enable_fault_tolerant: bool = False,
     ):
         self.model_config: ModelConfig = model_config  # type: ignore
         self.cache_config: CacheConfig = cache_config  # type: ignore
@@ -2018,6 +2019,7 @@ class FDConfig:
         self.router_config: RouterConfig = router_config
         self.routing_replay_config = routing_replay_config
         self.deploy_modality: DeployModality = deploy_modality
+        self.enable_fault_tolerant: bool = enable_fault_tolerant
         self.afd_config: AFDConfig = afd_config
         # Initialize cuda graph capture list
         max_capture_shape = self.scheduler_config.max_num_seqs
@@ -2170,7 +2172,7 @@ class FDConfig:
 
         if self.afd_config.enable_afd and self.afd_config.afd_master is not None:
             self.is_master = self.node_rank == 0
-            self.master_ip = self.afd_config.afd_master.split(":")[0]
+            self.master_ip = "0.0.0.0"
         elif self.parallel_config.tensor_parallel_size <= self.worker_num_per_node or self.node_rank == 0:
             self.is_master = True
             self.master_ip = "0.0.0.0"

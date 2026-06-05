@@ -589,8 +589,31 @@ class EngineClient:
         Check the health of the model server by checking whether all workers are alive.
 
         """
-        if self.worker_healthy_live_signal.value[0]:
-            elapsed_time = time.time() - self.worker_healthy_live_signal.value[0]
+        live_times = self.worker_healthy_live_signal.value
+        if self.fd_config.enable_fault_tolerant:
+            current_time = time.time()
+            timeout_worker_ids = []
+            live_worker_ids = []
+            for worker_id, live_time in enumerate(live_times):
+                if current_time - live_time > time_interval_threashold:
+                    timeout_worker_ids.append(worker_id)
+                else:
+                    live_worker_ids.append(worker_id)
+
+            if live_worker_ids:
+                if timeout_worker_ids:
+                    return (
+                        True,
+                        "Worker Service Degraded: "
+                        f"live_workers={live_worker_ids}, "
+                        f"timeout_workers={timeout_worker_ids}",
+                    )
+                return True, ""
+
+            return False, f"Worker Service Not Healthy: timeout_workers={timeout_worker_ids}"
+
+        if live_times[0]:
+            elapsed_time = time.time() - live_times[0]
             if elapsed_time > time_interval_threashold:
                 return False, "Worker Service Not Healthy"
 

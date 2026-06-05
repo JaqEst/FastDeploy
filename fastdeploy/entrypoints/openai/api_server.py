@@ -336,13 +336,13 @@ async def connection_manager():
 def health(request: Request) -> Response:
     """Health check."""
 
-    status, msg = app.state.engine_client.check_health()
+    status, health_msg = app.state.engine_client.check_health()
     if not status:
-        return Response(content=msg, status_code=404)
+        return Response(content=health_msg, status_code=404)
     status, msg = app.state.engine_client.is_workers_alive()
     if not status:
         return Response(content=msg, status_code=304)
-    return Response(status_code=200)
+    return Response(content=health_msg, status_code=200)
 
 
 @app.get("/load")
