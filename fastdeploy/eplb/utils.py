@@ -17,6 +17,7 @@
 import json
 import os
 import time
+import hashlib
 
 import numpy as np
 
@@ -63,6 +64,91 @@ class RedundantExpertWorkload:
                 return self.__json__(), "ok"
         except Exception as e:
             return {}, f"redundant_expert: load file {self.meta_file_name} failed, {e}"
+
+
+def _as_numpy_int_array(value):
+    if hasattr(value, "cpu"):
+        value = value.cpu().numpy()
+    return np.asarray(value, dtype=np.int32)
+
+
+def build_redundant_expert_table_snapshot(
+    *,
+    fd_config: FDConfig,
+    rank_expert_list,
+    logical_to_physical_map,
+    expert_count,
+    source: str,
+    local_rank: int = None,
+    clear_stat: bool = None,
+):
+    """Build a readable EPLB table snapshot without mutating the table."""
+    rank_expert_array = _as_numpy_int_array(rank_expert_list)
+    logical_to_physical_array = _as_numpy_int_array(logical_to_physical_map)
+    expert_count_array = _as_numpy_int_array(expert_count)
+
+    table_payload = {
+        "ep_rank_to_expert_id_list": rank_expert_array.tolist(),
+        "expert_id_to_ep_rank_array": logical_to_physical_array.tolist(),
+        "expert_in_rank_num_list": expert_count_array.tolist(),
+    }
+    table_hash = hashlib.sha256(json.dumps(table_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    slots_per_rank = int(getattr(fd_config.afd_config, "afd_num_local_physical_experts", 0))
+
+    return {
+        "source": source,
+        "timestamp": time.time(),
+        "role": fd_config.afd_config.afd_role if fd_config.afd_config.enable_afd else "non_afd",
+        "local_rank": None if local_rank is None else int(local_rank),
+        "clear_stat": clear_stat,
+        "afd_nnode_rank": int(fd_config.afd_config.afd_nnode_rank),
+        "expert_parallel_rank": int(fd_config.parallel_config.expert_parallel_rank),
+        "tensor_parallel_rank": int(fd_config.parallel_config.tensor_parallel_rank),
+        "engine_worker_queue_port": fd_config.parallel_config.local_engine_worker_queue_port,
+        "shape": {
+            "layers": int(rank_expert_array.shape[0]),
+            "physical_slots": int(rank_expert_array.shape[1]),
+            "slots_per_rank": slots_per_rank,
+            "rank_count": int(rank_expert_array.shape[1] // slots_per_rank) if slots_per_rank else None,
+            "logical_experts": int(logical_to_physical_array.shape[1]),
+            "max_replicas_per_logical_expert": int(logical_to_physical_array.shape[2]),
+        },
+        "table_hash": table_hash,
+        **table_payload,
+    }
+
+
+def dump_redundant_expert_table_snapshot(
+    *,
+    fd_config: FDConfig,
+    rank_expert_list,
+    logical_to_physical_map,
+    expert_count,
+    source: str,
+    local_rank: int = None,
+    clear_stat: bool = None,
+):
+    snapshot = build_redundant_expert_table_snapshot(
+        fd_config=fd_config,
+        rank_expert_list=rank_expert_list,
+        logical_to_physical_map=logical_to_physical_map,
+        expert_count=expert_count,
+        source=source,
+        local_rank=local_rank,
+        clear_stat=clear_stat,
+    )
+
+    dump_dir = os.path.join(fd_config.eplb_config.redundant_expert_meta_dir, "table_dumps")
+    os.makedirs(dump_dir, exist_ok=True)
+    role = snapshot["role"]
+    rank = "none" if local_rank is None else str(int(local_rank))
+    timestamp_ms = int(snapshot["timestamp"] * 1000)
+    path = os.path.join(dump_dir, f"{timestamp_ms}_{role}_{source}_rank{rank}.json")
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as fout:
+        json.dump(snapshot, fout)
+    os.replace(tmp_path, path)
+    return path, snapshot
 
 
 def init_eplb_signals(config: FDConfig, ipc_signal_suffix):

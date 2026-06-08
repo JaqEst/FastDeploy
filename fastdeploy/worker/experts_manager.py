@@ -22,6 +22,7 @@ import paddle
 from paddleformers.utils.log import logger
 
 from fastdeploy.eplb.eplb import rebalance_experts
+from fastdeploy.eplb.utils import dump_redundant_expert_table_snapshot
 
 
 class RedundantExpertManger:
@@ -182,6 +183,25 @@ class RedundantExpertManger:
         """
         update_expert_rank_table
         """
+        if self.fd_config is not None and clear_stat:
+            try:
+                dump_path, snapshot = dump_redundant_expert_table_snapshot(
+                    fd_config=self.fd_config,
+                    rank_expert_list=self.model_ep_rank_to_expert_id_list,
+                    logical_to_physical_map=self.model_expert_id_to_ep_rank_array,
+                    expert_count=self.model_expert_in_rank_num_list,
+                    source="model_table_before",
+                    local_rank=self.fd_config.parallel_config.expert_parallel_rank,
+                    clear_stat=clear_stat,
+                )
+                logger.info(
+                    "redundant_expert: dump model routing table before update, "
+                    f"path={dump_path}, hash={snapshot['table_hash']}, role={snapshot['role']}, "
+                    f"shape={snapshot['shape']}"
+                )
+            except Exception as e:
+                logger.warning(f"redundant_expert: dump model routing table before update failed, {e}")
+
         # update model info
         self.model_ep_rank_to_expert_id_list.copy_(paddle.to_tensor(rank_expert_list), True)
         self.model_expert_id_to_ep_rank_array.fill_(-1)
@@ -189,6 +209,24 @@ class RedundantExpertManger:
             logical_to_physical_map
         )
         self.model_expert_in_rank_num_list.copy_(paddle.to_tensor(expert_count), True)
+        if self.fd_config is not None and clear_stat:
+            try:
+                dump_path, snapshot = dump_redundant_expert_table_snapshot(
+                    fd_config=self.fd_config,
+                    rank_expert_list=rank_expert_list,
+                    logical_to_physical_map=logical_to_physical_map,
+                    expert_count=expert_count,
+                    source="model_table_after",
+                    local_rank=self.fd_config.parallel_config.expert_parallel_rank,
+                    clear_stat=clear_stat,
+                )
+                logger.info(
+                    "redundant_expert: dump model routing table after update, "
+                    f"path={dump_path}, hash={snapshot['table_hash']}, role={snapshot['role']}, "
+                    f"shape={snapshot['shape']}"
+                )
+            except Exception as e:
+                logger.warning(f"redundant_expert: dump model routing table after update failed, {e}")
 
         # reset
         if clear_stat:
