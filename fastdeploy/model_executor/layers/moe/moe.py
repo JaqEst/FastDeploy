@@ -624,37 +624,41 @@ class FusedMoE(nn.Layer):
         else:
             gate_expert_weight_key = up_gate_proj_expert_weight_key.replace("up_gate_proj", "gate_proj")
             up_expert_weight_key = up_gate_proj_expert_weight_key.replace("up_gate_proj", "up_proj")
-            for expert_idx in logical_expert_ids:
+            up_gate_proj_weights = [None] * len(logical_expert_ids)
+            down_proj_weights = [None] * len(logical_expert_ids)
+            logical_expert_id_to_slots = {}
+            for local_slot, expert_idx in enumerate(logical_expert_ids):
+                logical_expert_id_to_slots.setdefault(expert_idx, []).append(local_slot)
+            for expert_idx, local_slots in logical_expert_id_to_slots.items():
                 gate_expert_weight_key_name = gate_expert_weight_key.format(expert_idx)
                 up_expert_weight_key_name = up_expert_weight_key.format(expert_idx)
                 down_proj_expert_weight_key_name = down_proj_expert_weight_key.format(expert_idx)
-                gate = get_tensor(
-                    (
-                        state_dict.pop(gate_expert_weight_key_name)
-                        if gate_expert_weight_key_name in state_dict
-                        else gate_expert_weight_key_name
-                    ),
-                    self.fd_config.model_config.model,
+
+                # NOTE: Redundant layouts can place the same logical expert in multiple local physical slots.
+                # Load each logical expert once, fill all of its physical slots, then pop to release memory.
+                gate_weight = (
+                    state_dict.pop(gate_expert_weight_key_name)
+                    if gate_expert_weight_key_name in state_dict
+                    else gate_expert_weight_key_name
                 )
-                up = get_tensor(
-                    (
-                        state_dict.pop(up_expert_weight_key_name)
-                        if up_expert_weight_key_name in state_dict
-                        else up_expert_weight_key_name
-                    ),
-                    self.fd_config.model_config.model,
+                up_weight = (
+                    state_dict.pop(up_expert_weight_key_name)
+                    if up_expert_weight_key_name in state_dict
+                    else up_expert_weight_key_name
                 )
-                up_gate_proj_weights.append(paddle.concat([gate, up], axis=-1))
-                down_proj_weights.append(
-                    get_tensor(
-                        (
-                            state_dict.pop(down_proj_expert_weight_key_name)
-                            if down_proj_expert_weight_key_name in state_dict
-                            else down_proj_expert_weight_key_name
-                        ),
-                        self.fd_config.model_config.model,
-                    )
+                down_weight = (
+                    state_dict.pop(down_proj_expert_weight_key_name)
+                    if down_proj_expert_weight_key_name in state_dict
+                    else down_proj_expert_weight_key_name
                 )
+
+                gate = get_tensor(gate_weight, self.fd_config.model_config.model)
+                up = get_tensor(up_weight, self.fd_config.model_config.model)
+                down = get_tensor(down_weight, self.fd_config.model_config.model)
+                up_gate = paddle.concat([gate, up], axis=-1)
+                for idx, local_slot in enumerate(local_slots):
+                    up_gate_proj_weights[local_slot] = up_gate if idx == 0 else up_gate.clone()
+                    down_proj_weights[local_slot] = down if idx == 0 else down.clone()
         return up_gate_proj_weights, down_proj_weights, logical_expert_ids, ep_rank_to_expert_id_list
 
     def extract_moe_ffn_weights(self, state_dict: dict):

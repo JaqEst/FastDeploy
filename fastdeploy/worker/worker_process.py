@@ -112,6 +112,15 @@ def get_worker(fd_config: FDConfig, local_rank: int, rank: int) -> WorkerBase:
         return HpuWorker(fd_config=fd_config, local_rank=local_rank, rank=rank)
 
 
+def _get_eplb_shmem_parallel_size(fd_config: FDConfig, parallel_config: ParallelConfig) -> int:
+    """Return the rank count used to size EPLB async-load shared memory."""
+    if fd_config.afd_config.enable_afd:
+        if fd_config.afd_config.afd_num_ffn_ranks <= 0:
+            raise ValueError("AFD EPLB requires at least one FFN rank for async-load shared memory sizing.")
+        return fd_config.afd_config.afd_num_ffn_ranks
+    return parallel_config.expert_parallel_size
+
+
 def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
     """Initialize Paddle Fleet and return world size and global rank."""
 
@@ -510,7 +519,7 @@ class PaddleDisWorkerProc:
             self.mmap_infos = create_mmap(
                 [MODEL_MAIN_NAME],
                 self.parallel_config.expert_parallel_rank,
-                self.parallel_config.expert_parallel_size,
+                _get_eplb_shmem_parallel_size(self.fd_config, self.parallel_config),
                 shm_uuid=self.parallel_config.local_engine_worker_queue_port,
                 eplb_config=self.eplb_config,
                 logger=logger,
