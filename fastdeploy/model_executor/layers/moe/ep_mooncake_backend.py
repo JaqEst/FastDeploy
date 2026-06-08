@@ -77,7 +77,7 @@ class MooncakeEPEngine:
         self.num_experts = num_experts
         # First call uses timeout=-1 (no timeout); subsequent calls use 10 s.
         self._first_execution = True
-        self._timeout_us = 10_000_000
+        self._timeout_us = 100_000_000
 
     def _get_timeout(self) -> int:
         return -1 if self._first_execution else self._timeout_us
