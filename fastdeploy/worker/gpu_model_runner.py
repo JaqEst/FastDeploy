@@ -1267,6 +1267,21 @@ class GPUModelRunner(ModelRunnerBase):
         )
         return token_num, token_num_event
 
+    def prepare_inputs_ffn_only(self, is_dummy_or_profile_run=False):
+        token_num = sorted(self.cudagraph_capture_sizes, reverse=True)[0]
+        ids_remove_padding = paddle.empty([token_num], dtype=paddle.int64, device=self.device)
+        self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
+
+        self.forward_meta = ForwardMeta(
+            ids_remove_padding=self.share_inputs["ids_remove_padding"],
+            exist_prefill=self.exist_prefill(),
+            step_use_cudagraph=self.use_cudagraph and not self.exist_prefill(),
+            is_dummy_or_profile_run = is_dummy_or_profile_run,
+            ep_timeout_us=-1 if is_dummy_or_profile_run else envs.FD_MOONCAKE_EP_TIMEOUT,
+        )
+
+        return token_num
+
     def _process_reorder(self) -> None:
         if self.attn_backends and getattr(self.attn_backends[0], "enable_ids_reorder", False):
             self.share_inputs.enable_pd_reorder = True
@@ -1388,6 +1403,8 @@ class GPUModelRunner(ModelRunnerBase):
         # for zero size
         self.forward_meta.is_zero_size = self.forward_meta.ids_remove_padding.shape[0] == 0
         self.forward_meta.exist_prefill = self.exist_prefill()
+
+        self.forward_meta.ep_timeout_us = -1 if is_dummy_or_profile_run else envs.FD_MOONCAKE_EP_TIMEOUT
 
     def initialize_kv_cache(self, profile: bool = False) -> None:
         """
@@ -1708,7 +1725,7 @@ class GPUModelRunner(ModelRunnerBase):
         broadcast_src = self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size
         if self.fd_config.afd_config.enable_afd:
             broadcast_src = self.fd_config.afd_config.afd_node_srank
-            
+
         if not self.speculative_decoding:
             set_value_by_flags_and_idx(
                 self.share_inputs["token_ids_all"],
@@ -1865,6 +1882,9 @@ class GPUModelRunner(ModelRunnerBase):
             self.forward_meta.step_use_cudagraph = in_capturing and self.forward_meta.step_use_cudagraph
             self.padding_cudagraph_inputs()
 
+            if self.forward_meta.step_use_cudagraph:
+                self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+
             model_inputs = {}
             model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
             model_inputs["generated_modality"] = self.share_inputs["generated_modality"]
@@ -1911,6 +1931,74 @@ class GPUModelRunner(ModelRunnerBase):
                 # only need to capture prefill
                 break
 
+    def _dummy_run_ffn_only(
+        self,
+        num_tokens: int,
+        batch_size: int,
+        in_capturing: bool = False,
+        co_capturing: bool = False,
+        expected_decode_len: int = 1,
+    ):
+        capturing = in_capturing or co_capturing
+        num_warmup_dyruns_before_capture = 0
+        if co_capturing and not in_capturing:
+            num_warmup_dyruns_before_capture = self.graph_opt_config.cudagraph_num_of_warmups
+        num_dummy_runs = expected_decode_len + 1   # eos token
+
+        # dummy prefill
+        self.exist_prefill_flag = True
+        self.prepare_inputs_ffn_only(is_dummy_or_profile_run=True)
+
+        self.forward_meta.step_use_cudagraph = capturing and self.forward_meta.step_use_cudagraph
+        self.padding_cudagraph_inputs()
+
+        if self.forward_meta.step_use_cudagraph:
+            self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+
+        model_inputs = {}
+        model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
+
+        self.model(model_inputs, self.forward_meta)
+
+        self.exist_prefill_flag = False
+        num_dummy_runs -= 1
+
+        for _ in range(num_warmup_dyruns_before_capture):
+            self.prepare_inputs_ffn_only(is_dummy_or_profile_run=True)
+            self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+
+            self.forward_meta.step_use_cudagraph = False
+            self.padding_cudagraph_inputs()
+
+            model_inputs = {}
+            model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
+
+            self.model(model_inputs, self.forward_meta)
+
+        for _ in range(num_dummy_runs):
+            self.prepare_inputs_ffn_only(is_dummy_or_profile_run=True)
+
+            self.forward_meta.step_use_cudagraph = capturing and self.forward_meta.step_use_cudagraph
+            self.padding_cudagraph_inputs()
+
+            if self.forward_meta.step_use_cudagraph:
+                self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+
+            model_inputs = {}
+            model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
+
+            self.model(model_inputs, self.forward_meta)
+
+    def init_cache_ffn_only(self) -> None:
+        num_tokens = self.fd_config.get_max_chunk_tokens()
+        logger.info(
+            f"Dummy run with {num_tokens} tokens, mm_max_tokens_per_item: {self.model_config.mm_max_tokens_per_item}"
+        )
+        self._dummy_run_ffn_only(
+            num_tokens=num_tokens,
+            batch_size=self.scheduler_config.max_num_seqs,
+        )
+
     @sot_warmup_guard(True)
     def capture_model(self) -> None:
         """
@@ -1947,6 +2035,20 @@ class GPUModelRunner(ModelRunnerBase):
                     )
                     logger.info(
                         f"Warm up the model with the num_tokens:{capture_size}, expected_decode_len:{expected_decode_len}"
+                    )
+            elif self.fd_config.afd_config.afd_role == "ffn":
+                for index, capture_size in enumerate(sorted(capture_sizes, reverse=True)):
+                    # Capture one cuda graph only for AFD FFN participant
+                    capture_graph = index == 0
+                    self._dummy_run_ffn_only(
+                        num_tokens=self.fd_config.get_max_chunk_tokens(),
+                        batch_size=capture_size,
+                        in_capturing=capture_graph,
+                        co_capturing=True,
+                        expected_decode_len=expected_decode_len,
+                    )
+                    logger.info(
+                        f"Warm up the model with the capture size:{capture_size}, num tokens:{expected_decode_len}"
                     )
             else:
                 for batch_size in sorted(capture_sizes, reverse=True):
@@ -2089,10 +2191,8 @@ class GPUModelRunner(ModelRunnerBase):
             num_running_requests: batch_size
         """
         if self.fd_config.afd_config.afd_role == "ffn":
-            self.model(None, None)
-            return
-        
-        if not self.enable_overlap_schedule:
+            self.execute_model_ffn_only(model_forward_batch, num_running_requests)
+        elif not self.enable_overlap_schedule:
             self.execute_model_normal(model_forward_batch, num_running_requests)
         else:
             self.execute_model_overlap(model_forward_batch, num_running_requests)
@@ -2165,6 +2265,21 @@ class GPUModelRunner(ModelRunnerBase):
             self._cached_post_process_event = None
         self._cached_launch_token_num = next_launch_token_num
         self._cached_real_bsz = next_real_bsz
+
+    def execute_model_ffn_only(
+        self,
+        model_forward_batch: Optional[List[Request]] = None,
+        num_running_requests: int = None,
+    ) -> None:
+        current_launch_token_num = self.prepare_inputs_ffn_only()
+        self.current_launch_token_num = current_launch_token_num
+
+        self.padding_cudagraph_inputs()
+
+        model_inputs = {}
+        model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
+
+        self._execute(model_inputs)
 
     def _preprocess(
         self,
@@ -2318,7 +2433,7 @@ class GPUModelRunner(ModelRunnerBase):
                 self.deterministic_logger.log_tensor_md5s(
                     {"logits": logits}, forward_batch_reqs_list=self.forward_batch_reqs_list, stage="logits"
                 )
-            
+
             broadcast_src = self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size
             if self.fd_config.afd_config.enable_afd:
                 broadcast_src = self.fd_config.afd_config.afd_node_srank

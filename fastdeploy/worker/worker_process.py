@@ -818,10 +818,6 @@ class PaddleDisWorkerProc:
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if self.fd_config.afd_config.afd_role == "ffn":
-            logger.info("Skip KV cache initialization/profile for AFD FFN worker.")
-            return
-
         if self.fd_config.parallel_config.do_profile:
             # 1. Get available memory(bytes)
             available_kv_cache_memory = self.worker.determine_available_memory()
@@ -860,10 +856,18 @@ class PaddleDisWorkerProc:
                 self.get_profile_block_num_signal.value[0] = num_blocks_local
         else:
             num_blocks_local = self.fd_config.cache_config.total_block_num
-        logger.info(f"------- num_blocks_global: {num_blocks_local} --------")
 
-        # 4. init kv_cache with accurate num_blocks
-        self.worker.initialize_cache(num_gpu_blocks=num_blocks_local)
+        if not self.fd_config.afd_config.afd_role == "ffn":
+            # 4. init kv_cache with accurate num_blocks
+            logger.info(f"------- num_blocks_global: {num_blocks_local} --------")
+            self.worker.initialize_cache(num_gpu_blocks=num_blocks_local)
+        else:
+            logger.info("Collaborate with attention participants to initialize kv cache.")
+            # TODO: directly call worker.model_runner.init_cache_ffn_only()?
+            self.worker.model_runner.init_cache_ffn_only()
+
+        if self.fd_config.afd_config.enable_afd:
+            dist.barrier(self.parallel_config.ep_group)
 
     def graph_optimize_and_warm_up_model(self) -> None:
         self.worker.graph_optimize_and_warm_up_model()

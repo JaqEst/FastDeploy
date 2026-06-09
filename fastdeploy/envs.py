@@ -98,6 +98,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": lambda: int(
         os.getenv("FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "128")
     ),
+    # Mooncake EP timeout (in microseconds).
+    "FD_MOONCAKE_EP_TIMEOUT": lambda: int(os.getenv("FD_MOONCAKE_EP_TIMEOUT", "3_000_000")),
     # InfiniBand devices for Mooncake EP, comma-separated (e.g. "mlx5_0,mlx5_1").
     # Defaults to None for automatic device detection.
     "FD_MOONCAKE_IB_DEVICES": lambda: os.getenv("FD_MOONCAKE_IB_DEVICES", None),

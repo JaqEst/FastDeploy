@@ -54,8 +54,6 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
         self.role = role
         self.top_k = fd_config.model_config.num_experts_per_tok
         self.active_ranks = paddle.ones((fd_config.afd_config.afd_world_size,), dtype=paddle.int32)
-        self._first_execution = True
-        self._timeout_us = 10_000_000
         self.m2n_buffer = M2NBuffer(
             mooncake_group,
             attention_ranks=fd_config.afd_config.afd_attn_ranks,
@@ -65,18 +63,14 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
             hidden=fd_config.model_config.hidden_size,
         )
 
-    def _get_timeout(self) -> int:
-        return -1 if self._first_execution else self._timeout_us
-
-    @staticmethod
-    def _finish(event, hook) -> None:
+    def _finish(self, event, hook) -> None:
         if hook is not None:
             hook()
         elif event is not None:
             event.current_stream_wait()
 
     def dispatch_physical(self, x, physical_topk_idx, topk_weights, **kwargs):
-        timeout = self._get_timeout()
+        timeout = kwargs.get("timeout_us", -1)
         use_fp8 = kwargs.get("use_fp8", False)
         if self.role == "attn":
             recv_hidden, recv_count, handle, event, hook = self.m2n_buffer.a2e_isend(
@@ -101,7 +95,7 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
         return recv_hidden, recv_count, handle
 
     def combine(self, ffn_out, physical_topk_idx, topk_weights, handle, **kwargs):
-        timeout = self._get_timeout()
+        timeout = kwargs.get("timeout_us", -1)
         if self.role == "attn":
             combined, event, hook = self.m2n_buffer.e2a_irecv(
                 physical_topk_idx,
@@ -123,5 +117,4 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
                 return_recv_hook=True,
             )
         self._finish(event, hook)
-        self._first_execution = False
         return combined

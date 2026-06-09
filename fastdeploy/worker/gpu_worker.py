@@ -233,14 +233,6 @@ class GpuWorker(WorkerBase):
         | Static Full Graph (full=True)     | Dynamic                  | Static + CUDAGraph       |
         | Static Split Graph (full=False)   | Static + CUDAGraph       | Dynamic + CUDAGraph      |
         """
-        if self.fd_config.afd_config.afd_role == "ffn":
-            logger.info(
-                "Skip standalone graph warmup for AFD FFN worker. "
-                "FFN graph capture/replay is driven by the AFD participant loop "
-                "so its DeepEP collectives stay aligned with ATTN workers."
-            )
-            return
-
         if self.fd_config.graph_opt_config.graph_opt_level >= 1 and not self.model_runner.use_cudagraph:
             self.model_runner.sot_warmup()
         if self.fd_config.graph_opt_config.graph_opt_level >= 1:

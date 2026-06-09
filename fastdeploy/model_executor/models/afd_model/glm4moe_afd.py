@@ -143,20 +143,31 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
         )
 
         # --- 2. dispatch tokens to FFN workers ---
+        # DeepEP dispatch/combine must use the same physical expert id space.
         # EPLB topk returns AFD physical ids when redundant routing is enabled.
         if self.redundant_table_manger is not None:
             physical_topk_idx = topk_idx
         else:
             physical_topk_idx = self.afd_runner.routing_logical_to_physical(topk_idx)
-        recv_hidden, _, handle = self.afd_runner.dispatch_physical(
-            x, physical_topk_idx, topk_weights,
+        dc_kwargs = { "timeout_us": forward_meta.ep_timeout_us } if forward_meta.ep_timeout_us else {}
+        recv_hidden, recv_count, handle = self.afd_runner.dispatch_physical(
+            x,
+            physical_topk_idx,
+            topk_weights,
+            **dc_kwargs,
         )
 
         # ATTN rank has only phantom experts, produce zero FFN output
         ffn_out = paddle.zeros_like(recv_hidden)
 
         # --- 3. combine results from FFN workers ---
-        routed_out = self.afd_runner.combine(ffn_out, physical_topk_idx, topk_weights, handle)
+        routed_out = self.afd_runner.combine(
+            ffn_out,
+            physical_topk_idx,
+            topk_weights,
+            handle,
+            **dc_kwargs
+        )
 
         # --- 4. shared experts ---
         if self.shared_experts is not None:
@@ -384,11 +395,13 @@ class Glm4AFDFFNModel(nn.Layer):
     ) -> paddle.Tensor:
         # ids_remove_padding/forward_meta are graph-shape selectors for the
         # generic GraphOptBackend.  AFD FFN itself originates no tokens.
+        dc_kwargs = { "timeout_us": forward_meta.ep_timeout_us } if forward_meta.ep_timeout_us else {}
         for layer_id in self._moe_layer_ids:
             recv_hidden, recv_count, handle = self._afd_runner.dispatch_physical(
                 self._empty_x,
                 self._empty_topk_idx,
                 self._empty_topk_weights,
+                **dc_kwargs,
             )
             ffn_out = self._compute_local_experts(layer_id, recv_hidden, recv_count)
             self._afd_runner.combine(
@@ -396,6 +409,7 @@ class Glm4AFDFFNModel(nn.Layer):
                 self._empty_topk_idx,
                 self._empty_topk_weights,
                 handle,
+                **dc_kwargs,
             )
 
         return paddle.zeros([1], dtype=paddle.int32)
@@ -581,21 +595,6 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
             redundant_table_manger=self.redundant_table_manger,
         )
 
-        capture_sizes = self.fd_config.graph_opt_config.cudagraph_capture_sizes or [1]
-        capture_sizes = sorted({int(size) for size in capture_sizes if int(size) > 0}, reverse=True)
-        if not capture_sizes:
-            capture_sizes = [1]
-
-        self._afd_ffn_graph_metas = []
-        for capture_size in capture_sizes:
-            ids_remove_padding = paddle.zeros([capture_size], dtype=paddle.int64)
-            forward_meta = SimpleNamespace(
-                ids_remove_padding=ids_remove_padding,
-                exist_prefill=False,
-                step_use_cudagraph=True,
-            )
-            self._afd_ffn_graph_metas.append((ids_remove_padding, forward_meta))
-        self._afd_ffn_graph_meta_index = 0
         self._expert_params_mapping = FusedMoE.make_expert_params_mapping(
             num_experts=self.fd_config.model_config.n_routed_experts,
             ckpt_gate_proj_name="gate_proj",
@@ -646,22 +645,8 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
         raise NotImplementedError("AFD models only support loading weights with the default_v1 loader.")
 
     def forward(self, inputs: Dict, forward_meta: ForwardMeta):
-        should_advance = (
-            self.model.use_graph_opt
-            and self.fd_config.graph_opt_config.use_cudagraph
-            and self._afd_ffn_graph_meta_index < len(self._afd_ffn_graph_metas)
-        )
-        if should_advance:
-            ids_remove_padding, graph_forward_meta = self._afd_ffn_graph_metas[self._afd_ffn_graph_meta_index]
-        else:
-            ids_remove_padding, graph_forward_meta = self._afd_ffn_graph_metas[0]
-        output = self.model(
-            ids_remove_padding=ids_remove_padding,
-            forward_meta=graph_forward_meta,
-        )
-        if should_advance:
-            self._afd_ffn_graph_meta_index += 1
-        return output
+        ids_remove_padding = inputs["ids_remove_padding"]
+        return self.model(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
 
     def compute_logits(self, hidden_states, forward_meta=None):
         return None
