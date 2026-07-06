@@ -75,6 +75,33 @@ from fastdeploy.worker.worker_base import WorkerBase
 
 logger = get_logger("worker_process", "worker_process.log")
 
+def dump_mooncake_debug_state(worker, fd_config, prefix: str = "") -> None:
+
+    mc_model = worker.model_runner.get_model()
+    mooncake_a2a = mc_model._afd_runner.a2a_backend
+
+    if mooncake_a2a is None:
+        logger.warning("AFD Mooncake backend is not available on worker model")
+        return
+
+    mc_ep_group = fd_config.parallel_config.ep_group.process_group._mc._get_backend(paddle.device("cuda"))
+    mc_tp_group = fd_config.parallel_config.tp_group.process_group._mc._get_backend(paddle.device("cuda"))
+
+
+    mc_ep_active_ranks = mooncake_a2a.active_ranks
+
+    from mooncake.ep import get_active_ranks
+
+    logger.info(
+        f"{prefix} mooncake debug state: "
+        f"worker_rank={getattr(worker, 'rank', None)}, "
+        f"local_rank={getattr(worker, 'local_rank', None)}, "
+        f"mc_ep_active_ranks={mc_ep_active_ranks},"
+        f"ep_active={get_active_ranks(mc_ep_group)}, "
+        f"tp_active={get_active_ranks(mc_tp_group)}"
+    )
+
+
 
 def get_worker(fd_config: FDConfig, local_rank: int, rank: int) -> WorkerBase:
     """
@@ -592,6 +619,7 @@ class PaddleDisWorkerProc:
             self._event_loop_afd_ffn(tp_rank)
             return
 
+        attn_iter = 0
         while True:
             if self.fd_config.load_config.dynamic_load_weight and not envs.FD_ENABLE_V1_UPDATE_WEIGHTS:
                 self.model_weights_signal[0] = int(self.model_weights_status.value[0])
