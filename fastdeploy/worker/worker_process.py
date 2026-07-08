@@ -589,14 +589,13 @@ class PaddleDisWorkerProc:
             self.signal_update_weight_from_tensor_array.value[0] = 0
             broadcast_value = REARRANGE_EXPERT_MAGIC_NUM
         data = paddle.to_tensor([broadcast_value])
-        group, src = self._get_eplb_update_group_and_src()
-        paddle.distributed.broadcast(data, src=src, group=group)
+        paddle.distributed.broadcast(data, 0, group=self.parallel_config.ep_group)
         if data[0] == REARRANGE_EXPERT_MAGIC_NUM:
             self.update_weights_from_tensor(self.mmap_infos)
             logger.info(
                 f"redundant_expert: update_weight_from_tensor success, cost {(time.time() - rearrange_time)*1000}ms"
             )
-            paddle.distributed.barrier(group)
+            paddle.distributed.barrier(self.parallel_config.ep_group)
             if tp_rank == 0:
                 self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
             logger.info("redundant_expert: done")
