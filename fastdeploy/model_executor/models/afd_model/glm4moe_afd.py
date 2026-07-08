@@ -123,7 +123,7 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
                 expert_id_to_ep_rank_array,
                 expert_in_rank_num_list,
                 tokens_per_expert_stats_list,
-            ) = self.redundant_table_manger.get_ep_rank_to_expert_id_list_by_layer(self.layer_id)
+            ) = self.redundant_table_manger.get_active_ep_rank_to_expert_id_list_by_layer(self.layer_id)
             routing_kwargs = {
                 "expert_id_to_ep_rank_array": expert_id_to_ep_rank_array,
                 "expert_in_rank_num_list": expert_in_rank_num_list,

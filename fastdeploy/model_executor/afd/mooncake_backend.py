@@ -54,6 +54,7 @@ class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
         self.role = role
         self.top_k = fd_config.model_config.num_experts_per_tok
         self.active_ranks = paddle.ones((fd_config.afd_config.afd_world_size,), dtype=paddle.int32)
+        self.last_active_ranks = self.active_ranks.clone()
         self.m2n_buffer = M2NBuffer(
             mooncake_group,
             attention_ranks=fd_config.afd_config.afd_attn_ranks,
