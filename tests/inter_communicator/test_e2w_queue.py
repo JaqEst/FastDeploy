@@ -242,8 +242,9 @@ class TestEngineWorkerQueue(unittest.TestCase):
             tasks = ["task-A"]
             client.put_tasks(tasks)
             self.assertEqual(client.num_tasks(), 1)
-            fetched, all_read = client.get_tasks()
+            fetched, all_read, dropped = client.get_tasks()
             self.assertTrue(all_read)
+            self.assertFalse(dropped)
             self.assertEqual(fetched, [tasks])
             self.assertEqual(client.num_tasks(), 0)
             client.put_tasks(tasks)

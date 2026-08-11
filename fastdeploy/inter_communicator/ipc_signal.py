@@ -14,15 +14,75 @@
 # limitations under the License.
 """
 
+import os
+from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 
+import _posixshmem
 import numpy as np
 
 from fastdeploy.utils import llm_logger
 
+# Blocks created by this process. Their lifecycle belongs to this process, so attaching
+# to one of them again must not drop its resource_tracker registration.
+_created_shm_names = set()
+
+
+def untrack_shared_memory(shm: SharedMemory) -> None:
+    """Stop the current process from owning the lifecycle of a shared memory block.
+
+    CPython (< 3.13) registers a block with multiprocessing.resource_tracker even when
+    the process only attaches to an existing one. As a result the tracker unlinks the
+    block once the attaching process exits, which silently destroys a block that other
+    processes are still using: they keep their mapping but the name disappears, so any
+    process started later (e.g. a worker restarted by recover) fails to attach with
+    FileNotFoundError. Only the creator should unlink, via IPCSignal.clear().
+
+    Args:
+        shm: The shared memory block to stop tracking in this process.
+    """
+    try:
+        resource_tracker.unregister(shm._name, "shared_memory")
+    except Exception as e:
+        llm_logger.warning(f"Failed to untrack shared memory {shm.name}: {e}")
+
+
+def attach_shared_memory(name: str) -> SharedMemory:
+    """Attach to an existing shared memory block without taking over its lifecycle.
+
+    Args:
+        name: The unique identifier of the shared memory block.
+
+    Returns:
+        The attached shared memory block.
+    """
+    shm = SharedMemory(name=name)
+    if shm._name not in _created_shm_names:
+        untrack_shared_memory(shm)
+    return shm
+
+
+def create_shared_memory(name: str, size: int) -> SharedMemory:
+    """Create a shared memory block owned by this process.
+
+    Args:
+        name: The unique identifier of the shared memory block.
+        size: Size of the block in bytes.
+
+    Returns:
+        The created shared memory block.
+    """
+    shm = SharedMemory(create=True, size=size, name=name)
+    _created_shm_names.add(shm._name)
+    return shm
+
 
 def shared_memory_exists(name: str) -> bool:
     """Check if a shared memory block with the given name exists.
+
+    The block is probed with shm_open instead of SharedMemory, because attaching via
+    SharedMemory would register the block in this process's resource_tracker and a
+    probe must not change who owns the block's lifecycle.
 
     Args:
         name: The unique identifier of the shared memory block.
@@ -31,14 +91,14 @@ def shared_memory_exists(name: str) -> bool:
         True if the shared memory exists, False otherwise.
     """
     try:
-        shm = SharedMemory(name=name, create=False)
-        shm.close()
-        return True
+        fd = _posixshmem.shm_open("/" + name.lstrip("/"), os.O_RDONLY, mode=0o600)
     except FileNotFoundError:
         return False
     except Exception as e:
         llm_logger.error(f"Unexpected error: {e}")
         return False
+    os.close(fd)
+    return True
 
 
 class IPCSignal:
@@ -86,11 +146,11 @@ class IPCSignal:
                 if shared_memory_exists(name):
                     llm_logger.warning(f"ShareMemory: {name} already exists, delete it")
                     SharedMemory(name=name, create=False).unlink()
-                self.shm = SharedMemory(create=True, size=shm_size, name=name)
+                self.shm = create_shared_memory(name, shm_size)
                 self.value = None
             else:
                 llm_logger.debug(f"attaching ipc signal: {name}")
-                self.shm = SharedMemory(name=name)
+                self.shm = attach_shared_memory(name)
                 self.value = None
         else:
             assert isinstance(array, np.ndarray), "Input must be a numpy array"
@@ -101,16 +161,19 @@ class IPCSignal:
                 if shared_memory_exists(name):
                     llm_logger.warning(f"ShareMemory: {name} already exists, delete it")
                     SharedMemory(name=name, create=False).unlink()
-                self.shm = SharedMemory(create=True, size=array.nbytes, name=name)
+                self.shm = create_shared_memory(name, array.nbytes)
                 self.value: np.ndarray = np.ndarray(array.shape, dtype=array.dtype, buffer=self.shm.buf)
                 self.value[:] = array  # Initialize with input array data
             else:
                 llm_logger.debug(f"attaching ipc signal: {name}")
-                self.shm = SharedMemory(name=name)
+                self.shm = attach_shared_memory(name)
                 self.value: np.ndarray = np.ndarray(array.shape, dtype=array.dtype, buffer=self.shm.buf)
 
     def clear(self) -> None:
         """Release system resources and unlink the shared memory block."""
-        if shared_memory_exists(self.shm.name):
-            self.shm.close()
+        _created_shm_names.discard(self.shm._name)
+        self.shm.close()
+        try:
             self.shm.unlink()
+        except FileNotFoundError:
+            llm_logger.warning(f"ShareMemory: {self.shm.name} has already been unlinked by another process")

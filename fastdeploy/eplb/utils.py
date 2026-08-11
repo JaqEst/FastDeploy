@@ -93,7 +93,7 @@ def build_redundant_expert_table_snapshot(
         "expert_in_rank_num_list": expert_count_array.tolist(),
     }
     table_hash = hashlib.sha256(json.dumps(table_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    slots_per_rank = int(getattr(fd_config.afd_config, "afd_num_local_physical_experts", 0))
+    slots_per_rank = int(getattr(fd_config.afd_config, "num_local_physical_experts", 0))
 
     return {
         "source": source,
@@ -101,7 +101,7 @@ def build_redundant_expert_table_snapshot(
         "role": fd_config.afd_config.afd_role if fd_config.afd_config.enable_afd else "non_afd",
         "local_rank": None if local_rank is None else int(local_rank),
         "clear_stat": clear_stat,
-        "afd_nnode_rank": int(fd_config.afd_config.afd_nnode_rank),
+        "afd_node_rank": int(fd_config.afd_config.inst_rank),
         "expert_parallel_rank": int(fd_config.parallel_config.expert_parallel_rank),
         "tensor_parallel_rank": int(fd_config.parallel_config.tensor_parallel_rank),
         "engine_worker_queue_port": fd_config.parallel_config.local_engine_worker_queue_port,

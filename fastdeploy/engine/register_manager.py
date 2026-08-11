@@ -115,6 +115,7 @@ class RegisterManager:
 
                     # Update registration info
                     self.cfg.register_info["is_paused"] = self.get_is_paused()
+                    self.cfg.register_info["not_ready"] = self.cfg.launch_config.is_extension
                     self.cfg.register_info["version"] = self.cfg.model_config.version
                     self.cfg.register_info["connected_decodes"] = self.get_connected_decodes()
 

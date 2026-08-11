@@ -93,6 +93,11 @@ class MoEMethodBase(QuantMethodBase):
         splitwise_role = config.scheduler_config.splitwise_role
         load_strategy = config.load_config.load_strategy
 
+        # redundant experts have been counted in num_physical_experts
+        if config.afd_config.enable_afd:
+            common_args["num_experts"] = config.afd_config.num_physical_experts
+            common_args["redundant_experts_num"] = 0
+
         if config.parallel_config.ep_prefill_use_worst_num_tokens:
             token_split_factor = 2 if int(os.getenv("USE_TBO", "0")) == 1 else 1
             prefill_num_worst_tokens = (
@@ -116,10 +121,12 @@ class MoEMethodBase(QuantMethodBase):
                         **common_args,
                         use_internode_ll_two_stage=layer.fd_config.parallel_config.use_internode_ll_two_stage,
                         prefill_num_worst_tokens=prefill_num_worst_tokens,
+                        is_extension=config.launch_config.is_extension,
                     )
                     self.ep_decoder_runner = self.EPDecoderRunner(
                         **common_args,
                         use_internode_ll_two_stage=layer.fd_config.parallel_config.use_internode_ll_two_stage,
+                        is_extension=config.launch_config.is_extension,
                     )
                 else:
                     self.ep_prefill_runner = self.EPPrefillRunner(**common_args)

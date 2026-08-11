@@ -82,6 +82,9 @@ class EngineWorkerQueue:
             self.client_read_flag_init: List[List[int]] = [
                 [1] * self.num_client for _ in range(self.local_data_parallel_size)
             ]
+            self.client_inactive_flag_init: List[List[int]] = [
+                [0] * self.num_client for _ in range(self.local_data_parallel_size)
+            ]
 
             self.lock_init: List[threading.Lock] = [threading.Lock() for _ in range(self.local_data_parallel_size)]
             self.read_finish_flag_init: List[Value] = [Value("i", 0) for _ in range(self.local_data_parallel_size)]
@@ -176,6 +179,11 @@ class EngineWorkerQueue:
             QueueManager.register(
                 "get_client_read_flag",
                 callable=lambda idx: self.client_read_flag_init[idx],
+                proxytype=ListProxy,
+            )
+            QueueManager.register(
+                "get_client_inactive_flag",
+                callable=lambda idx: self.client_inactive_flag_init[idx],
                 proxytype=ListProxy,
             )
             QueueManager.register(
@@ -346,6 +354,7 @@ class EngineWorkerQueue:
             ), f"self.client_id={self.client_id}, self.num_client={self.num_client}"
             QueueManager.register("get_tasks")
             QueueManager.register("get_client_read_flag")
+            QueueManager.register("get_client_inactive_flag")
             QueueManager.register("get_lock")
             QueueManager.register("get_read_finish_flag")
             QueueManager.register("get_exist_tasks_inter_signal")
@@ -383,6 +392,7 @@ class EngineWorkerQueue:
             # Get proxy objects for shared resources
             self.tasks: ListProxy = self.manager.get_tasks(self.local_data_parallel_id)
             self.client_read_flag: ListProxy = self.manager.get_client_read_flag(self.local_data_parallel_id)
+            self.client_inactive_flag: ListProxy = self.manager.get_client_inactive_flag(self.local_data_parallel_id)
             self.lock: AcquirerProxy = self.manager.get_lock(self.local_data_parallel_id)
             self.read_finish_flag: ValueProxy = self.manager.get_read_finish_flag(self.local_data_parallel_id)
             self.exist_tasks_inter_signal: ValueProxy = self.manager.get_exist_tasks_inter_signal(
@@ -447,6 +457,7 @@ class EngineWorkerQueue:
             )
 
             assert self.num_client == len(self.client_read_flag)
+            assert self.num_client == len(self.client_inactive_flag)
 
         # Only initialize shared memory for single-node deployments
         if self.is_single_node:
@@ -536,7 +547,7 @@ class EngineWorkerQueue:
                 time.sleep(interval)
         raise ConnectionError(f"TaskQueue cannot connect {self.address}")
 
-    def put_tasks(self, tasks: List[Any]) -> None:
+    def put_tasks(self, tasks: List[Any], client_ids: List[int] = None) -> None:
         """
         Add tasks to the shared queue in a thread-safe manner.
         Waits until all clients have read previous tasks before adding new ones.
@@ -545,40 +556,71 @@ class EngineWorkerQueue:
             tasks: Tasks to be added to the queue
         """
         self.lock.acquire()
-        while sum(self.client_read_flag) < self.num_client:
+        mask = self.client_inactive_flag[:]
+        while True:
+            read_flag = self.client_read_flag[:]
+            if not any(read == 0 and masked == 0 for read, masked in zip(read_flag, mask)):
+                break
             self.lock.release()
             time.sleep(0.001)
             self.lock.acquire()
+            mask = self.client_inactive_flag[:]
+
+        if client_ids is not None:
+            self.activate_clients(client_ids, True)
+            mask = self.client_inactive_flag[:]
+
         if envs.FD_ENABLE_MAX_PREFILL or envs.FD_ENABLE_E2W_TENSOR_CONVERT:
             # multimodal input numpy -> tensor
             to_tensor(tasks[0])
 
         self.tasks[:] = list()
-        self.client_read_flag[:] = [0] * self.num_client
+        self.client_read_flag[:] = mask
         self.tasks.append(tasks)
         self.set_exist_tasks(True)
         self.lock.release()
 
         llm_logger.debug(f"put_tasks: tasks={tasks}")
 
-    def get_tasks(self) -> Tuple[List[Any], bool]:
+    def get_tasks(self) -> Tuple[List[Any], bool, bool]:
         """
         Retrieve tasks from the shared queue and update read status.
 
         Returns:
-            tuple: (list of tasks, bool indicating if all clients have read)
+            tuple: (list of tasks, bool indicating if all clients have read,
+                    bool indicating if some clients are dropped)
         """
         tasks: List[Any] = list()
         self.lock.acquire()
+        # A client reads multiple times in a row, meaning others failed to read its tasks.
+        # So we deactivate these clients.
+        read_flag = self.client_read_flag[:]
+        if read_flag[self.client_id] > 0:
+            # skip inactive client
+            mask = self.client_inactive_flag[:]
+            if mask[self.client_id] == 1:
+                self.lock.release()
+                return tasks, False, False
+            read_count = read_flag[self.client_id]
+            read_flag[self.client_id] += 1
+            self.client_read_flag[self.client_id] = read_flag[self.client_id]
+            if any(r == read_count and m == 0 for r, m in zip(read_flag, mask)):
+                self.lock.release()
+                return tasks, False, True
+            client_ids = [i for i, x in enumerate(read_flag) if x < read_count]
+            self.deactivate_clients(client_ids, True)
+            self.lock.release()
+            return tasks, True, True
         tasks.extend(self.tasks)
-        self.client_read_flag[self.client_id] = 1
-        all_client_read: bool = np.sum(self.client_read_flag) == self.num_client
+        read_flag[self.client_id] = 1
+        self.client_read_flag[self.client_id] = read_flag[self.client_id]
+        all_client_read = np.count_nonzero(read_flag) == self.num_client
         if all_client_read:
             self.tasks[:] = list()
             self.set_exist_tasks(False)
         self.lock.release()
         llm_logger.debug(f"get_tasks: tasks={tasks}")
-        return tasks, all_client_read
+        return tasks, all_client_read, False
 
     def num_tasks(self) -> int:
         """
@@ -591,6 +633,46 @@ class EngineWorkerQueue:
         total_num: int = len(self.tasks)
         self.lock.release()
         return total_num
+
+    def activate_clients(self, client_ids: List[int], with_lock: bool=False) -> None:
+        """
+        Mark clients as active.
+        """
+        if not with_lock:
+            self.lock.acquire()
+        inactive_flag = self.client_inactive_flag[:]
+        for client_id in client_ids:
+            inactive_flag[client_id] = 0
+        self.client_inactive_flag[:] = inactive_flag
+        if not with_lock:
+            self.lock.release()
+
+        llm_logger.debug(f"activate_clients: client_ids={client_ids}")
+
+    def deactivate_clients(self, client_ids: List[int], with_lock: bool=False) -> None:
+        """
+        Mark clients as inactive and settle the round they may be blocking.
+        """
+        if not with_lock:
+            self.lock.acquire()
+        inactive_flag = self.client_inactive_flag[:]
+        for client_id in client_ids:
+            inactive_flag[client_id] = 1
+        self.client_inactive_flag[:] = inactive_flag
+        # Only an in-flight batch needs settling; with an empty queue there is no
+        # round to complete, and marking a read would be meaningless.
+        if len(self.tasks) > 0:
+            read_flag = self.client_read_flag[:]
+            for client_id in client_ids:
+                read_flag[client_id] = 1
+            self.client_read_flag[:] = read_flag
+            if np.count_nonzero(read_flag) == self.num_client:
+                self.tasks[:] = list()
+                self.set_exist_tasks(False)
+        if not with_lock:
+            self.lock.release()
+
+        llm_logger.debug(f"deactivate_clients: client_ids={client_ids}")
 
     def put_connect_rdma_task(self, connect_rdma_task):
         self.connect_task_lock.acquire()

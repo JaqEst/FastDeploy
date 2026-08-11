@@ -106,7 +106,7 @@ func BuildDisaggregateInfo(ctx context.Context, prefillURL, decodeURL string) (m
 		slices.Contains(decodeInfo.TransferProtocol, "ipc")
 	tpPrefill := tpSizeFromWorker(prefillInfo)
 	tpDecode := tpSizeFromWorker(decodeInfo)
-	isSameTpSize := tpPrefill == tpDecode || tpDecode == 1
+	isSameTpSize := tpPrefill == tpDecode
 	useIPC := isSameNode && isSupportIPC && isSameTpSize
 
 	transferProto := "rdma"
@@ -194,7 +194,7 @@ func RegisterInstanceCore(ctx context.Context, rawInstance *InstanceInfo) error 
 	}
 
 	if !splitwiseMode && instanceRole != MIXED {
-			return fmt.Errorf("only MIXED instances are allowed")
+		return fmt.Errorf("only MIXED instances are allowed")
 	}
 
 	// Check instance health status
@@ -217,6 +217,7 @@ func RegisterInstanceCore(ctx context.Context, rawInstance *InstanceInfo) error 
 		DeviceIDs:             []string(instance.DeviceIDs),
 		MetricsPort:           string(instance.MetricsPort),
 		TpSize:                instance.TpSize,
+		NotReady:              instance.NotReady,
 	}
 
 	id := instance.URL()

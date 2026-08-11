@@ -26,7 +26,7 @@ class AFDDecodeRunner:
         self.static_log2phy_tensor = None
         if not fd_config.eplb_config.enable_eplb:
             self.static_log2phy_tensor = paddle.to_tensor(
-                self.fd_config.afd_config.afd_static_log2phy,
+                self.fd_config.afd_config.static_log2phy,
                 dtype=paddle.int64,
             )
 
@@ -35,9 +35,9 @@ class AFDDecodeRunner:
 
             self.a2a_backend = AFDDeepEPA2ABackend(fd_config)
         elif envs.FD_MOE_A2A_BACKEND == "mooncake":
-            from fastdeploy.model_executor.afd.mooncake_backend import AFDMooncakeM2NA2ABackend
+            from fastdeploy.model_executor.afd.mooncake_backend import AFDMooncakeA2ABackend
 
-            self.a2a_backend = AFDMooncakeM2NA2ABackend(fd_config)
+            self.a2a_backend = AFDMooncakeA2ABackend(fd_config)
         else:
             raise ValueError(
                 f"Unknown FD_MOE_A2A_BACKEND={envs.FD_MOE_A2A_BACKEND!r}. "
@@ -45,9 +45,9 @@ class AFDDecodeRunner:
             )
 
         logger.info(
-            f"AFDDecodeRunner created: physical_experts={self.fd_config.afd_config.afd_num_physical_experts}, "
-            f"local_physical_experts={self.fd_config.afd_config.afd_num_local_physical_experts}, "
-            f"attn_ranks={self.fd_config.afd_config.afd_attn_ranks}, ffn_ranks={self.fd_config.afd_config.afd_ffn_ranks}, "
+            f"AFDDecodeRunner created: physical_experts={self.fd_config.afd_config.num_physical_experts}, "
+            f"local_physical_experts={self.fd_config.afd_config.num_local_physical_experts}, "
+            f"attn_ranks={self.fd_config.afd_config.attn_ranks}, ffn_ranks={self.fd_config.afd_config.ffn_ranks}, "
             f"a2a_backend={self.a2a_backend.name}, "
             f"ep_rank={fd_config.parallel_config.expert_parallel_rank}, "
             f"current_device={paddle.device.get_device()}"

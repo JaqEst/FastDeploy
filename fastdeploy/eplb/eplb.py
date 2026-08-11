@@ -282,24 +282,24 @@ def rebalance_experts(
         raise ValueError(f"weight must be [layers, logical_experts], got shape={weight.shape}")
 
     num_layers, num_logical_experts = weight.shape
-    if num_logical_experts != afd_config.afd_num_logical_experts:
+    if num_logical_experts != afd_config.num_logical_experts:
         raise ValueError(
             "AFD EPLB weight shape does not match config: "
             f"weight_logical_experts={num_logical_experts}, "
-            f"config_logical_experts={afd_config.afd_num_logical_experts}"
+            f"config_logical_experts={afd_config.num_logical_experts}"
         )
-    if afd_config.afd_num_redundant_experts < 0:
-        raise ValueError(f"AFD redundant experts must be non-negative, got {afd_config.afd_num_redundant_experts}")
+    if afd_config.num_redundant_experts < 0:
+        raise ValueError(f"AFD redundant experts must be non-negative, got {afd_config.num_redundant_experts}")
 
-    ffn_ranks = afd_config.afd_ffn_ranks
-    ffn_replicas = afd_config.afd_num_ffn_physical_experts
-    local_physical_experts = afd_config.afd_num_local_physical_experts
-    global_physical_experts = afd_config.afd_num_physical_experts
-    if ffn_replicas != num_logical_experts + afd_config.afd_num_redundant_experts:
+    ffn_ranks = afd_config.ffn_ranks
+    ffn_replicas = afd_config.num_ffn_physical_experts
+    local_physical_experts = afd_config.num_local_physical_experts
+    global_physical_experts = afd_config.num_physical_experts
+    if ffn_replicas != num_logical_experts + afd_config.num_redundant_experts:
         raise ValueError(
             "AFD EPLB config layout is inconsistent: "
             f"ffn_replicas={ffn_replicas}, logical={num_logical_experts}, "
-            f"redundant={afd_config.afd_num_redundant_experts}"
+            f"redundant={afd_config.num_redundant_experts}"
         )
     if num_replicas != global_physical_experts:
         raise ValueError(
@@ -324,7 +324,7 @@ def rebalance_experts(
         global_end = global_start + local_physical_experts
         global_phy2log[:, global_start:global_end] = ffn_phy2log[:, ffn_start:ffn_end]
 
-    max_replicas = afd_config.afd_num_redundant_experts + 1
+    max_replicas = afd_config.num_redundant_experts + 1
     global_log2phy = np.full((num_layers, num_logical_experts, max_replicas), -1, dtype=np.int32)
     mapped_log2phy = np.full_like(ffn_log2phy, -1, dtype=np.int32)
     valid = ffn_log2phy >= 0

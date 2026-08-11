@@ -148,6 +148,7 @@ type InstanceInfo struct {
 	DeviceIDs             IntToStringList `json:"device_ids,omitempty" yaml:"device_ids,omitempty"`
 	MetricsPort           Port            `json:"metrics_port,omitempty" yaml:"metrics_port,omitempty"`
 	TpSize                int             `json:"tp_size,omitempty" yaml:"tp_size,omitempty"`
+	NotReady              bool            `json:"not_ready,omitempty" yaml:"not_ready,omitempty"`
 }
 
 func isValidPort(p Port) bool {

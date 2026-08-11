@@ -31,6 +31,7 @@ type WorkerInfo struct {
 	DeviceIDs             []string `json:"device_ids"`
 	MetricsPort           string   `json:"metrics_port"`
 	TpSize                int      `json:"tp_size"`
+	NotReady              bool     `json:"not_ready,omitempty"`
 }
 
 var DefaultManager *Manager
@@ -57,6 +58,10 @@ func Init(cfg *config.Config) {
 	healthEndpoint = cfg.Manager.HealthCheckEndpoint
 	failureThreshold = cfg.Manager.HealthFailureThreshold
 	successThreshold = cfg.Manager.HealthSuccessThreshold
+}
+
+func workerIsReady(worker *WorkerInfo) bool {
+	return worker != nil && !worker.NotReady
 }
 
 func WorkerMapToList(ctx context.Context, workerType string) []string {
@@ -91,7 +96,7 @@ func WorkerMapToList(ctx context.Context, workerType string) []string {
 	// Build worker list
 	workerURLs := make([]string, 0, len(keys))
 	for _, key := range keys {
-		if workerInfo, exists := workerMap[key]; exists {
+		if workerInfo, exists := workerMap[key]; exists && workerIsReady(workerInfo) {
 			workerURLs = append(workerURLs, workerInfo.Url)
 		}
 	}

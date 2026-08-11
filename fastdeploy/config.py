@@ -632,7 +632,6 @@ class ParallelConfig:
     def __init__(
         self,
         args,
-        world_size: Optional[int] = None
     ):
         self.sequence_parallel = False  # Whether to enable sequence parallelism.
         self.use_ep = False  # Whether to enable Expert Parallelism
@@ -684,10 +683,12 @@ class ParallelConfig:
         else:
             self.expert_parallel_size = 1
 
-        if args.get("afd_role") is not None and world_size is not None:
-            self.enable_expert_parallel = True
-            self.expert_parallel_size = world_size
         self.use_ep = self.expert_parallel_size > 1
+
+        # afd deployment always uses ep
+        if args.get("afd_role") in ("attn", "ffn"):
+            self.enable_expert_parallel = True
+            self.use_ep = True
 
         if self.shutdown_comm_group_if_worker_idle is None:
             self.shutdown_comm_group_if_worker_idle = not self.use_ep
@@ -713,49 +714,64 @@ class ParallelConfig:
         # use_sequence_parallel_moe: allgather + qkv_linear + attn + all2all + out_linear
         self.use_sequence_parallel_moe = (
             (not self.disable_sequence_parallel_moe)
-            and self.expert_parallel_size > 1
+            and self.use_ep
             and self.tensor_parallel_size > 1
         )
         logger.info(f"use_sequence_parallel_moe: {self.use_sequence_parallel_moe}")
 
-    def set_communicate_group(self, afd_config: AFDConfig=None):
-        # different tp group id
-        # prevent different tp_groups using the same group_id
+    def set_communicate_group(self, afd_config: AFDConfig=None, launch_config: LaunchConfig=None):
         tp_gid_offset = envs.FD_TP_GROUP_GID_OFFSET
-        if afd_config is not None and afd_config.enable_afd:
-            if afd_config.afd_node_srank is None:
-                raise ValueError("afd_node_srank must be set before creating AFD tp_group")
-            tp_group_ranks = range(
-                afd_config.afd_node_srank,
-                afd_config.afd_node_srank + self.tensor_parallel_size,
-            )
-            tp_group_gid = afd_config.afd_nnode_rank + tp_gid_offset
-            ep_group_gid = afd_config.afd_nnodes + tp_gid_offset
-        else:
-            tp_group_ranks = range(
-                self.data_parallel_rank * self.tensor_parallel_size,
-                (self.data_parallel_rank + 1) * self.tensor_parallel_size,
-            )
-            tp_group_gid = self.data_parallel_rank + tp_gid_offset
-            ep_group_gid = self.data_parallel_size + tp_gid_offset
 
-        if envs.FD_MOE_A2A_BACKEND == "mooncake":
-            from mooncake.paddle_integration import new_mooncake_group
-            self.tp_group = new_mooncake_group(list(tp_group_ranks), tp_group_gid)
-        else:
-            dist.collective._set_custom_gid(tp_group_gid)
-            self.tp_group = dist.new_group(tp_group_ranks)
+        if self.enable_expert_parallel:
+            # same ep group id
+            ep_group_ranks = list(range(self.expert_parallel_size))
+            if afd_config and afd_config.enable_afd:
+                ep_group_gid = afd_config.ninsts + tp_gid_offset
+            else:
+                ep_group_gid = self.data_parallel_size + tp_gid_offset
+
+            pg_opts = None
+            if envs.FD_USE_MOONCAKE_PG:
+                is_extension = launch_config.is_extension if launch_config else False
+                pg_opts = {
+                    "is_extension": is_extension,
+                    "global_ranks_in_group": ep_group_ranks,
+                }
+
+            dist.collective._set_custom_gid(ep_group_gid)
+            self.ep_group = dist.new_group(ep_group_ranks, pg_options=pg_opts)
             dist.collective._set_custom_gid(None)
 
-        # same ep group id
-        if self.enable_expert_parallel:
-            if envs.FD_MOE_A2A_BACKEND == "mooncake":
-                from mooncake.paddle_integration import new_mooncake_group
-                self.ep_group = new_mooncake_group(list(range(self.expert_parallel_size)), ep_group_gid)
-            else:
-                dist.collective._set_custom_gid(ep_group_gid)
-                self.ep_group = dist.new_group(range(self.expert_parallel_size))
-                dist.collective._set_custom_gid(None)
+            if envs.FD_USE_MOONCAKE_PG and self.ep_group.is_member():
+                self.ep_active_ranks = self.ep_group.process_group.get_active_ranks()
+
+        # different tp group id
+        # prevent different tp_groups using the same group_id
+        if afd_config and afd_config.enable_afd:
+            tp_group_ranks = afd_config.inst_ranks
+            tp_group_gid = afd_config.inst_rank + tp_gid_offset
+        else:
+            tp_group_ranks = list(range(
+                self.data_parallel_rank * self.tensor_parallel_size,
+                (self.data_parallel_rank + 1) * self.tensor_parallel_size,
+            ))
+            tp_group_gid = self.data_parallel_rank + tp_gid_offset
+
+        pg_opts = None
+        if envs.FD_USE_MOONCAKE_PG:
+            is_extension = bool(launch_config and launch_config.is_extension)
+            is_ffn_only = bool(afd_config and afd_config.is_ffn)
+            pg_opts = {
+                "is_extension": is_extension and is_ffn_only,
+                "global_ranks_in_group": tp_group_ranks,
+            }
+
+        dist.collective._set_custom_gid(tp_group_gid)
+        self.tp_group = dist.new_group(tp_group_ranks, pg_options=pg_opts)
+        dist.collective._set_custom_gid(None)
+
+        if envs.FD_USE_MOONCAKE_PG and self.tp_group.is_member():
+            self.tp_active_ranks = self.tp_group.process_group.get_active_ranks()
 
         logger.info(
             f"data_parallel_size: {self.data_parallel_size}, tensor_parallel_size: {self.tensor_parallel_size}, expert_parallel_size: {self.expert_parallel_size}, data_parallel_rank: {self.data_parallel_rank}, tensor_parallel_rank: {self.tensor_parallel_rank}, expert_parallel_rank: {self.expert_parallel_rank}, tp_group: {self.tp_group}."
@@ -774,76 +790,95 @@ class ParallelConfig:
 
 class AFDConfig:
     """
-    Configuration for AFD.
+    Configuration for Attention-FFN Disaggregation.
     """
 
-    def __init__(
-        self,
-        args,
-        afd_node_srank: int = 0,
-        afd_attn_tp_size: int = 1,
-    ):
+    def __init__(self, args):
         self.afd_role = None
-        self.afd_master = None
-        self.afd_nnodes: int = 1
-        self.afd_nnode_rank: int = 0
-        self.afd_node_srank: int = afd_node_srank
-        self.afd_attn_ranks: list[int] = []
-        self.afd_ffn_ranks: list[int] = []
-        self.afd_world_size: int = 1
-        self.afd_num_attn_ranks: int = 0
-        self.afd_num_ffn_ranks: int = 0
-        self.afd_attn_tp_size: int = afd_attn_tp_size
-        self.afd_num_logical_experts: int = 0
-        self.afd_redundant_experts_num: int = 0
-        self.afd_num_ffn_physical_experts: int = 0
-        self.afd_num_local_physical_experts: int = 0
-        self.afd_num_physical_experts: int = 0
-        self.afd_static_log2phy: list[int] = []
+        self.afd_world_size = 1
+        self.ninsts: int = 1
+        self.inst_rank: int = 0
+        self.inst_first_rank = 0
+        self.inst_last_rank = 1
+        self.attn_inst_size = 1
 
-        if args is not None:
-            for key, value in args.items():
-                if hasattr(self, key) and value != "None":
-                    setattr(self, key, value)
+        for key, value in args.items():
+            if hasattr(self, key) and value != "None":
+                setattr(self, key, value)
+
+        if not self.enable_afd:
+            return
+
+        if not(os.getenv("GATHERED_AFD_ROLE", None) and os.getenv("GATHERED_TENSOR_PARALLEL_SIZE", None)):
+            return
+
+        # runtime initialization
+        # initialized during worker startup
+        rank2role = os.getenv("GATHERED_AFD_ROLE").split(",")
+        rank2inst_size = os.getenv("GATHERED_TENSOR_PARALLEL_SIZE").split(",")
+        rank2inst_size = [int(rank2inst_size[i]) for i in range(len(rank2inst_size))]
+
+        self.attn_ranks = [rank for rank, role in enumerate(rank2role) if role == "attn"]
+        self.ffn_ranks = [rank for rank, role in enumerate(rank2role) if role == "ffn"]
+        self.afd_world_size = len(rank2role)
+
+        attn_inst_sizes = [v for k, v in zip(rank2role, rank2inst_size) if k == "attn"]
+        # We assumes that attn instances use the same tensor parallel size
+        assert all([s == attn_inst_sizes[0] for s in attn_inst_sizes]), (
+            "AFD requires all attn instances to have the same tensor parallel size"
+        )
+        self.attn_inst_size = attn_inst_sizes[0]
+
+        for _ in range(self.inst_rank):
+            self.inst_first_rank += rank2inst_size[self.inst_first_rank]
+        self.inst_last_rank = self.inst_first_rank + rank2inst_size[self.inst_first_rank]
 
     @property
     def enable_afd(self) -> bool:
-        return self.afd_role is not None
+        return self.afd_role in ("attn", "ffn")
 
-    def set_rank_topology(self, world_size: int, attn_ranks: list[int], ffn_ranks: list[int]) -> None:
-        if not attn_ranks:
-            raise ValueError("AFD requires at least one ATTN rank.")
-        if not ffn_ranks:
-            raise ValueError("AFD requires at least one FFN rank.")
+    @property
+    def is_attn(self) -> bool:
+        return self.afd_role == "attn"
 
-        self.afd_attn_ranks = sorted(int(rank) for rank in attn_ranks)
-        self.afd_ffn_ranks = sorted(int(rank) for rank in ffn_ranks)
-        self.afd_world_size = int(world_size)
-        self.afd_num_attn_ranks = len(self.afd_attn_ranks)
-        self.afd_num_ffn_ranks = len(self.afd_ffn_ranks)
+    @property
+    def num_attn_ranks(self) -> int:
+        return len(self.attn_ranks)
+
+    @property
+    def is_ffn(self) -> bool:
+        return self.afd_role == "ffn"
+
+    @property
+    def num_ffn_ranks(self) -> int:
+        return len(self.ffn_ranks)
+
+    @property
+    def inst_ranks(self) -> list[int]:
+        return list(range(self.inst_first_rank, self.inst_last_rank))
 
     def set_expert_layout(self, num_logical_experts: int, num_redundant_experts: int = 0) -> None:
-        self.afd_num_logical_experts = num_logical_experts
-        self.afd_num_redundant_experts = num_redundant_experts
-        self.afd_num_ffn_physical_experts = num_logical_experts + num_redundant_experts
+        self.num_logical_experts = num_logical_experts
+        self.num_redundant_experts = num_redundant_experts
+        self.num_ffn_physical_experts = num_logical_experts + num_redundant_experts
 
-        if self.afd_num_ffn_physical_experts % self.afd_num_ffn_ranks != 0:
+        if self.num_ffn_physical_experts % self.num_ffn_ranks != 0:
             raise ValueError(
                 "AFD requires logical + redundant experts to be divisible by FFN ranks: "
                 f"num_logical_experts={num_logical_experts}, "
                 f"redundant_experts_num={num_redundant_experts}, "
-                f"ffn_ranks={self.afd_ffn_ranks}"
+                f"ffn_ranks={self.ffn_ranks}"
             )
 
-        self.afd_num_local_physical_experts = self.afd_num_ffn_physical_experts // self.afd_num_ffn_ranks
-        self.afd_num_physical_experts = self.afd_num_local_physical_experts * self.afd_world_size
+        self.num_local_physical_experts = self.num_ffn_physical_experts // self.num_ffn_ranks
+        self.num_physical_experts = self.num_local_physical_experts * self.afd_world_size
 
-        self.afd_static_log2phy = []
+        self.static_log2phy = []
         for logical_id in range(num_logical_experts):
-            ffn_rank_index = logical_id // self.afd_num_local_physical_experts
-            ffn_global_rank = self.afd_ffn_ranks[ffn_rank_index]
-            local_offset = logical_id % self.afd_num_local_physical_experts
-            self.afd_static_log2phy.append(ffn_global_rank * self.afd_num_local_physical_experts + local_offset)
+            ffn_rank_index = logical_id // self.num_local_physical_experts
+            ffn_global_rank = self.ffn_ranks[ffn_rank_index]
+            local_offset = logical_id % self.num_local_physical_experts
+            self.static_log2phy.append(ffn_global_rank * self.num_local_physical_experts + local_offset)
 
     def print(self):
         logger.info("AFD Configuration Information :")
@@ -1966,6 +2001,31 @@ class RoutingReplayConfig:
         return json.dumps({key: value for key, value in self.__dict__.items()})
 
 
+class LaunchConfig:
+    """
+    Configuration for process launch and worker lifecycle.
+    """
+
+    def __init__(
+        self,
+        args = None,
+    ):
+        self.enable_fault_tolerant: bool = False
+        self.is_extension: bool = False
+        self.launch_port: int = -1
+
+        if args is not None:
+            for key, value in args.items():
+                if hasattr(self, key) and value != "None":
+                    setattr(self, key, value)
+
+    def print(self):
+        logger.info("Launch Configuration Information :")
+        for k, v in self.__dict__.items():
+            logger.info("{:<20}:{:<6}{}".format(k, "", v))
+        logger.info("=============================================================")
+
+
 class FDConfig:
     """
     The configuration class which contains all fastdeploy-related configuration. This
@@ -2002,7 +2062,7 @@ class FDConfig:
         test_mode=False,
         routing_replay_config: Optional[RoutingReplayConfig] = None,
         deploy_modality: DeployModality = DeployModality.MIXED,
-        enable_fault_tolerant: bool = False,
+        launch_config: LaunchConfig = None,
     ):
         self.model_config: ModelConfig = model_config  # type: ignore
         self.cache_config: CacheConfig = cache_config  # type: ignore
@@ -2020,8 +2080,8 @@ class FDConfig:
         self.router_config: RouterConfig = router_config
         self.routing_replay_config = routing_replay_config
         self.deploy_modality: DeployModality = deploy_modality
-        self.enable_fault_tolerant: bool = enable_fault_tolerant
         self.afd_config: AFDConfig = afd_config
+        self.launch_config: LaunchConfig = launch_config
         # Initialize cuda graph capture list
         max_capture_shape = self.scheduler_config.max_num_seqs
         if self.graph_opt_config.cudagraph_only_prefill:
@@ -2065,9 +2125,9 @@ class FDConfig:
 
         self.host_ip = get_host_ip()
 
-        if self.afd_config.enable_afd and self.afd_config.afd_master is not None:
-            self.nnode = self.afd_config.afd_nnodes
-            self.node_rank = self.afd_config.afd_nnode_rank
+        if self.afd_config.enable_afd:
+            self.nnode = self.afd_config.ninsts
+            self.node_rank = self.afd_config.inst_rank
         elif self.ips is None:
             self.nnode = 1
             self.node_rank = 0
@@ -2122,6 +2182,10 @@ class FDConfig:
         if current_platform.is_intel_hpu():
             self.parallel_config.device_ids = os.getenv("HPU_VISIBLE_DEVICES", self.parallel_config.device_ids)
 
+        # Custom-all-reduce does not support fault tolerance
+        if self.launch_config.enable_fault_tolerant:
+            self.parallel_config.disable_custom_all_reduce = True
+
         if (
             self.load_config
             and self.load_config.dynamic_load_weight
@@ -2171,7 +2235,7 @@ class FDConfig:
             # The first moe layer id of GLM4.5 model
             self.model_config.moe_layer_start_index = self.model_config.first_k_dense_replace
 
-        if self.afd_config.enable_afd and self.afd_config.afd_master is not None:
+        if self.afd_config.enable_afd:
             self.is_master = self.node_rank == 0
             self.master_ip = "0.0.0.0"
         elif self.parallel_config.tensor_parallel_size <= self.worker_num_per_node or self.node_rank == 0:
@@ -2295,8 +2359,8 @@ class FDConfig:
                 )
             else:
                 tp_size = self.parallel_config.tensor_parallel_size
-                if self.afd_config is not None and self.afd_config.afd_role == "ffn":
-                    tp_size = self.afd_config.afd_attn_tp_size
+                if self.afd_config is not None and self.afd_config.is_ffn:
+                    tp_size = self.afd_config.attn_inst_size
                 # It will hang when real batch_size < tp_size
                 self.graph_opt_config.filter_capture_size(tp_size=tp_size)
 
@@ -2385,13 +2449,12 @@ class FDConfig:
             assert self.scheduler_config.splitwise_role == "decode", (
                 f"When afd_role is set to '{self.afd_config.afd_role}', splitwise_role must be 'decode'"
             )
-            assert self.afd_config.afd_master is not None, "afd_master must be set when afd_role is enabled"
-            assert self.afd_config.afd_nnodes >= 1, (
-                f"afd_nnodes must be >= 1, got {self.afd_config.afd_nnodes}"
+            assert self.afd_config.ninsts >= 1, (
+                f"ninsts must be >= 1, got {self.afd_config.ninsts}"
             )
-            assert 0 <= self.afd_config.afd_nnode_rank < self.afd_config.afd_nnodes, (
-                f"afd_nnode_rank must be in [0, {self.afd_config.afd_nnodes}), "
-                f"got {self.afd_config.afd_nnode_rank}"
+            assert 0 <= self.afd_config.inst_rank < self.afd_config.ninsts, (
+                f"inst_rank must be in [0, {self.afd_config.ninsts}), "
+                f"got {self.afd_config.inst_rank}"
             )
 
         if not self.cache_config.enable_chunked_prefill:
@@ -2483,6 +2546,7 @@ class FDConfig:
                 or k == "afd_config"
                 or k == "parallel_config"
                 or k == "commit_config"
+                or k == "launch_config"
             ):
                 if v is not None:
                     v.print()
@@ -2522,6 +2586,7 @@ class FDConfig:
             "transfer_protocol": transfer_protocol,
             "tp_size": self.parallel_config.tensor_parallel_size,
             "is_paused": False,
+            "not_ready": self.launch_config.is_extension,
             "version": self.model_config.version,
             "connected_decodes": [],
         }

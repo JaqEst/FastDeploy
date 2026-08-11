@@ -511,6 +511,7 @@ class DeepEPPrefillRunner(DeepEPRunner):
         ep_group=None,
         use_internode_ll_two_stage: bool = False,
         prefill_num_worst_tokens: int = 0,
+        **kwargs,
     ):
         super().__init__(
             top_k,
@@ -630,6 +631,7 @@ class DeepEPDecoderRunner(DeepEPRunner):
         ep_group=None,
         moe_phase: MoEPhase = MoEPhase("decode"),
         use_internode_ll_two_stage: bool = False,
+        **kwargs,
     ):
         super().__init__(
             top_k,
@@ -650,13 +652,12 @@ class DeepEPDecoderRunner(DeepEPRunner):
         x: paddle.Tensor,
         topk_idx: paddle.Tensor,
         topk_weights: paddle.Tensor,
-        *args,
+        expertwise_scale=None,
+        use_fp8: bool = False,
+        quant_group_size: int = 128,
+        use_ue8m0: bool = False,
         **kwargs,
     ):
-        expertwise_scale = kwargs.get("expertwise_scale", None)
-        use_fp8 = kwargs.get("use_fp8", False)
-        quant_group_size = kwargs.get("quant_group_size", 128)
-        use_ue8m0 = kwargs.get("use_ue8m0", False)
         if not self.use_internode_ll_two_stage:
             recv_hidden_states, recv_expert_count, handle, dispatch_hook = self.ep_engine.low_latency_dispatch(
                 x, topk_idx, expertwise_scale, use_fp8, quant_group_size, use_ue8m0
@@ -674,8 +675,7 @@ class DeepEPDecoderRunner(DeepEPRunner):
 
         return recv_hidden_states, recv_expert_count, handle
 
-    def combine(self, ffn_out, topk_idx, topk_weights, handle, **kwargs):
-        quant_group_size = kwargs.get("quant_group_size", 128)
+    def combine(self, ffn_out, topk_idx, topk_weights, handle, quant_group_size: int = 128, **kwargs):
         if not self.use_internode_ll_two_stage:
             combined_hidden_states, combine_hook = self.ep_engine.low_latency_combine(
                 ffn_out, topk_idx, topk_weights, handle
@@ -698,3 +698,4 @@ class DeepEPDecoderRunner(DeepEPRunner):
 # Canonical public names re-exported via ep.py dispatcher.
 EPPrefillRunner = DeepEPPrefillRunner
 EPDecoderRunner = DeepEPDecoderRunner
+EPBackend = DeepEPEngine

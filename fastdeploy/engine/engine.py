@@ -40,6 +40,7 @@ from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.common_engine import (
     EngineService,
     _format_worker_launch_failure_message,
+    _get_launch_control_sock,
 )
 from fastdeploy.engine.expert_service import start_data_parallel_service
 from fastdeploy.engine.request import Request
@@ -98,7 +99,7 @@ class LLMEngine:
         self.do_profile = 1
         if (
             self.cfg.cache_config.num_gpu_blocks_override
-            or self.cfg.afd_config.afd_role == "ffn"
+            or self.cfg.afd_config.is_ffn
         ):
             self.do_profile = 0
 
@@ -218,6 +219,10 @@ class LLMEngine:
             return False
 
         console_logger.info(f"Worker processes are launched with {time.time() - start_time} seconds.")
+
+        # An instance relaunched with `--extension` rejoins an existing group,
+        # so hand it to the elastic manager now that its workers are alive.
+        self.engine.submit_extension_recover()
 
         # Print blocks number & max running requests to console
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
@@ -533,8 +538,11 @@ class LLMEngine:
         pd_cmd = f"{command_prefix} {sys.executable} {uncache_worker_stdout} -m paddle.distributed.launch"
         pd_cmd = pd_cmd + f" --log_dir {log_dir}"
 
-        if self.cfg.enable_fault_tolerant:
+        if self.cfg.launch_config.enable_fault_tolerant:
             pd_cmd = pd_cmd + " --enable-fault-tolerant"
+        if self.cfg.launch_config.enable_fault_tolerant or self.cfg.launch_config.is_extension:
+            ctl_sock_suffix = self.cfg.parallel_config.engine_worker_queue_port[0]
+            pd_cmd = pd_cmd + f" --launch-control-sock {_get_launch_control_sock(ctl_sock_suffix).path}"
 
         worker_path = "../worker/worker_process.py"
         py_script = os.path.join(current_dir_path, worker_path)
@@ -665,19 +673,19 @@ class LLMEngine:
             "enable_entropy": self.cfg.model_config.enable_entropy,
             "ep_prefill_use_worst_num_tokens": self.cfg.parallel_config.ep_prefill_use_worst_num_tokens,
             "enable_overlap_schedule": self.cfg.scheduler_config.enable_overlap_schedule,
+            "is_extension": self.cfg.launch_config.is_extension,
         }
         for worker_flag, value in worker_store_true_flag.items():
             if value:
                 arguments = arguments + f" --{worker_flag}"
 
         if self.cfg.afd_config.enable_afd:
-            arguments += f" --afd_role {self.cfg.afd_config.afd_role}"
-            if self.cfg.afd_config.afd_master is not None:
-                arguments += (
-                    f" --afd_master {self.cfg.afd_config.afd_master}"
-                    f" --afd_nnodes {self.cfg.afd_config.afd_nnodes}"
-                    f" --afd_nnode_rank {self.cfg.afd_config.afd_nnode_rank}"
-                )
+            arguments += (
+                f" --afd_role {self.cfg.afd_config.afd_role}"
+                f" --ninsts {self.cfg.afd_config.ninsts}"
+                f" --inst_rank {self.cfg.afd_config.inst_rank}"
+            )
+
         if ips is not None:
             arguments += f" --ips {ips}"
 
@@ -690,12 +698,16 @@ class LLMEngine:
                 arguments = arguments + f" --{worker_flag} {value}"
 
         if self.cfg.afd_config.enable_afd:
-            pd_cmd = (
-                pd_cmd
-                + f" --master {self.cfg.afd_config.afd_master}"
-                + f" --nnodes {self.cfg.afd_config.afd_nnodes}"
-                + f" --rank {self.cfg.afd_config.afd_nnode_rank}"
+            assert self.cfg.launch_config.launch_port != -1, "launch_port must be set when enabling AFD"
+            master_addr = f"{self.cfg.ips[0]}:{self.cfg.launch_config.launch_port}"
+            pd_cmd += (
+                f" --master {master_addr}"
+                f" --pod_name afdi{self.cfg.afd_config.inst_rank}"
+                f" --nnodes {self.cfg.afd_config.ninsts}"
+                f" --rank {self.cfg.afd_config.inst_rank}"
             )
+            # gather rank roles and tp size for afd
+            pd_cmd += " --gather_option_keys afd_role,tensor_parallel_size"
         elif self.cfg.nnode > 1:
             pd_cmd = pd_cmd + f" --ips {ips} --nnodes {len(self.cfg.ips)}"
         pd_cmd = pd_cmd + arguments + f" 2>{log_dir}/launch_worker.log"
@@ -804,31 +816,21 @@ class LLMEngine:
         Check the health of the model server by checking whether all workers are alive.
 
         """
-        live_times = self.engine.worker_healthy_live_signal.value
-        if self.cfg.enable_fault_tolerant:
+        workers = self.engine.worker_healthy_live_signal.value
+
+        if self.cfg.launch_config.enable_fault_tolerant:
             current_time = time.time()
-            timeout_worker_ids = []
-            live_worker_ids = []
-            for worker_id, live_time in enumerate(live_times):
-                if current_time - live_time > time_interval_threashold:
-                    timeout_worker_ids.append(worker_id)
-                else:
-                    live_worker_ids.append(worker_id)
+            timeout_workers = [
+                worker_id
+                for worker_id, live_time in enumerate(workers)
+                if current_time - live_time > time_interval_threashold
+            ]
 
-            if live_worker_ids:
-                if timeout_worker_ids:
-                    return (
-                        True,
-                        "Worker Service Degraded: "
-                        f"live_workers={live_worker_ids}, "
-                        f"timeout_workers={timeout_worker_ids}",
-                    )
-                return True, ""
+            all_timeout = len(timeout_workers) == len(workers)
+            return not all_timeout, f"Timeout workers: {timeout_workers}"
 
-            return False, f"Worker Service Not Healthy: timeout_workers={timeout_worker_ids}"
-
-        if live_times[0]:
-            elapsed_time = time.time() - live_times[0]
+        if workers[0]:
+            elapsed_time = time.time() - workers[0]
             if elapsed_time > time_interval_threashold:
                 return False, "Worker Service Not Healthy"
 

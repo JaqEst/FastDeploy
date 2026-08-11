@@ -36,12 +36,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import paddle
+from paddle.distributed.launch.utils.control_socket import ControlSocketClient
 import zmq
 from tqdm import tqdm
 
 import fastdeploy.metrics.trace as tracing
 from fastdeploy.cache_manager.cache_data import CacheStatus
 from fastdeploy.config import FDConfig
+from fastdeploy.engine.elastic_manager import ElasticManager
 from fastdeploy.engine.register_manager import RegisterManager
 from fastdeploy.engine.request import (
     CompletionOutput,
@@ -112,6 +114,13 @@ def _format_worker_launch_failure_message(log_dir: str) -> str:
     if traceback_text:
         return f"{message}\n{traceback_text}"
     return message
+
+
+def _get_launch_control_sock(port: int) -> ControlSocketClient:
+    """获取启动器控制套接字"""
+    path = f"/dev/shm/fd_launch_control_{port}.sock"
+    client = ControlSocketClient(path)
+    return client
 
 
 class EngineService:
@@ -225,6 +234,13 @@ class EngineService:
             get_is_paused=self._get_is_paused_safe,
         )
 
+        # Initialize ElasticManager
+        self._elastic_manager = ElasticManager(
+            cfg=self.cfg,
+            worker_healthy_live_signal=self.worker_healthy_live_signal,
+            is_registered=self._register_manager.is_registered,
+        )
+
         if self.cfg.eplb_config.enable_eplb:
             current_suffix = self.cfg.parallel_config.local_engine_worker_queue_port
             init_eplb_signals(cfg, current_suffix)
@@ -235,7 +251,7 @@ class EngineService:
             self.do_profile = 1
             if (
                 self.cfg.cache_config.num_gpu_blocks_override
-                or self.cfg.afd_config.afd_role == "ffn"
+                or self.cfg.afd_config.is_ffn
             ):
                 self.do_profile = 0
 
@@ -264,6 +280,7 @@ class EngineService:
             self._decode_process_splitwise_requests()
 
         self._register_manager.start()
+        self._elastic_manager.start()
 
     def start_worker_service(self, async_llm_pid=None):
         # Initialize IPC signals for worker management
@@ -1381,6 +1398,105 @@ class EngineService:
             data = [[error_result]] if envs.ZMQ_SEND_BATCH_DATA else [error_result]
             self.send_response_server.send_response(request_id, data, worker_pid=worker_pid)
 
+    def submit_extension_recover(self):
+        """
+        Submit a recover task for an instance relaunched with `--extension`.
+        """
+        if not self.cfg.launch_config.is_extension:
+            return {"recover_ranks": []}
+
+        ctl_sock_suffix = self.cfg.parallel_config.engine_worker_queue_port[0]
+        response = _get_launch_control_sock(ctl_sock_suffix).request({"action": "ranks"})
+        recover_ranks = [int(r) for r in response.get("ranks", [])]
+        worker_ids = list(range(len(self.worker_healthy_live_signal.value)))
+
+        self._elastic_manager.submit_recover(ranks=recover_ranks, worker_ids=worker_ids)
+        self.llm_logger.info("Submitted extension recover for ranks: {}".format(recover_ranks))
+        return {"recover_ranks": recover_ranks}
+
+    def _control_recover(self, control_request: ControlRequest):
+        """Recover failed workers if exist.
+        Args:
+            control_request: The control request containing recover command
+
+        Raises:
+            Exception: If recover is not supported in current configuration
+
+        Returns:
+            dict: Dictionary containing recover result information, {'recover_ranks': list}
+        """
+        if not self.cfg.launch_config.enable_fault_tolerant:
+            raise Exception("recover only supported when enable_fault_tolerant is set to True")
+
+        # find timeout workers
+        current_time = time.time()
+        timeout_workers = [
+            worker_id
+            for worker_id, live_time in enumerate(self.worker_healthy_live_signal.value)
+            if current_time - live_time > envs.FD_WORKER_ALIVE_TIMEOUT
+        ]
+
+        if not timeout_workers:
+            return {"recover_ranks": []}
+
+        # send recover request to paddle.distributed.launch
+        local_dp_id = self.cfg.parallel_config.local_data_parallel_id
+        tp_size = self.cfg.parallel_config.tensor_parallel_size
+        container_ids = [local_dp_id * tp_size + worker_id for worker_id in timeout_workers]
+        ctl_sock_suffix = self.cfg.parallel_config.engine_worker_queue_port[0]
+        command = {"action": "recover", "container_ids": container_ids}
+        response = _get_launch_control_sock(ctl_sock_suffix).request(command)
+        recover_ranks = [int(r) for r in response.get("recover_ranks", [])]
+
+        self._elastic_manager.submit_recover(ranks=recover_ranks, worker_ids=timeout_workers)
+        self.llm_logger.info("Successfully restart ranks: {}".format(recover_ranks))
+        return {"recover_ranks": recover_ranks}
+
+    def _control_recover_status(self, control_request: ControlRequest):
+        """Return recover task status."""
+        if not self.cfg.launch_config.enable_fault_tolerant:
+            raise Exception("recover only supported when enable_fault_tolerant is set to True")
+        return {"tasks": self._elastic_manager.list_task_status(action="recover")}
+
+    def _control_recover_commit(self, control_request: ControlRequest):
+        """Commit a recovery to healthy workers in the current group."""
+        recover_ranks = control_request.get_args()["ranks"]
+        task = self._elastic_manager.get_task(action="recover", ranks=recover_ranks)
+
+        if task is not None and task.status != ElasticManager.STATUS_READY:
+            raise Exception("Task not ready")
+
+        # filter workers which become unhealthy after _control_recover call
+        worker_ids = self._elastic_manager.get_alive_worker_ids()
+        values = self.worker_healthy_live_signal.value
+        current_time = time.time()
+        worker_ids = [
+            worker_id for worker_id in worker_ids
+            if current_time - values[worker_id] <= envs.FD_WORKER_ALIVE_TIMEOUT
+        ]
+
+        if task is not None:
+            worker_ids += task.worker_ids
+
+        commit_args = copy.deepcopy(control_request.get_args())
+        commit_args["worker_ids"] = worker_ids
+        commit_request = ControlRequest(
+            request_id=control_request.request_id,
+            method="recover",
+            args=commit_args,
+        )
+        activate_clients = task.worker_ids if task else None
+        self.engine_worker_queue.put_tasks(([commit_request], 1), client_ids=activate_clients)
+        asyncio.run(self._wait_for_control_responses(
+            control_request.request_id, 30, executors=["worker"], worker_ids=worker_ids
+        ))
+
+        if task is not None:
+            self._elastic_manager.complete_task(action="recover", ranks=recover_ranks)
+            self.cfg.launch_config.is_extension = False
+        self.llm_logger.info("Successfully recover ranks: {}".format(recover_ranks))
+        return None
+
     def _control_pause(self, control_request: ControlRequest):
         """Pauses the LLM engine and aborts all running/inflight requests.
         Args:
@@ -1792,7 +1908,13 @@ class EngineService:
                 self.cache_task_queue.put_transfer_task((CacheStatus.CTRL, control_request))
         return
 
-    async def _wait_for_control_responses(self, request_id: str, timeout: int, executors: List[str] = None):
+    async def _wait_for_control_responses(
+        self,
+        request_id: str,
+        timeout: int,
+        executors: List[str] = None,
+        worker_ids: Optional[List[int]] = None,
+    ):
         """Wait for matching control responses from the selected executor queues.
 
         This helper selects the control-response queues that belong to the requested
@@ -1806,6 +1928,7 @@ class EngineService:
             executors: Executor groups to wait for, for example `["worker"]` or
                 `["worker", "cache_transfer"]`. If `None`, waits for all control
                 response queues.
+            worker_ids: Optional local worker ids used to filter worker response queues.
 
         Returns:
             A list of `response.result` values collected from all matched
@@ -1816,18 +1939,30 @@ class EngineService:
                 control response or fails while waiting.
         """
 
-        def select_control_queues(executors: List[str] = None):
-            """Select control response queues by executors."""
+        def select_control_queues(executors: List[str] = None, worker_ids: Optional[List[int]] = None):
+            """Select control response queues by executors and optional worker ids."""
             if executors is None:
                 return self._ctrl_output_queues
-            else:
-                queues = {}
-                for k, v in self._ctrl_output_queues.items():
-                    if "w2e" in k and "worker" in executors:
-                        queues[k] = v
-                    elif "c2e" in k and "cache_transfer" in executors:
-                        queues[k] = v
-                return queues
+
+            worker_queue_names = None
+            if worker_ids is not None:
+                tp_size = self.cfg.parallel_config.tensor_parallel_size
+                dp_index = self.cfg.parallel_config.local_data_parallel_id
+                engine_worker_queue_port = self.cfg.parallel_config.local_engine_worker_queue_port
+                worker_queue_names = {
+                    f"ctrl_w2e_rank{worker_id + tp_size * dp_index}_{engine_worker_queue_port}"
+                    for worker_id in worker_ids
+                }
+
+            queues = {}
+            for k, v in self._ctrl_output_queues.items():
+                if "w2e" in k and "worker" in executors:
+                    if worker_queue_names is not None and k not in worker_queue_names:
+                        continue
+                    queues[k] = v
+                elif "c2e" in k and "cache_transfer" in executors:
+                    queues[k] = v
+            return queues
 
         async def wait_one(queue_name: str, queue):
             """Wait until one queue returns a response for the current request_id."""
@@ -1856,7 +1991,7 @@ class EngineService:
                 )
 
         # Select only the control response queues that belong to the requested executors.
-        queues = select_control_queues(executors)
+        queues = select_control_queues(executors, worker_ids=worker_ids)
         if not queues:
             self.llm_logger.info(f"No queues to wait for, executors: {executors}")
             return
@@ -2199,6 +2334,8 @@ class EngineService:
         self.llm_logger.info("Exit sub services.....")
         self.running = False
 
+        self._elastic_manager.stop()
+
         if self.use_async_llm:
             # Clean up worker processes first (before closing multiprocessing services)
             if hasattr(self, "worker_proc") and self.worker_proc is not None:
@@ -2403,8 +2540,11 @@ class EngineService:
         pd_cmd = f"{command_prefix} {sys.executable} {uncache_worker_stdout} -m paddle.distributed.launch"
         pd_cmd = pd_cmd + f" --log_dir {log_dir}"
 
-        if self.cfg.enable_fault_tolerant:
+        if self.cfg.launch_config.enable_fault_tolerant:
             pd_cmd = pd_cmd + " --enable-fault-tolerant"
+        if self.cfg.launch_config.enable_fault_tolerant or self.cfg.launch_config.is_extension:
+            ctl_sock_suffix = self.cfg.parallel_config.engine_worker_queue_port[0]
+            pd_cmd = pd_cmd + f" --launch-control-sock {_get_launch_control_sock(ctl_sock_suffix).path}"
 
         worker_path = "../worker/worker_process.py"
         py_script = os.path.join(current_dir_path, worker_path)
@@ -2449,7 +2589,6 @@ class EngineService:
         ips = None
         if self.cfg.ips is not None:
             ips = ",".join(self.cfg.ips)
-        afd_enabled = self.cfg.afd_config.enable_afd and self.cfg.afd_config.afd_master is not None
         arguments = (
             f" --devices {self.cfg.parallel_config.device_ids} {py_script}"
             f" --max_num_seqs {self.cfg.scheduler_config.max_num_seqs} --max_model_len {self.cfg.model_config.max_model_len}"
@@ -2516,19 +2655,19 @@ class EngineService:
             "moe_gate_fp32": self.cfg.model_config.moe_gate_fp32,
             "enable_entropy": self.cfg.model_config.enable_entropy,
             "enable_overlap_schedule": self.cfg.scheduler_config.enable_overlap_schedule,
+            "is_extension": self.cfg.launch_config.is_extension,
         }
         for worker_flag, value in worker_store_true_flag.items():
             if value:
                 arguments = arguments + f" --{worker_flag}"
 
         if self.cfg.afd_config.enable_afd:
-            arguments += f" --afd_role {self.cfg.afd_config.afd_role}"
-            if self.cfg.afd_config.afd_master is not None:
-                arguments += (
-                    f" --afd_master {self.cfg.afd_config.afd_master}"
-                    f" --afd_nnodes {self.cfg.afd_config.afd_nnodes}"
-                    f" --afd_nnode_rank {self.cfg.afd_config.afd_nnode_rank}"
-                )
+            arguments += (
+                f" --afd_role {self.cfg.afd_config.afd_role}"
+                f" --ninsts {self.cfg.afd_config.ninsts}"
+                f" --inst_rank {self.cfg.afd_config.inst_rank}"
+            )
+
         if ips is not None:
             arguments += f" --ips {ips}"
 
@@ -2540,13 +2679,17 @@ class EngineService:
             if value:
                 arguments = arguments + f" --{worker_flag} {value}"
 
-        if afd_enabled:
-            pd_cmd = (
-                pd_cmd
-                + f" --master {self.cfg.afd_config.afd_master}"
-                + f" --nnodes {self.cfg.afd_config.afd_nnodes}"
-                + f" --rank {self.cfg.afd_config.afd_nnode_rank}"
+        if self.cfg.afd_config.enable_afd:
+            assert self.cfg.launch_config.launch_port != -1, "launch_port must be set when enabling AFD"
+            master_addr = f"{self.cfg.ips[0]}:{self.cfg.launch_config.launch_port}"
+            pd_cmd += (
+                f" --master {master_addr}"
+                f" --pod_name afdi{self.cfg.afd_config.inst_rank}"
+                f" --nnodes {self.cfg.afd_config.ninsts}"
+                f" --rank {self.cfg.afd_config.inst_rank}"
             )
+            # gather rank roles and tp size for afd
+            pd_cmd += " --gather_option_keys afd_role,tensor_parallel_size"
         elif self.cfg.nnode > 1:
             pd_cmd = pd_cmd + f" --ips {ips} --nnodes {len(self.cfg.ips)}"
         pd_cmd = pd_cmd + arguments + f" 2>{log_dir}/launch_worker.log"
@@ -2584,31 +2727,21 @@ class EngineService:
         Check the health of the model server by checking whether all workers are alive.
 
         """
-        live_times = self.worker_healthy_live_signal.value
-        if self.cfg.enable_fault_tolerant:
+        workers = self.worker_healthy_live_signal.value
+
+        if self.cfg.launch_config.enable_fault_tolerant:
             current_time = time.time()
-            timeout_worker_ids = []
-            live_worker_ids = []
-            for worker_id, live_time in enumerate(live_times):
-                if current_time - live_time > time_interval_threashold:
-                    timeout_worker_ids.append(worker_id)
-                else:
-                    live_worker_ids.append(worker_id)
+            timeout_workers = [
+                worker_id
+                for worker_id, live_time in enumerate(workers)
+                if current_time - live_time > time_interval_threashold
+            ]
 
-            if live_worker_ids:
-                if timeout_worker_ids:
-                    return (
-                        True,
-                        "Worker Service Degraded: "
-                        f"live_workers={live_worker_ids}, "
-                        f"timeout_workers={timeout_worker_ids}",
-                    )
-                return True, ""
+            all_timeout = len(timeout_workers) == len(workers)
+            return not all_timeout, f"Timeout workers: {timeout_workers}"
 
-            return False, f"Worker Service Not Healthy: timeout_workers={timeout_worker_ids}"
-
-        if live_times[0]:
-            elapsed_time = time.time() - live_times[0]
+        if workers[0]:
+            elapsed_time = time.time() - workers[0]
             if elapsed_time > time_interval_threashold:
                 return False, "Worker Service Not Healthy"
 

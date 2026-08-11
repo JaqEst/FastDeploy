@@ -94,10 +94,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_USE_BLACKWELL_GEMM": lambda: bool(int(os.getenv("FD_USE_BLACKWELL_GEMM", "0"))),
     # Whether to use PFCCLab/DeepEP.
     "FD_USE_PFCC_DEEP_EP": lambda: bool(int(os.getenv("FD_USE_PFCC_DEEP_EP", "0"))),
-    # Max dispatch tokens per rank for Mooncake EP (must be <= 1024).
-    "FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": lambda: int(
-        os.getenv("FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "128")
-    ),
     # Mooncake EP timeout (in microseconds).
     "FD_MOONCAKE_EP_TIMEOUT": lambda: int(os.getenv("FD_MOONCAKE_EP_TIMEOUT", "3_000_000")),
     # Whether to use aggregate send.
@@ -159,6 +155,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_ENABLE_CACHE_TASK": lambda: os.getenv("FD_ENABLE_CACHE_TASK", "0"),
     # Max pre-fetch requests number in PD
     "FD_EP_MAX_PREFETCH_TASK_NUM": lambda: int(os.getenv("FD_EP_MAX_PREFETCH_TASK_NUM", "8")),
+    # Whether to enable the control request poll mechanism
+    "FD_ENABLE_EP_CONTROL_REQ_POLL": lambda: bool(int(os.getenv("FD_ENABLE_EP_CONTROL_REQ_POLL", os.getenv("FD_ENABLE_V1_UPDATE_WEIGHTS", "0")))),
     # Enable or disable model caching.
     # When enabled, the quantized model is stored as a cache for future inference to improve loading efficiency.
     "FD_ENABLE_MODEL_LOAD_CACHE": lambda: bool(int(os.getenv("FD_ENABLE_MODEL_LOAD_CACHE", "0"))),

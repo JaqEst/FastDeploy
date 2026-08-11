@@ -1268,6 +1268,16 @@ class GPUModelRunner(ModelRunnerBase):
         return token_num, token_num_event
 
     def prepare_inputs_ffn_only(self, is_dummy_or_profile_run=False):
+        token_num_event = paddle.device.cuda.create_event()
+        token_num_event.record()
+
+        if (
+            is_dummy_or_profile_run
+            or (not self.enable_overlap_schedule)
+            or self.exist_prefill()
+        ):
+            token_num_event.synchronize()
+
         token_num = sorted(self.cudagraph_capture_sizes, reverse=True)[0]
         ids_remove_padding = paddle.empty([token_num], dtype=paddle.int64, device=self.device)
         self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
@@ -1277,10 +1287,10 @@ class GPUModelRunner(ModelRunnerBase):
             exist_prefill=self.exist_prefill(),
             step_use_cudagraph=self.use_cudagraph and not self.exist_prefill(),
             is_dummy_or_profile_run = is_dummy_or_profile_run,
-            ep_timeout_us=-1 if is_dummy_or_profile_run else envs.FD_MOONCAKE_EP_TIMEOUT,
+            timeout_us=-1 if is_dummy_or_profile_run else envs.FD_MOONCAKE_EP_TIMEOUT,
         )
 
-        return token_num
+        return token_num, token_num_event
 
     def _process_reorder(self) -> None:
         if self.attn_backends and getattr(self.attn_backends[0], "enable_ids_reorder", False):
@@ -1404,7 +1414,7 @@ class GPUModelRunner(ModelRunnerBase):
         self.forward_meta.is_zero_size = self.forward_meta.ids_remove_padding.shape[0] == 0
         self.forward_meta.exist_prefill = self.exist_prefill()
 
-        self.forward_meta.ep_timeout_us = -1 if is_dummy_or_profile_run else envs.FD_MOONCAKE_EP_TIMEOUT
+        self.forward_meta.timeout_us = -1 if is_dummy_or_profile_run else envs.FD_MOONCAKE_EP_TIMEOUT
 
     def initialize_kv_cache(self, profile: bool = False) -> None:
         """
@@ -1724,7 +1734,7 @@ class GPUModelRunner(ModelRunnerBase):
 
         broadcast_src = self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size
         if self.fd_config.afd_config.enable_afd:
-            broadcast_src = self.fd_config.afd_config.afd_node_srank
+            broadcast_src = self.fd_config.afd_config.inst_first_rank
 
         if not self.speculative_decoding:
             set_value_by_flags_and_idx(
@@ -1883,7 +1893,7 @@ class GPUModelRunner(ModelRunnerBase):
             self.padding_cudagraph_inputs()
 
             if self.forward_meta.step_use_cudagraph:
-                self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+                self.forward_meta.timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
 
             model_inputs = {}
             model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
@@ -1953,7 +1963,7 @@ class GPUModelRunner(ModelRunnerBase):
         self.padding_cudagraph_inputs()
 
         if self.forward_meta.step_use_cudagraph:
-            self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+            self.forward_meta.timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
 
         model_inputs = {}
         model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
@@ -1965,7 +1975,7 @@ class GPUModelRunner(ModelRunnerBase):
 
         for _ in range(num_warmup_dyruns_before_capture):
             self.prepare_inputs_ffn_only(is_dummy_or_profile_run=True)
-            self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+            self.forward_meta.timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
 
             self.forward_meta.step_use_cudagraph = False
             self.padding_cudagraph_inputs()
@@ -1982,7 +1992,7 @@ class GPUModelRunner(ModelRunnerBase):
             self.padding_cudagraph_inputs()
 
             if self.forward_meta.step_use_cudagraph:
-                self.forward_meta.ep_timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
+                self.forward_meta.timeout_us = envs.FD_MOONCAKE_EP_TIMEOUT
 
             model_inputs = {}
             model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
@@ -2036,7 +2046,7 @@ class GPUModelRunner(ModelRunnerBase):
                     logger.info(
                         f"Warm up the model with the num_tokens:{capture_size}, expected_decode_len:{expected_decode_len}"
                     )
-            elif self.fd_config.afd_config.afd_role == "ffn":
+            elif self.fd_config.afd_config.is_ffn:
                 for index, capture_size in enumerate(sorted(capture_sizes, reverse=True)):
                     # Capture one cuda graph only for AFD FFN participant
                     capture_graph = index == 0
@@ -2190,7 +2200,7 @@ class GPUModelRunner(ModelRunnerBase):
             intermediate_tensors:
             num_running_requests: batch_size
         """
-        if self.fd_config.afd_config.afd_role == "ffn":
+        if self.fd_config.afd_config.is_ffn:
             self.execute_model_ffn_only(model_forward_batch, num_running_requests)
         elif not self.enable_overlap_schedule:
             self.execute_model_normal(model_forward_batch, num_running_requests)
@@ -2271,15 +2281,9 @@ class GPUModelRunner(ModelRunnerBase):
         model_forward_batch: Optional[List[Request]] = None,
         num_running_requests: int = None,
     ) -> None:
-        current_launch_token_num = self.prepare_inputs_ffn_only()
-        self.current_launch_token_num = current_launch_token_num
-
-        self.padding_cudagraph_inputs()
-
-        model_inputs = {}
-        model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
-
+        model_inputs, token_num_event = self._preprocess_ffn_only(model_forward_batch, num_running_requests)
         self._execute(model_inputs)
+        token_num_event.synchronize()
 
     def _preprocess(
         self,
@@ -2328,6 +2332,23 @@ class GPUModelRunner(ModelRunnerBase):
             model_inputs["image_features"] = self.share_inputs["image_features"]
 
         return model_inputs, p_done_idxs, token_num_event
+
+    def _preprocess_ffn_only(
+        self,
+        model_forward_batch: Optional[List[Request]] = None,
+        num_running_requests: int = None
+    ) -> None:
+        if self.deterministic_logger is not None:
+            self.deterministic_logger.log_batch_start(model_forward_batch)
+
+        current_launch_token_num, token_num_event = self.prepare_inputs_ffn_only()
+        self.current_launch_token_num = current_launch_token_num
+
+        self.padding_cudagraph_inputs()
+
+        model_inputs = {}
+        model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
+        return model_inputs, token_num_event
 
     def _execute(self, model_inputs: Dict[str, paddle.Tensor]) -> None:
         if model_inputs is not None and len(model_inputs) > 0:
@@ -2436,7 +2457,7 @@ class GPUModelRunner(ModelRunnerBase):
 
             broadcast_src = self.parallel_config.data_parallel_rank * self.parallel_config.tensor_parallel_size
             if self.fd_config.afd_config.enable_afd:
-                broadcast_src = self.fd_config.afd_config.afd_node_srank
+                broadcast_src = self.fd_config.afd_config.inst_first_rank
 
             if not self.speculative_decoding:
                 set_value_by_flags_and_idx(
@@ -2900,6 +2921,66 @@ class GPUModelRunner(ModelRunnerBase):
         self.dynamic_weight_manager.finalize_update(pid)
 
         self.dynamic_weight_manager._log_memory("dynamic weight manager update all memory")
+
+    def recover(self, ranks: List[int], worker_ids: List[int]):
+        worker_id = self.parallel_config.tensor_parallel_rank
+        if worker_id not in worker_ids:
+            return
+
+        logger.info(f">>> start recover ranks, ranks: {ranks}")
+        start_time = time.perf_counter()
+
+        world_group = paddle.distributed.get_group()
+        assert world_group.backend == "mooncake", f"Recover backend is not mooncake, it is {world_group.backend}"
+        global_rank = paddle.distributed.get_rank(world_group)
+        if global_rank not in ranks:    # primary ranks
+            # recover ranks are not ready to join current group
+            while not all(world_group.process_group.get_peer_state(ranks)):
+                time.sleep(0.001)
+            world_group.process_group.recover_ranks(ranks)
+        else:    # recover ranks
+            world_group.process_group.join_group()
+        logger.info(f"world group recovered! active ranks: {world_group.process_group.get_active_ranks().tolist()}")
+
+        if self.parallel_config.enable_expert_parallel:
+            ep_group = self.parallel_config.ep_group
+            ep_ranks = [ep_group.ranks.index(r) for r in ranks if r in ep_group.ranks]
+            # primary ranks are in this group and so are the recover ranks
+            if ep_group.is_member() and ep_ranks:
+                ep_rank = self.parallel_config.expert_parallel_rank
+                if ep_rank not in ep_ranks:
+                    while not all(ep_group.process_group.get_peer_state(ep_ranks)):
+                        time.sleep(0.001)
+                    ep_group.process_group.recover_ranks(ep_ranks)
+                else:
+                    ep_group.process_group.join_group()
+                logger.info(f"ep group recovered! active ranks: {ep_group.process_group.get_active_ranks().tolist()}")
+
+        # Skip tp group recovery as we build tp group normally for attn instance
+        if self.fd_config.afd_config.is_ffn:
+            tp_group = self.parallel_config.tp_group
+            tp_ranks = [tp_group.ranks.index(r) for r in ranks if r in tp_group.ranks]
+            if tp_group.is_member() and tp_ranks:
+                tp_rank = self.parallel_config.tensor_parallel_rank
+                if tp_rank not in tp_ranks:
+                    while not all(tp_group.process_group.get_peer_state(tp_ranks)):
+                        time.sleep(0.001)
+                    tp_group.process_group.recover_ranks(tp_ranks)
+                else:
+                    tp_group.process_group.join_group()
+                logger.info(f"tp group recovered! active ranks: {tp_group.process_group.get_active_ranks().tolist()}")
+
+        if self.parallel_config.enable_expert_parallel:
+            from fastdeploy.model_executor.layers.moe.ep import EPBackend
+            backend = EPBackend()
+            backend.active_ranks.copy_(ep_group.process_group.get_active_ranks())
+            backend.last_active_ranks.copy_(backend.active_ranks)
+            backend.buffer.update_ep_member()
+            logger.info(f"ep buffer recovered! active ranks: {backend.active_ranks.tolist()}")
+
+        paddle.distributed.barrier(world_group)
+        logger.info(f"<<< finish recover ranks! time cost: {time.perf_counter()-start_time:.3f}s")
+        self.fd_config.launch_config.is_extension = False
 
     def update_weights(self, version: str = None, verify_checksum: bool = False):
         return self.dynamic_weight_manager.update_weights_by_rdma(version, verify_checksum)

@@ -23,42 +23,36 @@ class AFDDeepEPA2ABackend(AFDA2ABackendBase):
     name = "deepep"
 
     def __init__(self, fd_config):
-        from fastdeploy.config import MoEPhase
-        from fastdeploy.model_executor.layers.moe.ep_deepep_backend import DeepEPEngine
+        from fastdeploy.model_executor.layers.moe.ep import EPDecoderRunner
 
-        self.ep_engine = DeepEPEngine(
-            num_max_dispatch_tokens_per_rank=fd_config.model_config.num_max_dispatch_tokens_per_rank,
-            hidden_size=fd_config.model_config.hidden_size,
-            num_experts=fd_config.afd_config.afd_num_physical_experts,
-            ep_size=fd_config.afd_config.afd_world_size,
+        self.ep_runner = EPDecoderRunner(
+            fd_config.model_config.num_experts_per_tok,
+            fd_config.model_config.hidden_size,
+            fd_config.afd_config.num_physical_experts,
+            fd_config.scheduler_config.splitwise_role,
+            fd_config.model_config.num_max_dispatch_tokens_per_rank,
+            ep_size=fd_config.parallel_config.expert_parallel_size,
             ep_rank=fd_config.parallel_config.expert_parallel_rank,
-            splitwise_role=fd_config.scheduler_config.splitwise_role,
-            moe_phase=MoEPhase("decode"),
-            group=fd_config.parallel_config.ep_group,
+            ep_group=fd_config.parallel_config.ep_group,
             use_internode_ll_two_stage=False,
-            top_k=fd_config.model_config.num_experts_per_tok,
         )
 
     def dispatch_physical(self, x, physical_topk_idx, topk_weights, **kwargs):
-        recv_hidden, recv_count, handle, dispatch_hook = self.ep_engine.low_latency_dispatch(
+        return self.ep_runner.dispatch(
             x,
             physical_topk_idx,
-            kwargs.get("expertwise_scale", None),
-            kwargs.get("use_fp8", False),
-            kwargs.get("quant_group_size", 128),
-            kwargs.get("use_ue8m0", False),
+            topk_weights,
+            expertwise_scale=kwargs.get("expertwise_scale", None),
+            use_fp8=kwargs.get("use_fp8", False),
+            quant_group_size=kwargs.get("quant_group_size", 128),
+            use_ue8m0=kwargs.get("use_ue8m0", False),
         )
-        if dispatch_hook is not None:
-            dispatch_hook()
-        return recv_hidden, recv_count, handle
 
     def combine(self, ffn_out, physical_topk_idx, topk_weights, handle, **kwargs):
-        combined, combine_hook = self.ep_engine.low_latency_combine(
+        return self.ep_runner.combine(
             ffn_out,
             physical_topk_idx,
             topk_weights,
             handle,
+            quant_group_size=kwargs.get("quant_group_size", 128),
         )
-        if combine_hook is not None:
-            combine_hook()
-        return combined

@@ -201,6 +201,24 @@ func TestRegisterInstanceCore(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("not_ready flag is stored", func(t *testing.T) {
+		Init(&config.Config{Server: config.ServerConfig{Splitwise: false}})
+		instance := &InstanceInfo{
+			Role:             Role{EnumValue: MIXED, IsSet: true},
+			HostIP:           "127.0.0.1",
+			Port:             Port("8081"),
+			TransferProtocol: []string{"rdma"},
+			NotReady:         true,
+		}
+
+		err := RegisterInstanceCore(context.Background(), instance)
+		assert.NoError(t, err)
+
+		worker := DefaultManager.mixedWorkerMap[instance.URL()]
+		assert.NotNil(t, worker)
+		assert.True(t, worker.NotReady)
+	})
+
 	t.Run("invalid instance info", func(t *testing.T) {
 		instance := &InstanceInfo{
 			Role: Role{EnumValue: MIXED, IsSet: true},

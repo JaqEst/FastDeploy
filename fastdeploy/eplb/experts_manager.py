@@ -56,16 +56,16 @@ class RedundantExpertManager:
         self.ipc_signal_suffix = ipc_signal_suffix
         self.local_rank = self.rank % self.fd_config.parallel_config.tensor_parallel_size
 
-        self._is_afd_attn = self.fd_config.afd_config.enable_afd and self.fd_config.afd_config.afd_role == "attn"
+        self._is_afd_attn = self.fd_config.afd_config.is_attn
 
         if not self.fd_config.afd_config.enable_afd:
             self.num_replicas = self.num_logical_experts + self.num_redundant_experts
             self.num_nodes = max(ep_size // 8, 1)
             self.num_gpus = ep_size
         else:
-            self.num_replicas = self.fd_config.afd_config.afd_num_physical_experts
-            self.num_nodes = max(len(self.fd_config.afd_config.afd_ffn_ranks) // 8, 1)
-            self.num_gpus = len(self.fd_config.afd_config.afd_ffn_ranks)
+            self.num_replicas = self.fd_config.afd_config.num_physical_experts
+            self.num_nodes = max(len(self.fd_config.afd_config.ffn_ranks) // 8, 1)
+            self.num_gpus = len(self.fd_config.afd_config.ffn_ranks)
         self.num_groups = self.num_logical_experts
         self.expert_per_rank = self.num_replicas // ep_size
         assert (

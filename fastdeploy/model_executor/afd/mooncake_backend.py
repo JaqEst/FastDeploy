@@ -17,105 +17,50 @@ import paddle
 from .afd import AFDA2ABackendBase
 
 
-class AFDMooncakeM2NA2ABackend(AFDA2ABackendBase):
-    """Mooncake M2N implementation for AFD all-to-all communication."""
+class AFDMooncakeA2ABackend(AFDA2ABackendBase):
+    """Mooncake implementation for AFD all-to-all communication."""
 
     name = "mooncake"
 
     def __init__(self, fd_config):
-        if fd_config.model_config.num_max_dispatch_tokens_per_rank > 1024:
-            raise ValueError(
-                "Mooncake AFD requires num_max_dispatch_tokens_per_rank <= 1024, "
-                f"got {fd_config.model_config.num_max_dispatch_tokens_per_rank}."
-            )
-
-        try:
-            paddle.enable_compat(scope={"mooncake"})
-            from mooncake.mooncake_ep_m2n_buffer import M2NBuffer
-        except ImportError as exc:
-            raise ImportError(
-                "FD_MOE_A2A_BACKEND=mooncake in AFD requires mooncake.mooncake_ep_m2n_buffer. "
-                "Please install a Mooncake wheel that includes the M2N EP wrapper."
-            ) from exc
-
-        role = fd_config.afd_config.afd_role
-        if role not in ("attn", "ffn"):
-            raise ValueError(f"Mooncake AFD requires afd_role to be 'attn' or 'ffn', got {role!r}.")
-
-        ep_group = fd_config.parallel_config.ep_group
-        try:
-            mooncake_group = ep_group.process_group._mc
-        except AttributeError as exc:
+        if fd_config.parallel_config.ep_group.backend != "mooncake":
             raise TypeError(
                 "Mooncake AFD requires fd_config.parallel_config.ep_group to be a Mooncake process group. "
                 "Set FD_MOE_A2A_BACKEND=mooncake so FastDeploy initializes Mooncake PG."
-            ) from exc
+            )
 
-        self.role = role
-        self.top_k = fd_config.model_config.num_experts_per_tok
-        self.active_ranks = paddle.ones((fd_config.afd_config.afd_world_size,), dtype=paddle.int32)
-        self.last_active_ranks = self.active_ranks.clone()
-        self.m2n_buffer = M2NBuffer(
-            mooncake_group,
-            attention_ranks=fd_config.afd_config.afd_attn_ranks,
-            ffn_ranks=fd_config.afd_config.afd_ffn_ranks,
-            num_experts_per_rank=fd_config.afd_config.afd_num_local_physical_experts,
-            num_max_dispatch_tokens_per_rank=fd_config.model_config.num_max_dispatch_tokens_per_rank,
-            hidden=fd_config.model_config.hidden_size,
+        from fastdeploy.model_executor.layers.moe.ep import EPDecoderRunner
+
+        self.ep_runner = EPDecoderRunner(
+            fd_config.model_config.num_experts_per_tok,
+            fd_config.model_config.hidden_size,
+            fd_config.afd_config.num_physical_experts,
+            fd_config.scheduler_config.splitwise_role,
+            fd_config.model_config.num_max_dispatch_tokens_per_rank,
+            ep_size=fd_config.parallel_config.expert_parallel_size,
+            ep_rank=fd_config.parallel_config.expert_parallel_rank,
+            ep_group=fd_config.parallel_config.ep_group,
+            is_extension=fd_config.launch_config.is_extension,
         )
 
-    def _finish(self, event, hook) -> None:
-        if hook is not None:
-            hook()
-        elif event is not None:
-            event.current_stream_wait()
+        # active ranks reference
+        self.active_ranks = self.ep_runner.ep_engine.active_ranks
+        self.last_active_ranks = self.ep_runner.ep_engine.last_active_ranks
 
     def dispatch_physical(self, x, physical_topk_idx, topk_weights, **kwargs):
-        timeout = kwargs.get("timeout_us", -1)
-        use_fp8 = kwargs.get("use_fp8", False)
-        if self.role == "attn":
-            recv_hidden, recv_count, handle, event, hook = self.m2n_buffer.a2e_isend(
-                x,
-                physical_topk_idx,
-                self.active_ranks,
-                timeout_us=timeout,
-                use_fp8=use_fp8,
-                async_finish=False,
-                return_recv_hook=True,
-            )
-        else:
-            recv_hidden, recv_count, handle, event, hook = self.m2n_buffer.a2e_irecv(
-                self.active_ranks,
-                self.top_k,
-                timeout_us=timeout,
-                use_fp8=use_fp8,
-                async_finish=False,
-                return_recv_hook=True,
-            )
-        self._finish(event, hook)
-        return recv_hidden, recv_count, handle
+        return self.ep_runner.dispatch(
+            x,
+            physical_topk_idx,
+            topk_weights,
+            timeout=kwargs.get("timeout_us", -1),
+            use_fp8=kwargs.get("use_fp8", False),
+        )
 
     def combine(self, ffn_out, physical_topk_idx, topk_weights, handle, **kwargs):
-        timeout = kwargs.get("timeout_us", -1)
-        if self.role == "attn":
-            combined, event, hook = self.m2n_buffer.e2a_irecv(
-                physical_topk_idx,
-                topk_weights,
-                self.active_ranks,
-                handle,
-                timeout_us=timeout,
-                async_finish=False,
-                return_recv_hook=True,
-            )
-        else:
-            combined, event, hook = self.m2n_buffer.e2a_isend(
-                ffn_out,
-                self.active_ranks,
-                handle,
-                timeout_us=timeout,
-                zero_copy=False,
-                async_finish=False,
-                return_recv_hook=True,
-            )
-        self._finish(event, hook)
-        return combined
+        return self.ep_runner.combine(
+            ffn_out,
+            physical_topk_idx,
+            topk_weights,
+            handle,
+            timeout=kwargs.get("timeout_us", -1),
+        )

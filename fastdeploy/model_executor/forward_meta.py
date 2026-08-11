@@ -147,7 +147,7 @@ class ForwardMeta:
     # Flag of profile run
     is_dummy_or_profile_run: bool = False
     # EP per-forward communication timeout override.
-    ep_timeout_us: Optional[int] = None
+    timeout_us: Optional[int] = None
     # Routing Replay table buffer
     routing_replay_table: Optional[paddle.Tensor] = None
 

@@ -70,8 +70,6 @@ class GpuWorker(WorkerBase):
 
             gc.collect()
             paddle.device.cuda.empty_cache()
-            # if envs.FD_MOE_A2A_BACKEND == "mooncake" and not self.parallel_config.disable_custom_all_reduce:
-            #     raise RuntimeError("Mooncake backend requires --disable-custom-all-reduce.")
             if (
                 not self.parallel_config.disable_custom_all_reduce
                 and self.parallel_config.tensor_parallel_size > 1
@@ -190,6 +188,10 @@ class GpuWorker(WorkerBase):
         # Initialize routing replay manager
         if self.fd_config.routing_replay_config.enable_routing_replay:
             self.model_runner.initialize_routing_replay_manager()
+
+    def recover(self, ranks: List[int], worker_ids: List[int]):
+        """Recover failed ranks and join back the process group"""
+        return self.model_runner.recover(ranks, worker_ids)
 
     def update_weights(self, version: str = None, verify_checksum: bool = False):
         """update weights in place"""

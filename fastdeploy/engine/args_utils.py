@@ -27,6 +27,7 @@ from fastdeploy.config import (
     CacheConfig,
     ConvertOption,
     DeployModality,
+    LaunchConfig,
     EarlyStopConfig,
     EPLBConfig,
     FDConfig,
@@ -308,17 +309,12 @@ class EngineArgs:
     Splitwise role: prefill, decode or mixed
     """
 
-    afd_master: Optional[str] = None
-    """
-    Paddle launcher master endpoint for instance-level AFD world, e.g. 10.0.0.1:29500.
-    """
-
-    afd_nnodes: int = 1
+    ninsts: int = 1
     """
     Number of api_server instances participating in the AFD world.
     """
 
-    afd_nnode_rank: int = 0
+    inst_rank: int = 0
     """
     Rank of the current api_server instance in the AFD world.
     """
@@ -591,6 +587,16 @@ class EngineArgs:
     Enable worker-process fault tolerance. (Only available for FFN roles)
     """
 
+    is_extension: bool = False
+    """
+    Whether this process is an extension process.. Default is False.
+    """
+
+    launch_port: int = -1
+    """
+    Port for launcher http server.
+    """
+
     def __post_init__(self):
         """
         Post-initialization processing to set default tokenizer if not provided.
@@ -637,17 +643,15 @@ class EngineArgs:
                 raise ValueError(f"afd_role must be 'attn' or 'ffn', got: '{self.afd_role}'")
             if self.splitwise_role != "decode":
                 raise ValueError(f"When afd_role is set to '{self.afd_role}', splitwise_role must be 'decode'")
-            if self.afd_master is None:
-                raise ValueError("afd_master must be set when afd_role is enabled")
-            if self.afd_nnodes is None:
-                raise ValueError("afd_nnodes must be set when afd_role is enabled")
-            if self.afd_nnode_rank is None:
-                raise ValueError("afd_nnode_rank must be set when afd_role is enabled")
-            if self.afd_nnodes < 1:
-                raise ValueError(f"afd_nnodes must be >= 1, got {self.afd_nnodes}")
-            if self.afd_nnode_rank < 0 or self.afd_nnode_rank >= self.afd_nnodes:
+            if self.ninsts is None:
+                raise ValueError("ninsts must be set when afd_role is enabled")
+            if self.inst_rank is None:
+                raise ValueError("inst_rank must be set when afd_role is enabled")
+            if self.ninsts < 1:
+                raise ValueError(f"ninsts must be >= 1, got {self.ninsts}")
+            if self.inst_rank < 0 or self.inst_rank >= self.ninsts:
                 raise ValueError(
-                    f"afd_nnode_rank must be in [0, {self.afd_nnodes}), got {self.afd_nnode_rank}"
+                    f"inst_rank must be in [0, {self.ninsts}), got {self.inst_rank}"
                 )
 
         if not (
@@ -1226,6 +1230,21 @@ class EngineArgs:
             help="Enable worker-process fault tolerance.",
         )
 
+        system_group.add_argument(
+            "--extension",
+            dest="is_extension",
+            action="store_true",
+            default=EngineArgs.is_extension,
+            help="Whether this process is an extension process.",
+        )
+
+        system_group.add_argument(
+            "--launch-port",
+            type=int,
+            default=EngineArgs.launch_port,
+            help="Port for launcher http server.",
+        )
+
         # Performance tuning parameters group
         perf_group = parser.add_argument_group("Performance Tuning")
         perf_group.add_argument(
@@ -1296,21 +1315,17 @@ class EngineArgs:
             help="Role of AFD. Default is None. (attn, ffn)",
         )
         afd_group.add_argument(
-            "--afd-master",
-            type=str,
-            default=EngineArgs.afd_master,
-            help="Paddle launcher master endpoint for instance-level AFD world.",
-        )
-        afd_group.add_argument(
-            "--afd-nnodes",
+            "--afd-ninsts",
+            dest="ninsts",
             type=int,
-            default=EngineArgs.afd_nnodes,
+            default=EngineArgs.ninsts,
             help="Number of api_server instances in the AFD world.",
         )
         afd_group.add_argument(
-            "--afd-nnode-rank",
+            "--afd-inst-rank",
+            dest="inst_rank",
             type=int,
-            default=EngineArgs.afd_nnode_rank,
+            default=EngineArgs.inst_rank,
             help="Current api_server instance rank in the AFD world.",
         )
 
@@ -1606,6 +1621,7 @@ class EngineArgs:
         routing_replay_config = self.create_routing_repaly_config()
         router_config = RouterConfig(all_dict)
         afd_config = AFDConfig(all_dict)
+        launch_config = LaunchConfig(all_dict)
 
         early_stop_cfg = self.create_early_stop_config()
         early_stop_cfg.update_enable_early_stop(self.enable_early_stop)
@@ -1636,5 +1652,5 @@ class EngineArgs:
             early_stop_config=early_stop_cfg,
             routing_replay_config=routing_replay_config,
             deploy_modality=DeployModality.from_str(self.deploy_modality),
-            enable_fault_tolerant=self.enable_fault_tolerant,
+            launch_config=launch_config,
         )

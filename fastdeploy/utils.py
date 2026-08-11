@@ -21,6 +21,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import pickle
 import random
@@ -1168,6 +1169,7 @@ router_logger = get_logger("router", "router.log")
 fmq_logger = get_logger("fmq", "fmq.log")
 obj_logger = get_logger("obj", "obj.log")  # debug内存问题
 register_manager_logger = get_logger("register_manager", "register_manager.log")
+elastic_manager_logger = get_logger("elastic_manager", "elastic_manager.log")
 
 
 def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
@@ -1336,5 +1338,5 @@ def all_gather_values(value: int | float | bool, group: paddle.distributed.commu
     _local = paddle.to_tensor([value], dtype="float32")
     _global = [paddle.zeros_like(_local) for _ in range(group.world_size)]
     paddle.distributed.all_gather(_global, _local, group)
-    _results = [_type(t.item()) for t in _global]
+    _results = [_type(t.item()) if math.isfinite(t.item()) else _type(0) for t in _global]
     return _results

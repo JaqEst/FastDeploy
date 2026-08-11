@@ -35,20 +35,20 @@ func TestWorkerMapToList(t *testing.T) {
 	Init(&config.Config{})
 	DefaultManager.prefillWorkerMap = map[string]*WorkerInfo{
 		"http://worker1": {Url: "http://worker1"},
-		"http://worker2": {Url: "http://worker2"},
+		"http://worker2": {Url: "http://worker2", NotReady: true},
 	}
 	DefaultManager.decodeWorkerMap = map[string]*WorkerInfo{
 		"http://worker3": {Url: "http://worker3"},
 	}
 	DefaultManager.mixedWorkerMap = map[string]*WorkerInfo{
-		"http://worker4": {Url: "http://worker4"},
+		"http://worker4": {Url: "http://worker4", NotReady: true},
 	}
 
 	t.Run("prefill workers", func(t *testing.T) {
 		workers := WorkerMapToList(context.Background(), "prefill")
-		assert.Len(t, workers, 2)
+		assert.Len(t, workers, 1)
 		assert.Contains(t, workers, "http://worker1")
-		assert.Contains(t, workers, "http://worker2")
+		assert.NotContains(t, workers, "http://worker2")
 	})
 
 	t.Run("decode workers", func(t *testing.T) {
@@ -59,8 +59,7 @@ func TestWorkerMapToList(t *testing.T) {
 
 	t.Run("mixed workers", func(t *testing.T) {
 		workers := WorkerMapToList(context.Background(), "mixed")
-		assert.Len(t, workers, 1)
-		assert.Contains(t, workers, "http://worker4")
+		assert.Len(t, workers, 0)
 	})
 
 	t.Run("invalid worker type", func(t *testing.T) {

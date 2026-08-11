@@ -149,24 +149,25 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
             physical_topk_idx = topk_idx
         else:
             physical_topk_idx = self.afd_runner.routing_logical_to_physical(topk_idx)
-        dc_kwargs = { "timeout_us": forward_meta.ep_timeout_us } if forward_meta.ep_timeout_us else {}
-        recv_hidden, recv_count, handle = self.afd_runner.dispatch_physical(
+
+        comm_kwargs = {}
+        if forward_meta.timeout_us:
+            comm_kwargs["timeout_us"] = forward_meta.timeout_us
+
+        dummy_recv_x, recv_count, dummy_handle = self.afd_runner.dispatch_physical(
             x,
             physical_topk_idx,
             topk_weights,
-            **dc_kwargs,
+            **comm_kwargs,
         )
-
-        # ATTN rank has only phantom experts, produce zero FFN output
-        ffn_out = paddle.zeros_like(recv_hidden)
 
         # --- 3. combine results from FFN workers ---
         routed_out = self.afd_runner.combine(
-            ffn_out,
+            dummy_recv_x,
             physical_topk_idx,
             topk_weights,
-            handle,
-            **dc_kwargs
+            dummy_handle,
+            **comm_kwargs
         )
 
         # --- 4. shared experts ---
@@ -328,7 +329,7 @@ class Glm4AFDFFNMoeBlock(nn.Layer):
         super().__init__()
         num_experts = fd_config.model_config.n_routed_experts
         if fd_config.afd_config.enable_afd and redundant_table_manger is None:
-            num_experts = fd_config.afd_config.afd_num_physical_experts
+            num_experts = fd_config.afd_config.num_physical_experts
         self.experts = FusedMoE(
             fd_config,
             hidden_size=fd_config.model_config.hidden_size,
@@ -384,9 +385,9 @@ class Glm4AFDFFNModel(nn.Layer):
 
         self._hidden_size = fd_config.model_config.hidden_size
         self._top_k = fd_config.model_config.num_experts_per_tok
-        self._empty_x = paddle.zeros([0, self._hidden_size], dtype=paddle.get_default_dtype())
-        self._empty_topk_idx = paddle.zeros([0, self._top_k], dtype=paddle.int64)
-        self._empty_topk_weights = paddle.zeros([0, self._top_k], dtype=paddle.float32)
+        self._dummy_x = paddle.empty(0, self._hidden_size, dtype=paddle.get_default_dtype())
+        self._dummy_topk_idx = paddle.empty(0, self._top_k, dtype=paddle.int64)
+        self._dummy_topk_weights = paddle.empty(0, self._top_k, dtype=paddle.float32)
 
     def forward(
         self,
@@ -395,24 +396,27 @@ class Glm4AFDFFNModel(nn.Layer):
     ) -> paddle.Tensor:
         # ids_remove_padding/forward_meta are graph-shape selectors for the
         # generic GraphOptBackend.  AFD FFN itself originates no tokens.
-        dc_kwargs = { "timeout_us": forward_meta.ep_timeout_us } if forward_meta.ep_timeout_us else {}
+        comm_kwargs = {}
+        if forward_meta.timeout_us:
+            comm_kwargs["timeout_us"] = forward_meta.timeout_us
+
         for layer_id in self._moe_layer_ids:
-            recv_hidden, recv_count, handle = self._afd_runner.dispatch_physical(
-                self._empty_x,
-                self._empty_topk_idx,
-                self._empty_topk_weights,
-                **dc_kwargs,
+            recv_x, recv_count, handle = self._afd_runner.dispatch_physical(
+                self._dummy_x,
+                self._dummy_topk_idx,
+                self._dummy_topk_weights,
+                **comm_kwargs,
             )
-            ffn_out = self._compute_local_experts(layer_id, recv_hidden, recv_count)
+            ffn_out = self._compute_local_experts(layer_id, recv_x, recv_count)
             self._afd_runner.combine(
                 ffn_out,
-                self._empty_topk_idx,
-                self._empty_topk_weights,
+                self._dummy_topk_idx,
+                self._dummy_topk_weights,
                 handle,
-                **dc_kwargs,
+                **comm_kwargs,
             )
 
-        return paddle.zeros([1], dtype=paddle.int32)
+        return paddle.empty(0, dtype=paddle.int32)
 
     def _compute_local_experts(
         self,
@@ -631,7 +635,7 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
 
                 physical_expert_id = expert_id
                 if self.redundant_table_manger is None:
-                    physical_expert_id = self.fd_config.afd_config.afd_static_log2phy[expert_id]
+                    physical_expert_id = self.fd_config.afd_config.static_log2phy[expert_id]
                 param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=physical_expert_id)
 
                 model_sublayer_name = re.sub(
@@ -694,7 +698,7 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
                 weight_loader = getattr(param, "weight_loader", moe_block.experts.weight_loader)
                 physical_expert_id = expert_id
                 if self.redundant_table_manger is None:
-                    physical_expert_id = self.fd_config.afd_config.afd_static_log2phy[expert_id]
+                    physical_expert_id = self.fd_config.afd_config.static_log2phy[expert_id]
                 weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=physical_expert_id)
                 model_sublayer_name = re.sub(
                     r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name

@@ -25,6 +25,7 @@ func New(cfg *config.Config) *gin.Engine {
 	{
 		v1.POST("/chat/completions", gateway.ChatCompletions)
 		v1.POST("/completions", gateway.Completions)
+		v1.POST("/recover/commit", manager.RecoverCommit)
 	}
 	r.POST("/register", manager.RegisterInstance)
 	r.GET("/registered_number", manager.RegisteredNumber)

@@ -384,6 +384,31 @@ def ping(raw_request: Request) -> Response:
     return health(raw_request)
 
 
+@app.post("/v1/recover")
+async def recover(request: Request) -> Response:
+    request_id = f"control-{uuid.uuid4()}"
+    control_request = ControlRequest(request_id=request_id, method="recover")
+    control_response = await app.state.engine_client.run_control_method(control_request)
+    return control_response.to_api_json_response()
+
+
+@app.post("/v1/recover/commit")
+async def recover_commit(request: Request) -> Response:
+    request_id = f"control-{uuid.uuid4()}"
+    body = await request.json() if await request.body() else {}
+    control_request = ControlRequest(request_id=request_id, method="recover_commit", args=body)
+    control_response = await app.state.engine_client.run_control_method(control_request)
+    return control_response.to_api_json_response()
+
+
+@app.get("/v1/recover/status")
+async def recover_status(request: Request) -> Response:
+    request_id = f"control-{uuid.uuid4()}"
+    control_request = ControlRequest(request_id=request_id, method="recover_status")
+    control_response = await app.state.engine_client.run_control_method(control_request)
+    return control_response.to_api_json_response()
+
+
 @app.post("/v1/pause")
 async def pause(request: Request) -> Response:
     # todo: support wait_for_inflight_requests(default False), clear_cache(default True) arguments

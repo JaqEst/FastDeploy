@@ -51,9 +51,9 @@ class RedundantExpertManger:
             self.num_nodes = max(ep_size // 8, 8)
             self.num_gpus = ep_size
         else:
-            self.num_replicas = fd_config.afd_config.afd_num_physical_experts
-            self.num_nodes = max(len(fd_config.afd_config.afd_ffn_ranks) // 8, 1)
-            self.num_gpus = len(fd_config.afd_config.afd_ffn_ranks)
+            self.num_replicas = fd_config.afd_config.num_physical_experts
+            self.num_nodes = max(fd_config.afd_config.num_ffn_ranks // 8, 1)
+            self.num_gpus = fd_config.afd_config.num_ffn_ranks
         self.num_groups = 1
 
         self.export_per_rank = self.num_replicas // ep_size
@@ -270,16 +270,16 @@ class RedundantExpertManger:
 
         if bool(paddle.all(last_active_ranks == active_ranks)):
             return
-        
-        local_physical_experts = self.fd_config.afd_config.afd_num_local_physical_experts
+
+        local_physical_experts = self.fd_config.afd_config.num_local_physical_experts
         fallback_physical_expert_id = (
-            self.fd_config.afd_config.afd_ffn_ranks[0] * local_physical_experts
+            self.fd_config.afd_config.ffn_ranks[0] * local_physical_experts
         )
-        
+
         # Candidate physical-expert ids per (layer, logical_expert), -1 padded.
         base = self.model_expert_id_to_ep_rank_array  # [L, E, C] int32
         num_candidates = base.shape[-1]
-        
+
         # Identify valid candidate physical experts and their owner ranks.
         # In AFD, valid physical experts are only placed on FFN ranks. ATTN rank slots stay -1.
         valid = base >= 0
@@ -351,7 +351,7 @@ class RedundantExpertManger:
         changed_ranks = paddle.nonzero(
             last_active_ranks != active_ranks,
         ).reshape([-1])
-        
+
         logger.info(
             "AFD EPLB active expert table refreshed by ranks: "
             f"changed_ranks={changed_ranks.tolist()}, "

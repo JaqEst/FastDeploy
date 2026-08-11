@@ -17,8 +17,6 @@ import types
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-import pytest
-
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.request import ControlRequest
 from fastdeploy.worker.worker_process import PaddleDisWorkerProc
@@ -118,16 +116,23 @@ class TestWorkerProcessControlMethod(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures"""
         self.mock_fd_config = Mock(spec=FDConfig)
+        self.mock_fd_config.launch_config = Mock()
+        self.mock_fd_config.launch_config.is_extension = False
         self.mock_fd_config.parallel_config = Mock()
         self.mock_fd_config.parallel_config.use_ep = False
+        self.mock_fd_config.parallel_config.tensor_parallel_rank = 0
         self.mock_fd_config.parallel_config.tensor_parallel_size = 1
         self.mock_fd_config.load_config = Mock()
         self.mock_fd_config.load_config.dynamic_load_weight = False
+        self.mock_fd_config.afd_config = Mock()
+        self.mock_fd_config.afd_config.enable_afd = False
+        self.mock_fd_config.afd_config.afd_role = None
 
         self.process = PaddleDisWorkerProc.__new__(PaddleDisWorkerProc)
         self.process.fd_config = self.mock_fd_config
         self.process.parallel_config = self.mock_fd_config.parallel_config
         self.process.local_rank = 0
+        self.process.global_rank = 0
         self.process.eplb_config = types.SimpleNamespace(enable_eplb=False)
 
         # Mock worker - use spec to avoid auto-creating Mock methods
@@ -223,15 +228,17 @@ class TestWorkerProcessControlMethod(unittest.TestCase):
         # Verify put was called
         self.mock_queue.put.assert_called_once()
 
-    @pytest.mark.skip("This case might hang in ci environment, to be fixed in the future")
     def test_event_loop_caches_ep_control_requests_before_collective_run(self):
         self.process.parallel_config.use_ep = True
         self.process.parallel_config.ep_group = Mock(world_size=1)
+        self.process.scheduler_config = Mock()
+        self.process.scheduler_config.splitwise_role == "mixed"
         self.process.cached_control_reqs = []
         self.process._run_eplb = Mock()
         self.process._tp_barrier_wait = Mock()
         self.process.run_control_method = Mock()
         self.process.worker_healthy_live_signal = Mock(value=[0])
+        self.process.engine_forward_signal = Mock(value=[0])
         self.process.max_chips_per_node = 8
         self.process.nnode = 1
         self.process.ranks = 1
@@ -239,7 +246,7 @@ class TestWorkerProcessControlMethod(unittest.TestCase):
         self.process.task_queue.exist_tasks.return_value = False
         self.process.task_queue.read_finish_flag = types.SimpleNamespace(get=Mock(return_value=1))
         control_req = ControlRequest(request_id="ep-ctrl", method="pause", args={})
-        self.process.task_queue.get_tasks.return_value = ([([control_req], 1)], False)
+        self.process.task_queue.get_tasks.return_value = ([([control_req], 1)], False, False)
         self.process.exist_task_signal = types.SimpleNamespace(value=[1])
         self.process.worker = types.SimpleNamespace(
             preprocess_new_task=Mock(),
@@ -250,6 +257,7 @@ class TestWorkerProcessControlMethod(unittest.TestCase):
         with (
             patch("fastdeploy.utils.all_gather_values", side_effect=SystemExit),
             patch("fastdeploy.worker.worker_process.all_gather_values", side_effect=SystemExit),
+            patch("fastdeploy.worker.worker_process.envs.FD_ENABLE_EP_CONTROL_REQ_POLL", "1"),
         ):
             with self.assertRaises(SystemExit):
                 self.process.event_loop_normal()

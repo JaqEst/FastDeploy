@@ -41,6 +41,7 @@ from fastdeploy.config import (
     EPLBConfig,
     ErnieArchitectures,
     FDConfig,
+    LaunchConfig,
     GraphOptimizationConfig,
     LoadConfig,
     ModelConfig,
@@ -71,38 +72,40 @@ from fastdeploy.model_executor.layers.quantization import parse_quant_config
 from fastdeploy.model_executor.utils import v1_loader_support
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
-from fastdeploy.utils import all_gather_values, get_logger, optional_type, get_host_ip
-from fastdeploy.cache_manager.transfer_factory.utils import get_rdma_nics
+from fastdeploy.utils import all_gather_values, get_logger, optional_type
 from fastdeploy.worker.worker_base import WorkerBase
+
+if envs.FD_USE_MOONCAKE_PG:
+    assert paddle.in_dynamic_mode(), "Mooncake process group only supports paddle dynamic mode."
+    from fastdeploy.utils import get_host_ip
+    from fastdeploy.cache_manager.transfer_factory.utils import get_rdma_nics
+    from mooncake.integration.paddle import ProcessGroupMooncake as pgmc
+    pgmc.set_host_ip(get_host_ip())
+    pgmc.set_device_filter(get_rdma_nics().split(","))
+    dist.register_process_group_backend("mooncake", pgmc.create)
+    # select backend for ``paddle.distributed.init_parallel_env()``
+    os.environ["PADDLE_DISTRI_BACKEND"] = "mooncake"
 
 logger = get_logger("worker_process", "worker_process.log")
 
 def dump_mooncake_debug_state(worker, fd_config, prefix: str = "") -> None:
+    ep_group = fd_config.parallel_config.ep_group.process_group
+    tp_group = fd_config.parallel_config.tp_group.process_group
 
-    mc_model = worker.model_runner.get_model()
-    mooncake_a2a = mc_model._afd_runner.a2a_backend
+    from fastdeploy.model_executor.layers.moe.ep import EPBackend
+    backend = EPBackend()
+    ep_buffer_active_ranks = backend.active_ranks.clone()
 
-    if mooncake_a2a is None:
-        logger.warning("AFD Mooncake backend is not available on worker model")
-        return
-
-    mc_ep_group = fd_config.parallel_config.ep_group.process_group._mc._get_backend(paddle.device("cuda"))
-    mc_tp_group = fd_config.parallel_config.tp_group.process_group._mc._get_backend(paddle.device("cuda"))
-
-
-    mc_ep_active_ranks = mooncake_a2a.active_ranks
-
-    from mooncake.ep import get_active_ranks
-
-    logger.info(
+    log_str = (
         f"{prefix} mooncake debug state: "
         f"worker_rank={getattr(worker, 'rank', None)}, "
         f"local_rank={getattr(worker, 'local_rank', None)}, "
-        f"mc_ep_active_ranks={mc_ep_active_ranks},"
-        f"ep_active={get_active_ranks(mc_ep_group)}, "
-        f"tp_active={get_active_ranks(mc_tp_group)}"
+        f"ep_buffer_active_ranks={ep_buffer_active_ranks},"
+        f"ep_group={ep_group.get_active_ranks()}"
     )
+    log_str += f", tp_group={tp_group.get_active_ranks()}" if tp_group else ""
 
+    logger.info(log_str)
 
 
 def get_worker(fd_config: FDConfig, local_rank: int, rank: int) -> WorkerBase:
@@ -144,13 +147,13 @@ def get_worker(fd_config: FDConfig, local_rank: int, rank: int) -> WorkerBase:
 def _get_eplb_shmem_parallel_size(fd_config: FDConfig, parallel_config: ParallelConfig) -> int:
     """Return the rank count used to size EPLB async-load shared memory."""
     if fd_config.afd_config.enable_afd:
-        if fd_config.afd_config.afd_num_ffn_ranks <= 0:
+        if fd_config.afd_config.num_ffn_ranks <= 0:
             raise ValueError("AFD EPLB requires at least one FFN rank for async-load shared memory sizing.")
-        return fd_config.afd_config.afd_num_ffn_ranks
+        return fd_config.afd_config.num_ffn_ranks
     return parallel_config.expert_parallel_size
 
 
-def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
+def init_distributed_environment(seed: int = 20, is_extension: bool = False) -> Tuple[int, int]:
     """Initialize Paddle Fleet and return world size and global rank."""
 
     world_size = dist.get_world_size()
@@ -162,113 +165,32 @@ def init_distributed_environment(seed: int = 20) -> Tuple[int, int]:
             "pp_degree": 1,
             "sharding_degree": 1,
         }
-
         # Set control in tensor parallel
         dist_strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
-        fleet.init(is_collective=True, strategy=dist_strategy)
+
+        comm_group_mode = "full"
+        world_pg_opts = None
+        if envs.FD_USE_MOONCAKE_PG:
+            comm_group_mode = "minimal"
+            world_pg_opts = {
+                "active_value": 0,
+                "is_extension": is_extension,
+                "max_world_size": None,
+                "global_ranks_in_group": list(range(world_size)),
+            }
+
+        fleet.init(
+            is_collective=True,
+            strategy=dist_strategy,
+            comm_group_mode=comm_group_mode,
+            pg_options=world_pg_opts,
+        )
 
         global_rank = fleet.worker_index()
     else:
         global_rank = 0
 
-    if envs.FD_USE_MOONCAKE_PG:
-        from mooncake.paddle_integration import init_mooncake_pg
-        init_mooncake_pg(
-            world_size, global_rank,
-            host_ip=get_host_ip(),
-            ib_device_filter=get_rdma_nics().split(","),
-            clean_existed_groups=True, logger=logger)
-
     return world_size, global_rank
-
-
-def collect_afd_rank_info(args, world_size: int, global_rank: int) -> Tuple[int, int, List[int], List[int], int, int]:
-    """Collect per-rank AFD topology and return node start rank, node-local rank and ATTN TP size."""
-    info = {
-        "afd_role": args.afd_role,
-        "afd_nnode_rank": args.afd_nnode_rank,
-        "global_rank": global_rank,
-        "tp_size": args.tensor_parallel_size,
-    }
-    infos = []
-    dist.all_gather_object(infos, info)
-    infos = sorted(infos, key=lambda item: item["global_rank"])
-    if len(infos) != world_size:
-        raise ValueError(
-            "AFD topology mismatch: gathered rank count does not match world_size. "
-            f"world_size={world_size}, gathered_ranks={len(infos)}"
-        )
-
-    ranks_map = {}
-    tp_map = {}
-    role_map = {}
-    attn_ranks = []
-    ffn_ranks = []
-    afd_attn_tp_size = None
-    for item in infos:
-        if item["afd_role"] == "attn":
-            attn_ranks.append(item["global_rank"])
-            if afd_attn_tp_size is None:
-                afd_attn_tp_size = item["tp_size"]
-            elif afd_attn_tp_size != item["tp_size"]:
-                raise ValueError(
-                    "AFD requires one ATTN tp_size, "
-                    f"got {afd_attn_tp_size} and {item['tp_size']} from ranks={infos}"
-                )
-        elif item["afd_role"] == "ffn":
-            ffn_ranks.append(item["global_rank"])
-        else:
-            raise ValueError(f"Unknown AFD role: {item['afd_role']}")
-
-        node_ranks = ranks_map.setdefault(item["afd_nnode_rank"], [])
-        node_ranks.append(item["global_rank"])
-
-        node_role = role_map.setdefault(item["afd_nnode_rank"], item["afd_role"])
-        if node_role != item["afd_role"]:
-            raise ValueError(
-                "AFD topology mismatch: ranks from the same node report different afd_role. "
-                f"afd_nnode_rank={item['afd_nnode_rank']}, ranks={infos}"
-            )
-
-        tp_size = tp_map.setdefault(item["afd_nnode_rank"], item["tp_size"])
-        if tp_size != item["tp_size"]:
-            raise ValueError(
-                "AFD topology mismatch: ranks from the same node report different tp_size. "
-                f"afd_nnode_rank={item['afd_nnode_rank']}, ranks={infos}"
-            )
-
-    if len(ranks_map) != args.afd_nnodes:
-        raise ValueError(
-            "AFD topology mismatch: gathered node count does not match afd_nnodes. "
-            f"afd_nnodes={args.afd_nnodes}, gathered_nodes={len(ranks_map)}, "
-            f"afd_nnode_ranks={sorted(ranks_map)}"
-        )
-
-    for afd_nnode_rank, node_ranks in ranks_map.items():
-        tp_size = tp_map[afd_nnode_rank]
-        if len(node_ranks) != tp_size:
-            raise ValueError(
-                "AFD topology mismatch: gathered global ranks do not match tensor_parallel_size. "
-                f"afd_nnode_rank={afd_nnode_rank}, tp={tp_size}, ranks={node_ranks}"
-            )
-        expect_ranks = list(range(node_ranks[0], node_ranks[0] + tp_size))
-        if node_ranks != expect_ranks:
-            raise ValueError(
-                "AFD topology mismatch: ranks inside one node must be contiguous. "
-                f"afd_nnode_rank={afd_nnode_rank}, expected={expect_ranks}, got={node_ranks}"
-            )
-
-    if not attn_ranks or not ffn_ranks:
-        raise ValueError(f"AFD requires both ATTN and FFN ranks, got attn={attn_ranks}, ffn={ffn_ranks}")
-
-    curr_node_ranks = ranks_map.get(args.afd_nnode_rank)
-    if curr_node_ranks is None:
-        raise ValueError(f"Can not resolve AFD instance ranks for afd_nnode_rank={args.afd_nnode_rank}")
-
-    afd_node_srank = curr_node_ranks[0]
-    local_rank = global_rank - afd_node_srank
-    ranks = len(curr_node_ranks)
-    return ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank, afd_attn_tp_size
 
 
 def update_fd_config_for_mm(fd_config: FDConfig) -> None:
@@ -287,7 +209,7 @@ class PaddleDisWorkerProc:
         in the task queue. Control flow is transmitted by IPC.
     """
 
-    def __init__(self, fd_config: FDConfig, world_size: int = 1, ranks: int = 1, global_rank: int = 0, local_rank: int = 0) -> None:
+    def __init__(self, fd_config: FDConfig, world_size: int = 1, global_rank: int = 0) -> None:
         """
         Initialize a distributed worker and task queue for single-node multi-GPU setup.
         Args:
@@ -296,14 +218,18 @@ class PaddleDisWorkerProc:
                 num_attention_heads, and ffn_hidden_size.
         """
         self.world_size = world_size
-        self.ranks = ranks
+        self.ranks = world_size
         self.global_rank = global_rank
-        self.local_rank = local_rank
+        self.local_rank = global_rank
         self.fd_config = fd_config
         self.parallel_config = fd_config.parallel_config
         self.cache_config = fd_config.cache_config
         self.scheduler_config = fd_config.scheduler_config
         self.eplb_config = fd_config.eplb_config
+
+        if fd_config.afd_config.enable_afd:
+            self.ranks = len(fd_config.afd_config.inst_ranks)
+            self.local_rank = global_rank - fd_config.afd_config.inst_first_rank
 
         # TODO(gongshaotian): Use worker factory to get worker
         self.worker = get_worker(fd_config=fd_config, local_rank=self.local_rank, rank=self.ranks)
@@ -445,7 +371,7 @@ class PaddleDisWorkerProc:
         """
         import time
 
-        if self.fd_config.afd_config.afd_role == "attn":
+        if self.fd_config.afd_config.is_attn:
             redundant_table_manger = self.worker.get_model().redundant_table_manger
             if redundant_table_manger is None:
                 raise RuntimeError("AFD ATTN EPLB update requires a redundant table manager.")
@@ -478,12 +404,6 @@ class PaddleDisWorkerProc:
         self.worker.get_model().update_state_dict(state_dicts)
         self.experts_manager.tensor_infos = None
 
-    def _get_eplb_update_group_and_src(self):
-        """Get the TP-local group/source for broadcasting EPLB update signals."""
-        if self.fd_config.afd_config.enable_afd:
-            return self.parallel_config.tp_group, self.fd_config.afd_config.afd_node_srank
-        return None, 0
-
     def _broadcast_model_weights_signal(self, src: int, group) -> int:
         model_weights_signal_tensor = paddle.full(shape=[1], fill_value=self.model_weights_signal[0], dtype="int32")
         paddle.distributed.broadcast(model_weights_signal_tensor, src=src, group=group)
@@ -491,7 +411,11 @@ class PaddleDisWorkerProc:
         return int(value)
 
     def _tp_barrier_wait(self):
-        if current_platform.is_xpu() or self.enable_overlap_schedule:
+        if (
+            current_platform.is_xpu()
+            or self.enable_overlap_schedule
+            and self.fd_config.afd_config.afd_role != "ffn"
+        ):
             self.task_queue.worker_process_tp_barrier.wait()
         else:
             paddle.distributed.barrier(self.parallel_config.tp_group)
@@ -553,7 +477,7 @@ class PaddleDisWorkerProc:
             create=False,
         )
 
-        if self.fd_config.afd_config.afd_role == "attn":
+        if self.fd_config.afd_config.is_attn:
             self.mmap_infos = None
         else:
             self.mmap_infos = create_mmap(
@@ -577,7 +501,7 @@ class PaddleDisWorkerProc:
             return
 
         ffn_ranks = paddle.to_tensor(
-        self.fd_config.afd_config.afd_ffn_ranks,
+            self.fd_config.afd_config.ffn_ranks,
             dtype=changed_ranks.dtype,
             place=changed_ranks.place,
         )
@@ -676,14 +600,12 @@ class PaddleDisWorkerProc:
         max_occupied_batch_index = 0
         tp_rank = self.parallel_config.tensor_parallel_rank
 
-        paddle.distributed.barrier(self.parallel_config.ep_group)
+        if self.parallel_config.use_ep and self.fd_config.afd_config.enable_afd:
+            paddle.distributed.barrier(self.parallel_config.ep_group)
+
         # TODO: Unify status variables model_weights_status (shared memory) and model_weights_signal (numpy array) to one
         self.model_weights_signal = np.zeros([1], dtype=np.int32)
-        if self.fd_config.afd_config.afd_role == "ffn":
-            self._event_loop_afd_ffn(tp_rank)
-            return
 
-        attn_iter = 0
         while True:
             if self.fd_config.load_config.dynamic_load_weight and not envs.FD_ENABLE_V1_UPDATE_WEIGHTS:
                 self.model_weights_signal[0] = int(self.model_weights_status.value[0])
@@ -762,8 +684,9 @@ class PaddleDisWorkerProc:
 
             if self.exist_task_signal.value[0] == ExistTaskStatus.EXIST or self.task_queue.read_finish_flag.get() == 1:
                 logger.debug(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} detected new requests.")
-                self.engine_forward_signal.value[0] = 1
-                tasks, read_finish = self.task_queue.get_tasks()
+                if not self.fd_config.launch_config.is_extension:
+                    self.engine_forward_signal.value[0] = 1
+                tasks, read_finish, dropped = self.task_queue.get_tasks()
                 # Only one of all tp_size client will get read_finish == True.
                 if read_finish:
                     # Reset the two signal.
@@ -771,6 +694,9 @@ class PaddleDisWorkerProc:
                         self.task_queue.read_finish_flag.set(0)
                     else:
                         self.exist_task_signal.value[0] = ExistTaskStatus.EMPTY
+                # Some ranks are deactivated, skip this round.
+                if dropped:
+                    continue
                 # In EP parallel(corresponing to dp attention), we need to barrier for prefill to prevent data imbalance due to inconsistent data arrival.
                 # Only EP + DP prefill should barrier for data arrival.
                 # In mixed mode and decoder in D, we should not barrier to influence decoding.
@@ -779,14 +705,14 @@ class PaddleDisWorkerProc:
 
                 req_dicts, control_reqs = [], []
                 assert (
-                    len(tasks) > 0
+                    len(tasks) > 0 or self.fd_config.launch_config.is_extension
                 ), f"task_queue.get_tasks() should contain at least one tuple, [([req1, ...] ,real_bsz)], but got len(tasks)={len(tasks)}"
                 # In EP + DP prefill, empty task ([]) is delived in worker to barrier. For empty task, just skip and continue.
                 # tasks[0] contains two part, ([req1, ...] ,real_bsz)
                 # tasks[0][0] is [req1, ...]
                 # if empty batch is delived, eval(tasks[0][0]) should be False ([]),
                 # if batch with requests is delived, eval(tasks[0][0]) should be True, then to be processed as below.
-                if tasks[0][0]:
+                if tasks and tasks[0][0]:
                     for req_dict, bsz in tasks:
                         if len(req_dict) > 0 and isinstance(req_dict[0], ControlRequest):
                             control_reqs.append(req_dict[0])
@@ -822,15 +748,16 @@ class PaddleDisWorkerProc:
                     # Process prefill inputs
                     self.worker.preprocess_new_task(req_dicts, max_occupied_batch_index)
             else:
+                # Synchronize the signal for other workers
+                self._tp_barrier_wait() if tp_size > 1 else None
                 if self.scheduler_config.splitwise_role == "prefill":
-                    if tp_size > 1:
-                        # Synchronize the signal for other workers
-                        self._tp_barrier_wait()
                     continue
 
             # Let the ep group run control method synchronically
-            if envs.FD_ENABLE_V1_UPDATE_WEIGHTS and self.parallel_config.use_ep:
+            if envs.FD_ENABLE_EP_CONTROL_REQ_POLL and self.parallel_config.use_ep:
                 pendings = all_gather_values(len(self.cached_control_reqs), self.parallel_config.ep_group)
+                if hasattr(self.parallel_config, "ep_active_ranks"):
+                    pendings = [p for p, active in zip(pendings, self.parallel_config.ep_active_ranks.tolist()) if active]
                 if all([p > 0 for p in pendings]):
                     logger.info(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} detected all ep ranks have pending control tasks.")
                     self.run_control_method(self.cached_control_reqs.pop(0))
@@ -854,6 +781,10 @@ class PaddleDisWorkerProc:
                 self._tp_barrier_wait() if tp_size > 1 else None
                 continue
 
+            if self.fd_config.launch_config.is_extension:
+                time.sleep(0.001)
+                continue
+
             # Execute model to generate token. The generated token will be written to the buffer.
             # These generated tokens can be obtained through get_output op.
             start_execute_time = time.time()
@@ -875,28 +806,6 @@ class PaddleDisWorkerProc:
             ):
                 self._tp_barrier_wait() if tp_size > 1 else None
                 time.sleep(0.001)
-
-    def _event_loop_afd_ffn(self, tp_rank: int) -> None:
-        """Run the AFD FFN participant loop on the normal worker event-loop thread."""
-        if hasattr(self.worker, "device"):
-            paddle.device.set_device(self.worker.device)
-
-        logger.info(
-            "Start AFD FFN participant loop in event_loop_normal. "
-            f"global_rank={self.global_rank}, local_rank={self.local_rank}"
-        )
-        while True:
-            try:
-                self.worker_healthy_live_signal.value[tp_rank] = int(time.time())
-                with paddle.no_grad():
-                    self.worker.execute_model(None, 0)
-                self._run_eplb(tp_rank)
-            except Exception:
-                logger.error(
-                    "AFD FFN participant loop failed. "
-                    f"global_rank={self.global_rank}, local_rank={self.local_rank}\n{traceback.format_exc()}"
-                )
-                os._exit(1)
 
     def initialize_kv_cache(self) -> None:
         """Profiles the peak memory usage of the model to determine how many
@@ -949,16 +858,16 @@ class PaddleDisWorkerProc:
         else:
             num_blocks_local = self.fd_config.cache_config.total_block_num
 
-        if not self.fd_config.afd_config.afd_role == "ffn":
+        if not self.fd_config.afd_config.is_ffn:
             # 4. init kv_cache with accurate num_blocks
             logger.info(f"------- num_blocks_global: {num_blocks_local} --------")
             self.worker.initialize_cache(num_gpu_blocks=num_blocks_local)
-        else:
+        elif not self.fd_config.launch_config.is_extension:
             logger.info("Collaborate with attention participants to initialize kv cache.")
             # TODO: directly call worker.model_runner.init_cache_ffn_only()?
             self.worker.model_runner.init_cache_ffn_only()
 
-        if self.fd_config.afd_config.enable_afd:
+        if self.fd_config.afd_config.enable_afd and not self.fd_config.launch_config.is_extension:
             dist.barrier(self.parallel_config.ep_group)
 
     def graph_optimize_and_warm_up_model(self) -> None:
@@ -1119,9 +1028,8 @@ def parse_args():
     )
     parser.add_argument("--splitwise_role", type=str, default="mixed", help="splitwise role")
     parser.add_argument("--afd_role", type=str, default=None, help="AFD role: attn, ffn, or None (disabled)")
-    parser.add_argument("--afd_master", type=str, default=None, help="AFD master endpoint.")
-    parser.add_argument("--afd_nnodes", type=int, default=1, help="AFD instance count.")
-    parser.add_argument("--afd_nnode_rank", type=int, default=0, help="AFD instance rank.")
+    parser.add_argument("--ninsts", type=int, default=1, help="AFD instance count.")
+    parser.add_argument("--inst_rank", type=int, default=0, help="AFD instance rank.")
     parser.add_argument(
         "--tensor_parallel_size",
         type=int,
@@ -1394,6 +1302,13 @@ def parse_args():
         help="Deploy modality: 'mixed' for multimodal, 'text' for text-only.",
     )
 
+    parser.add_argument(
+        "--is_extension",
+        action="store_true",
+        default=False,
+        help="Whether this worker is an extension worker.",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -1401,13 +1316,7 @@ def parse_args():
 def initialize_fd_config(
     args,
     world_size: int = 1,
-    ranks: int = 1,
     global_rank: int = 0,
-    local_rank: int = 0,
-    afd_node_srank: int = 0,
-    afd_attn_tp_size: int = 1,
-    afd_attn_ranks: List[int] | None = None,
-    afd_ffn_ranks: List[int] | None = None,
 ) -> FDConfig:
     """Initialize FDConfig from either RolloutModelConfig or argparse.Namespace
 
@@ -1422,13 +1331,15 @@ def initialize_fd_config(
     model_config = ModelConfig(vars(args))
     device_config = DeviceConfig(vars(args))
     speculative_config = SpeculativeConfig(args.speculative_config)
-    parallel_config = ParallelConfig(vars(args), world_size)
+    parallel_config = ParallelConfig(vars(args))
     cache_config = CacheConfig(vars(args))
     scheduler_config = SchedulerConfig(vars(args))
     eplb_config = EPLBConfig(args.eplb_config)
-    afd_config = AFDConfig(vars(args), afd_node_srank, afd_attn_tp_size)
+    afd_config = AFDConfig(vars(args))
+    launch_config = LaunchConfig(vars(args))
+
     if afd_config.enable_afd:
-        afd_config.set_rank_topology(world_size, afd_attn_ranks or [], afd_ffn_ranks or [])
+        parallel_config.expert_parallel_size = afd_config.afd_world_size
         num_logical_experts = (
             model_config.moe_num_experts[0]
             if isinstance(model_config.moe_num_experts, list)
@@ -1436,6 +1347,11 @@ def initialize_fd_config(
         )
         num_redundant_experts = eplb_config.redundant_experts_num if eplb_config.enable_eplb else 0
         afd_config.set_expert_layout(num_logical_experts, num_redundant_experts)
+
+    local_rank = global_rank
+    if afd_config.enable_afd:
+        # reset local_rank
+        local_rank = global_rank - afd_config.inst_first_rank
 
     parallel_config.tensor_parallel_rank = local_rank % parallel_config.tensor_parallel_size
     parallel_config.data_parallel_rank = local_rank // parallel_config.tensor_parallel_size
@@ -1449,7 +1365,7 @@ def initialize_fd_config(
     if parallel_config.expert_parallel_size > 1:
         expert_parallel_rank = global_rank if afd_config.enable_afd else local_rank % parallel_config.expert_parallel_size
         if afd_config.enable_afd:
-            num_experts_per_rank = afd_config.afd_num_local_physical_experts
+            num_experts_per_rank = afd_config.num_local_physical_experts
         else:
             if isinstance(model_config.moe_num_experts, list):
                 num_experts = model_config.moe_num_experts[0] + eplb_config.redundant_experts_num
@@ -1463,7 +1379,7 @@ def initialize_fd_config(
         parallel_config.num_experts_per_rank = num_experts_per_rank
         parallel_config.num_experts_start_offset = num_experts_start_offset
 
-    parallel_config.set_communicate_group(afd_config)
+    parallel_config.set_communicate_group(afd_config, launch_config)
 
     load_config = LoadConfig(vars(args))
 
@@ -1549,6 +1465,7 @@ def initialize_fd_config(
         eplb_config=eplb_config,
         routing_replay_config=routing_replay_config,
         deploy_modality=DeployModality.from_str(getattr(args, "deploy_modality", "mixed")),
+        launch_config=launch_config,
     )
     logger.info(f"parallel_config.local_engine_worker_queue_port {parallel_config.local_engine_worker_queue_port}")
 
@@ -1578,42 +1495,20 @@ def run_worker_proc() -> None:
     # global_rank: 当前 worker 在整个 world 中的 rank
     # local_rank: 当前 worker 在当前 api_server 实例内的 rank
     # ranks: 当前 api_server 实例内的 worker 数
-    # afd_node_srank: 当前 api_server 实例在整个 world 中的起始 rank
+    # inst_first_rank: 当前 api_server 实例在整个 world 中的起始 rank
 
-    world_size, global_rank = init_distributed_environment()
-
-    local_rank = global_rank
-    ranks = world_size
-    afd_node_srank = 0
-    afd_attn_tp_size = 1
-    attn_ranks = []
-    ffn_ranks = []
-
-    if args.afd_role is not None:
-        ranks, local_rank, attn_ranks, ffn_ranks, afd_node_srank, afd_attn_tp_size = collect_afd_rank_info(
-            args, world_size, global_rank
-        )
+    world_size, global_rank = init_distributed_environment(is_extension=args.is_extension)
 
     # Get fd_config
-    fd_config = initialize_fd_config(
-        args,
-        world_size=world_size,
-        ranks=ranks,
-        global_rank=global_rank,
-        local_rank=local_rank,
-        afd_node_srank=afd_node_srank,
-        afd_attn_tp_size=afd_attn_tp_size,
-        afd_attn_ranks=attn_ranks,
-        afd_ffn_ranks=ffn_ranks,
-    )
+    fd_config = initialize_fd_config(args, world_size, global_rank)
 
     # Create worker process
     if current_platform.is_iluvatar():
         from fastdeploy.worker.iluvatar_worker import IluvatarPaddleDisWorkerProc
 
-        worker_proc = IluvatarPaddleDisWorkerProc(fd_config, ranks, local_rank)
+        worker_proc = IluvatarPaddleDisWorkerProc(fd_config, world_size, global_rank)
     else:
-        worker_proc = PaddleDisWorkerProc(fd_config, world_size, ranks, global_rank, local_rank)
+        worker_proc = PaddleDisWorkerProc(fd_config, world_size, global_rank)
         worker_proc.init_control()
 
     # Enable batch-invariant mode for deterministic inference.

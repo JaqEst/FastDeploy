@@ -32,12 +32,12 @@ def load_mooncake_ep() -> ModuleType:
     """
     paddle.enable_compat(scope={"mooncake"})
     try:
-        import mooncake.mooncake_ep_buffer as ep_module  # type: ignore
+        import mooncake.integration.paddle as module  # type: ignore
 
         logger.info("FD use Mooncake/EP now.")
-        return ep_module
+        return module
     except ImportError as e:
-        logger.error(f"import mooncake.mooncake_ep_buffer failed! type={type(e).__name__}, err={e}")
+        logger.error(f"import mooncake.integration.paddle failed! type={type(e).__name__}, err={e}")
         logger.error(f"Traceback:{traceback.format_exc()}")
         raise
 
@@ -59,36 +59,35 @@ class MooncakeEPEngine:
         ep_size: int,
         num_max_dispatch_tokens_per_rank: int,
         group,
-        **kwargs,
+        is_extension: bool = False,
     ):
         assert num_max_dispatch_tokens_per_rank <= 1024, (
             "Mooncake EP requires num_max_dispatch_tokens_per_rank <= 1024 "
             "(FINISHED_SUM_TAG constraint)."
         )
 
-        self.active_ranks = paddle.ones((num_experts,), dtype=paddle.int32).cuda()
+        self.active_ranks = paddle.ones((ep_size,), dtype=paddle.int32)
+        if is_extension:
+            self.active_ranks.copy_(group.process_group.get_active_ranks(), True)
+        self.last_active_ranks = self.active_ranks.clone()
 
         num_bytes = mooncake.Buffer.get_ep_buffer_size_hint(
             num_max_dispatch_tokens_per_rank, hidden_size, ep_size, num_experts,
         )
-        self.buffer = mooncake.Buffer(group.process_group._mc, num_bytes)
+        self.buffer = mooncake.Buffer(group, num_bytes)
 
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.num_experts = num_experts
-        # First call uses timeout=-1 (no timeout); subsequent calls use 10 s.
-        self._first_execution = True
-        self._timeout_us = 100_000_000
 
-    def _get_timeout(self) -> int:
-        return -1 if self._first_execution else self._timeout_us
+        logger.info("Mooncake EP buffer created successfully.")
 
     def low_latency_dispatch(
         self,
         hidden_states: paddle.Tensor,
         topk_idx: paddle.Tensor,
         use_fp8: bool = False,
+        timeout: int = -1,
     ):
-        timeout = self._get_timeout()
         packed_recv_hidden, packed_recv_count, handle, _, hook = self.buffer.dispatch(
             hidden_states,
             topk_idx,
@@ -100,7 +99,6 @@ class MooncakeEPEngine:
             async_finish=False,
             return_recv_hook=True,
         )
-        self._first_execution = False
         return packed_recv_hidden, packed_recv_count, handle, hook
 
     def low_latency_combine(
@@ -109,8 +107,8 @@ class MooncakeEPEngine:
         topk_idx: paddle.Tensor,
         topk_weights: paddle.Tensor,
         handle,
+        timeout: int = -1,
     ):
-        timeout = self._get_timeout()
         combined_hidden, _, hook = self.buffer.combine(
             hidden_states,
             topk_idx,
@@ -121,7 +119,6 @@ class MooncakeEPEngine:
             async_finish=False,
             return_recv_hook=True,
         )
-        self._first_execution = False
         return combined_hidden, hook
 
 
@@ -133,19 +130,22 @@ class MooncakeEPRunner(EPRunnerBase):
         top_k: int,
         hidden_size: int,
         num_experts: int,
+        splitwise_role: str,
+        num_max_dispatch_tokens_per_rank: int,
         ep_size: int = 1,
         ep_rank: int = 0,
-        ep_group=None,
         redundant_experts_num: int = 0,
-        **kwargs,  # absorb deepep-only args (splitwise_role, moe_phase, …)
+        ep_group=None,
+        is_extension: bool = False,
     ):
         super().__init__(top_k, num_experts, redundant_experts_num)
         self.ep_engine = MooncakeEPEngine(
             hidden_size=hidden_size,
             num_experts=num_experts + redundant_experts_num,
             ep_size=ep_size,
-            num_max_dispatch_tokens_per_rank=envs.FD_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             group=ep_group,
+            is_extension=is_extension,
         )
 
 
@@ -155,26 +155,53 @@ class MooncakeEPDecoderRunner(MooncakeEPRunner):
     Interface matches DeepEPDecoderRunner so the MoE forward pass needs no changes.
     """
 
+    def __init__(
+        self,
+        top_k: int,
+        hidden_size: int,
+        num_experts: int,
+        splitwise_role: str,
+        num_max_dispatch_tokens_per_rank: int,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        redundant_experts_num: int = 0,
+        ep_group=None,
+        is_extension: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            top_k,
+            hidden_size,
+            num_experts,
+            splitwise_role,
+            num_max_dispatch_tokens_per_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            redundant_experts_num=redundant_experts_num,
+            ep_group=ep_group,
+            is_extension=is_extension,
+        )
+
     def dispatch(
         self,
         x: paddle.Tensor,
         topk_idx: paddle.Tensor,
         topk_weights: paddle.Tensor,
-        *args,
+        timeout: int = -1,
+        use_fp8: bool = False,
         **kwargs,
     ):
-        use_fp8 = kwargs.get("use_fp8", False)
         recv_hidden_states, recv_expert_count, handle, dispatch_hook = (
-            self.ep_engine.low_latency_dispatch(x, topk_idx, use_fp8=use_fp8)
+            self.ep_engine.low_latency_dispatch(x, topk_idx, use_fp8=use_fp8, timeout=timeout)
         )
         if dispatch_hook is not None:
             dispatch_hook()
 
         return recv_hidden_states, recv_expert_count, handle
 
-    def combine(self, ffn_out, topk_idx, topk_weights, handle, **kwargs):
+    def combine(self, ffn_out, topk_idx, topk_weights, handle, timeout: int = -1, **kwargs):
         combined_hidden_states, combine_hook = (
-            self.ep_engine.low_latency_combine(ffn_out, topk_idx, topk_weights, handle)
+            self.ep_engine.low_latency_combine(ffn_out, topk_idx, topk_weights, handle, timeout=timeout)
         )
         if combine_hook is not None:
             combine_hook()
@@ -190,18 +217,19 @@ class MooncakeEPPrefillRunner(MooncakeEPRunner):
     """
 
     def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Mooncake EP does not support the prefill (normal) mode yet. "
+        logger.warning(
+            "Mooncake EP prefill runner is not yet implemented. "
             "Only decode (low-latency) mode is available."
         )
 
     def dispatch(self, *args, **kwargs):
-        raise NotImplementedError
+        raise NotImplementedError("Mooncake EP prefill runner is not yet implemented.")
 
     def combine(self, *args, **kwargs):
-        raise NotImplementedError
+        raise NotImplementedError("Mooncake EP prefill runner is not yet implemented.")
 
 
 # Canonical public names re-exported via ep.py dispatcher.
 EPPrefillRunner = MooncakeEPPrefillRunner
 EPDecoderRunner = MooncakeEPDecoderRunner
+EPBackend = MooncakeEPEngine

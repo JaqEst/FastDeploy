@@ -30,11 +30,13 @@ if _backend == "deepep":
         DeepEPBufferManager,
         EPDecoderRunner,
         EPPrefillRunner,
+        EPBackend,
         deep_ep,
     )
 elif _backend == "mooncake":
     from .ep_mooncake_backend import (  # noqa: F401
         EPDecoderRunner,
         EPPrefillRunner,
+        EPBackend,
         mooncake,
     )
