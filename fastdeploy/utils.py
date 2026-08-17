@@ -1336,7 +1336,6 @@ register_custom_python_op = register_op
 def all_gather_values(value: int | float | bool, group: paddle.distributed.communication.group.Group) -> list:
     _type = type(value)
     _local = paddle.to_tensor([value], dtype="float32")
-    _global = [paddle.zeros_like(_local) for _ in range(group.world_size)]
+    _global = paddle.zeros([group.world_size], dtype="float32")
     paddle.distributed.all_gather(_global, _local, group)
-    _results = [_type(t.item()) if math.isfinite(t.item()) else _type(0) for t in _global]
-    return _results
+    return [_type(v) if math.isfinite(v) else _type(0) for v in _global.tolist()]
