@@ -2974,9 +2974,15 @@ class GPUModelRunner(ModelRunnerBase):
             from fastdeploy.model_executor.layers.moe.ep import EPBackend
             backend = EPBackend()
             backend.active_ranks.copy_(ep_group.process_group.get_active_ranks())
-            backend.last_active_ranks.copy_(backend.active_ranks)
             backend.buffer.update_ep_member()
             logger.info(f"ep buffer recovered! active ranks: {backend.active_ranks.tolist()}")
+
+            if self.fd_config.eplb_config.enable_eplb:
+                self.get_model().redundant_table_manger.refresh_active_expert_rank_table_by_ranks(
+                    backend.last_active_ranks,
+                    backend.active_ranks,
+                )
+            backend.last_active_ranks.copy_(backend.active_ranks)
 
         paddle.distributed.barrier(world_group)
         logger.info(f"<<< finish recover ranks! time cost: {time.perf_counter()-start_time:.3f}s")

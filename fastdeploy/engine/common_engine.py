@@ -2655,6 +2655,7 @@ class EngineService:
             "moe_gate_fp32": self.cfg.model_config.moe_gate_fp32,
             "enable_entropy": self.cfg.model_config.enable_entropy,
             "enable_overlap_schedule": self.cfg.scheduler_config.enable_overlap_schedule,
+            "enable_fault_tolerant": self.cfg.launch_config.enable_fault_tolerant,
             "is_extension": self.cfg.launch_config.is_extension,
         }
         for worker_flag, value in worker_store_true_flag.items():

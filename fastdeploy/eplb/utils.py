@@ -20,6 +20,7 @@ import time
 import hashlib
 
 import numpy as np
+import requests
 
 from fastdeploy.config import FDConfig
 from fastdeploy.inter_communicator import IPCSignal
@@ -151,6 +152,119 @@ def dump_redundant_expert_table_snapshot(
     return path, snapshot
 
 
+def _ffn_slot_pairs(afd_config):
+    """Yield (ffn_local_slice, global_slice) pairs, matching the layout eplb produces."""
+    local = afd_config.num_local_physical_experts
+    for ffn_index, global_rank in enumerate(afd_config.ffn_ranks):
+        yield (
+            slice(ffn_index * local, (ffn_index + 1) * local),
+            slice(global_rank * local, (global_rank + 1) * local),
+        )
+
+
+def compact_expert_rank_table(phy2log: np.ndarray, afd_config) -> np.ndarray:
+    """Drop the ATTN placeholder slots, leaving a table independent of the AFD rank layout."""
+    if not afd_config.enable_afd:
+        return phy2log
+    compact = np.full((phy2log.shape[0], afd_config.num_ffn_physical_experts), -1, dtype=np.int32)
+    for ffn_slice, global_slice in _ffn_slot_pairs(afd_config):
+        compact[:, ffn_slice] = phy2log[:, global_slice]
+    return compact
+
+
+def expand_expert_rank_table(compact: np.ndarray, afd_config) -> np.ndarray:
+    """Inverse of compact_expert_rank_table: place FFN-local slots back at global slot ids."""
+    if not afd_config.enable_afd:
+        return compact
+    phy2log = np.full((compact.shape[0], afd_config.num_physical_experts), -1, dtype=np.int32)
+    for ffn_slice, global_slice in _ffn_slot_pairs(afd_config):
+        phy2log[:, global_slice] = compact[:, ffn_slice]
+    return phy2log
+
+
+def derive_expert_tables(phy2log: np.ndarray, num_logical_experts: int, max_replicas: int):
+    """Rebuild (logical_to_physical_map, expert_count) from a phy2log table."""
+    num_layers = phy2log.shape[0]
+    log2phy = np.full((num_layers, num_logical_experts, max_replicas), -1, dtype=np.int32)
+    expert_count = np.zeros((num_layers, num_logical_experts), dtype=np.int32)
+    for layer in range(num_layers):
+        for slot, logical_expert_id in enumerate(phy2log[layer]):
+            if logical_expert_id < 0:
+                continue
+            log2phy[layer, logical_expert_id, expert_count[layer, logical_expert_id]] = slot
+            expert_count[layer, logical_expert_id] += 1
+    return log2phy, expert_count
+
+
+def _fetch_expert_rank_table(config: FDConfig, timeout: float = 5.0, wait_seconds: float = 30.0):
+    """Pull the in-use phy2log table from a serving peer instance, discovered via the router."""
+    router_url = config.router_config.router if config.router_config else None
+    if not router_url:
+        return None
+
+    inst_types = ('attn', 'ffn') if config.afd_config.enable_afd else (config.scheduler_config.splitwise_role,)
+    eplb_args = {
+        "user": config.eplb_config.redundant_expert_api_user,
+        "passwd": config.eplb_config.redundant_expert_api_password,
+    }
+
+    deadline = time.time() + wait_seconds
+    while True:
+        try:
+            instances = requests.get(f"{router_url.rstrip('/')}/registered", timeout=timeout).json()
+        except Exception as e:
+            instances = {}
+
+        for type in inst_types:
+            for peer in instances.get(type) or []:
+                if peer.get("not_ready"):
+                    continue
+                url = peer.get("url", "")
+                if not url.startswith("http"):
+                    url = f"http://{url}"
+                try:
+                    res = requests.post(f"{url}/get_expert_rank_table", json=eplb_args, timeout=timeout)
+                    body = res.json()
+                    if res.ok and body.get("code") == 0:
+                        return np.array(body["data"], dtype=np.int32)
+                except Exception as e:
+                    pass
+
+        if time.time() >= deadline:
+            return None
+        time.sleep(2)
+
+
+def _expert_rank_table_shape(config: FDConfig) -> tuple:
+    """Shape of the shared phy2log table: [num_hidden_layers, num_experts+num_redundant_experts]."""
+    num_logical_experts = config.model_config.moe_num_experts
+    if isinstance(num_logical_experts, list):
+        num_logical_experts = num_logical_experts[0]
+    return (config.model_config.num_hidden_layers, num_logical_experts + config.eplb_config.redundant_experts_num)
+
+
+def read_shared_expert_rank_table(config: FDConfig):
+    """Read the in-use compact phy2log table the engine published, None when it holds no table."""
+    if not config.eplb_config.enable_eplb:
+        return None
+    try:
+        dp_ipc_signal_suffix = (
+            f"{config.parallel_config.local_engine_worker_queue_port}_dp{config.parallel_config.local_data_parallel_id}"
+        )
+        signal = IPCSignal(
+            name="expert_rank_table",
+            array=np.full(_expert_rank_table_shape(config), -1, dtype=np.int32),
+            dtype=np.int32,
+            suffix=dp_ipc_signal_suffix,
+            create=False,
+        )
+        table = np.array(signal.value, dtype=np.int32)
+    except Exception as e:
+        return None
+    # The engine fills the table with -1 until it holds a placement.
+    return None if np.any(table < 0) else table
+
+
 def init_eplb_signals(config: FDConfig, ipc_signal_suffix):
     """
     Initialize shared memory to indicate eplb status
@@ -191,6 +305,20 @@ def init_eplb_signals(config: FDConfig, ipc_signal_suffix):
     _ = IPCSignal(
         name="signal_update_weight_from_tensor",
         array=signal_update_weight_from_tensor,
+        dtype=np.int32,
+        suffix=dp_ipc_signal_suffix,
+        create=True,
+    )
+
+    # In-use phy2log table, served to instances joining the cluster
+    expert_rank_table = np.full(_expert_rank_table_shape(config), -1, dtype=np.int32)
+    if config.launch_config.is_extension:
+        peer_table = _fetch_expert_rank_table(config)
+        if peer_table is not None:
+            expert_rank_table[:] = peer_table
+    _ = IPCSignal(
+        name="expert_rank_table",
+        array=expert_rank_table,
         dtype=np.int32,
         suffix=dp_ipc_signal_suffix,
         create=True,

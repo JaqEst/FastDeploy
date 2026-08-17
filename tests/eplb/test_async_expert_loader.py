@@ -132,6 +132,9 @@ class _StubConn:
     def send(self, data):
         self.sent.append(data)
 
+    def close(self):
+        pass
+
 
 class TestAsyncExpertLoader(unittest.TestCase):
     """Test cases for async_expert_loader.py"""
@@ -166,19 +169,27 @@ class TestAsyncExpertLoader(unittest.TestCase):
             f.write(b"\x00" * 8192)
         t1 = paddle.ones([4], dtype="float32")
         t2 = paddle.zeros([8], dtype="float32")
-        infos = save_tensor_to_shm_mem([("w1", t1), ("w2", t2)], fp, logger=_logger)
+        fd = os.open(fp, os.O_RDWR)
+        try:
+            infos = save_tensor_to_shm_mem([("w1", t1), ("w2", t2)], fd, logger=_logger)
+        finally:
+            os.close(fd)
         self.assertEqual(infos[0][:3], ("w1", 0, 16))
         self.assertEqual(infos[1][1], 16)
 
     def test_save_tensor_errors(self):
-        """save_tensor_to_shm_mem: file not exist + overflow."""
+        """save_tensor_to_shm_mem: invalid fd + overflow."""
         with self.assertRaises(OSError):
-            save_tensor_to_shm_mem([], "/nonexistent/path")
+            save_tensor_to_shm_mem([], -1)
         fp = os.path.join(self.temp_dir, "tiny")
         with open(fp, "wb") as f:
             f.write(b"\x00" * 4)
-        with self.assertRaises(IOError):
-            save_tensor_to_shm_mem([("big", paddle.ones([100], dtype="float32"))], fp)
+        fd = os.open(fp, os.O_RDWR)
+        try:
+            with self.assertRaises(IOError):
+                save_tensor_to_shm_mem([("big", paddle.ones([100], dtype="float32"))], fd)
+        finally:
+            os.close(fd)
 
     def test_load_tensor_numeric_dtypes(self):
         """load_tensor_from_shm_mem: float32, uint8, int8, int32."""
@@ -363,11 +374,13 @@ class TestAsyncExpertLoader(unittest.TestCase):
             patch("builtins.open", return_value=_DummyFileCtx()),
             patch.object(os, "open", return_value=5),
             patch.object(os, "ftruncate"),
+            patch.object(os, "unlink"),
             patch.object(ctypes, "cast", return_value=_StubPtr()),
             patch.object(ctypes, "addressof", return_value=0x1000),
         ):
-            result = create_mmap(["m"], 0, 1, "u", _eplb_config(), _logger)
+            result, shm_fds = create_mmap(["m"], 0, 1, "u", _eplb_config(), _logger)
         self.assertIn("m", result)
+        self.assertEqual(shm_fds["m"], 5)
 
     # -- load_model_weights_process --
 
@@ -395,7 +408,9 @@ class TestAsyncExpertLoader(unittest.TestCase):
 
                 with patch.object(AsyncEPLoader, "load_experts_weight_from_disk", _boom):
                     try:
-                        load_model_weights_process(0, self.temp_dir, 8, 3, "", "uuid", _eplb_config(), data, mg)
+                        load_model_weights_process(
+                            0, self.temp_dir, 8, 3, "", -1, _eplb_config(), data, mg, _StubConn(), _StubConn()
+                        )
                     except KeyboardInterrupt:
                         pass
             else:
@@ -412,13 +427,25 @@ class TestAsyncExpertLoader(unittest.TestCase):
                         ):
                             try:
                                 load_model_weights_process(
-                                    0, self.temp_dir, 8, 3, "", "uuid", _eplb_config(), data, mg
+                                    0,
+                                    self.temp_dir,
+                                    8,
+                                    3,
+                                    "",
+                                    -1,
+                                    _eplb_config(),
+                                    data,
+                                    mg,
+                                    _StubConn(),
+                                    _StubConn(),
                                 )
                             except KeyboardInterrupt:
                                 pass
                     else:
                         try:
-                            load_model_weights_process(0, self.temp_dir, 8, 3, "", "uuid", _eplb_config(), data, mg)
+                            load_model_weights_process(
+                                0, self.temp_dir, 8, 3, "", -1, _eplb_config(), data, mg, _StubConn(), _StubConn()
+                            )
                         except KeyboardInterrupt:
                             pass
         return data

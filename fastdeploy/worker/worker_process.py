@@ -414,48 +414,48 @@ class PaddleDisWorkerProc:
         if (
             current_platform.is_xpu()
             or self.enable_overlap_schedule
-            and self.fd_config.afd_config.afd_role != "ffn"
+            and not self.fd_config.launch_config.enable_fault_tolerant
         ):
             self.task_queue.worker_process_tp_barrier.wait()
         else:
             paddle.distributed.barrier(self.parallel_config.tp_group)
 
-    def _init_eplb_signal(self):
+    def init_eplb(self):
         if not self.eplb_config.enable_eplb:
+            logger.info(f"Skip eplb init. enable_eplb: {self.eplb_config.enable_eplb}")
             return
 
+        start_time = time.perf_counter()
         self.last_dump_expert_workload_ts = 0
+        # Run before RedundantExpertManager forks the async loader: the loader
+        # inherits shm_fd, which is the only handle left once create_mmap unlinks the file.
+        if self.fd_config.afd_config.is_attn:
+            self.mmap_infos = None
+            shm_fd = -1
+        else:
+            logger.info("Creating shared memory for eplb.")
+            self.mmap_infos, shm_fds = create_mmap(
+                [MODEL_MAIN_NAME],
+                self.parallel_config.expert_parallel_rank,
+                _get_eplb_shmem_parallel_size(self.fd_config, self.parallel_config),
+                shm_uuid=self.parallel_config.local_engine_worker_queue_port,
+                eplb_config=self.eplb_config,
+                logger=logger,
+            )
+            shm_fd = shm_fds[MODEL_MAIN_NAME]
+
         self.experts_manager = RedundantExpertManager(
             rank=self.parallel_config.expert_parallel_rank,
             ep_size=self.parallel_config.expert_parallel_size,
             fd_config=self.fd_config,
             ipc_signal_suffix=self.parallel_config.local_engine_worker_queue_port,
+            shm_fd=shm_fd,
         )
 
         dp_ipc_signal_suffix = (
             f"{self.parallel_config.local_engine_worker_queue_port}_dp{self.parallel_config.local_data_parallel_id}"
         )
-        tp_rank = self.parallel_config.tensor_parallel_rank
-        if tp_rank == 0:  # master rank0
-            signal_update_weight_from_tensor = np.zeros([1], dtype=np.int32)
-            self.signal_update_weight_from_tensor_array = IPCSignal(
-                name="signal_update_weight_from_tensor",
-                array=signal_update_weight_from_tensor,
-                dtype=np.int32,
-                suffix=dp_ipc_signal_suffix,
-                create=False,
-            )
-
-            rearrange_experts_status = np.zeros([1], dtype=np.int32)
-            self.rearrange_experts_signal = IPCSignal(
-                name="rearrange_experts_status",
-                array=rearrange_experts_status,
-                dtype=np.int32,
-                suffix=dp_ipc_signal_suffix,
-                create=False,
-            )
-
-        tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{tp_rank}"
+        tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{self.parallel_config.tensor_parallel_rank}"
         experts_token_stats = np.zeros(
             (self.fd_config.model_config.num_hidden_layers, self.fd_config.model_config.moe_num_experts),
             dtype=np.int32,
@@ -477,17 +477,9 @@ class PaddleDisWorkerProc:
             create=False,
         )
 
-        if self.fd_config.afd_config.is_attn:
-            self.mmap_infos = None
-        else:
-            self.mmap_infos = create_mmap(
-                [MODEL_MAIN_NAME],
-                self.parallel_config.expert_parallel_rank,
-                _get_eplb_shmem_parallel_size(self.fd_config, self.parallel_config),
-                shm_uuid=self.parallel_config.local_engine_worker_queue_port,
-                eplb_config=self.eplb_config,
-                logger=logger,
-            )
+        end_time = time.perf_counter()
+        logger.info(f"Initialize eplb took {end_time - start_time} seconds.")
+        paddle.distributed.barrier(self.parallel_config.ep_group)
 
     def _maybe_refresh_eplb_expert_rank_table(self):
 
@@ -572,9 +564,9 @@ class PaddleDisWorkerProc:
 
         # All DP synchronously update weights
         broadcast_value = 0
-        if tp_rank == 0 and self.signal_update_weight_from_tensor_array.value[0] == 1:
+        if tp_rank == 0 and self.experts_manager.signal_update_weight_from_tensor_array.value[0] == 1:
             logger.info("redundant_expert: update_weight_from_tensor broadcast signal")
-            self.signal_update_weight_from_tensor_array.value[0] = 0
+            self.experts_manager.signal_update_weight_from_tensor_array.value[0] = 0
             broadcast_value = REARRANGE_EXPERT_MAGIC_NUM
         data = paddle.to_tensor([broadcast_value])
         paddle.distributed.broadcast(data, 0, group=self.parallel_config.ep_group)
@@ -585,23 +577,18 @@ class PaddleDisWorkerProc:
             )
             paddle.distributed.barrier(self.parallel_config.ep_group)
             if tp_rank == 0:
-                self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
+                self.experts_manager.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
             logger.info("redundant_expert: done")
 
     def event_loop_normal(self) -> None:
         """Main event loop for Paddle Distributed Workers.
         TODO(gongshaotian): support remote calling of functions that control worker.
         """
-        # init eplb signal
-        self._init_eplb_signal()
         tp_size = self.parallel_config.tensor_parallel_size
         # Currently, only support single node
         self.nnode = (tp_size + self.max_chips_per_node) // self.max_chips_per_node
         max_occupied_batch_index = 0
         tp_rank = self.parallel_config.tensor_parallel_rank
-
-        if self.parallel_config.use_ep and self.fd_config.afd_config.enable_afd:
-            paddle.distributed.barrier(self.parallel_config.ep_group)
 
         # TODO: Unify status variables model_weights_status (shared memory) and model_weights_signal (numpy array) to one
         self.model_weights_signal = np.zeros([1], dtype=np.int32)
@@ -1303,6 +1290,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--enable_fault_tolerant",
+        action="store_true",
+        default=False,
+        help="Enable fault tolerant mechanism.",
+    )
+
+    parser.add_argument(
         "--is_extension",
         action="store_true",
         default=False,
@@ -1534,6 +1528,9 @@ def run_worker_proc() -> None:
 
     # Trigger CUDAGraph capture
     worker_proc.graph_optimize_and_warm_up_model()
+
+    # Initialize EPLB
+    worker_proc.init_eplb()
 
     # Initialize health status
     worker_proc.init_health_status()

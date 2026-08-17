@@ -739,6 +739,17 @@ async def get_per_expert_tokens_stats(request: Request):
     return JSONResponse(content, status_code=status_code)
 
 
+@app.post("/get_expert_rank_table")
+@tracing.trace_span("get_expert_rank_table")
+async def get_expert_rank_table(request: Request):
+    """
+    get the in-use expert rank table
+    """
+    request_dict = await request.json()
+    content, status_code = await app.state.engine_client.get_expert_rank_table(request_dict=request_dict)
+    return JSONResponse(content, status_code=status_code)
+
+
 @app.post("/check_redundant")
 @tracing.trace_span("check_redundant")
 async def check_redundant(request: Request):

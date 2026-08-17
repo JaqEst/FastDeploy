@@ -216,6 +216,18 @@ class EngineClient:
             create=False,
         )
 
+        shm_expert_rank_table = np.zeros(
+            (self.fd_config.model_config.num_hidden_layers, self.fd_config.model_config.moe_num_experts + self.fd_config.eplb_config.redundant_experts_num),
+            dtype=np.int32,
+        )
+        self.shm_expert_rank_table_array = IPCSignal(
+            name="expert_rank_table",
+            array=shm_expert_rank_table,
+            dtype=np.int32,
+            suffix=dp_ipc_signal_suffix,
+            create=False,
+        )
+
         for tp_rank_id in range(self.tensor_parallel_size):
             tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{tp_rank_id}"
             signal_clear_experts_token_stats = np.zeros([1], dtype=np.int32)
@@ -1000,6 +1012,42 @@ class EngineClient:
         content = {"code": 0, "msg": "ok", "data": local_experts_list}
         status_code = HTTPStatus.OK
         return content, status_code
+
+    async def get_expert_rank_table(self, request_dict: dict):
+        """
+        get the in-use expert rank table (physical slot -> logical expert)
+
+        Args:
+            request_dict (dict): request body
+        Returns:
+            tuple: response body, status code
+        """
+        eplb_config = self.fd_config.eplb_config
+        if not eplb_config.enable_eplb:
+            return {"code": 1, "msg": "redundant expert is disabled"}, HTTPStatus.BAD_REQUEST
+
+        if (
+            request_dict.get("user", "") != eplb_config.redundant_expert_api_user
+            or request_dict.get("passwd", "") != eplb_config.redundant_expert_api_password
+        ):
+            return {"code": 1, "msg": "user or passwd is invalid"}, HTTPStatus.UNAUTHORIZED
+
+        if self.fd_config.parallel_config.tensor_parallel_rank != 0:
+            return {
+                "code": 1,
+                "msg": f"actual rank {self.fd_config.parallel_config.tensor_parallel_rank}, expect rank 0",
+            }, HTTPStatus.BAD_REQUEST
+
+        if self.rearrange_experts_signal.value[0] not in (
+            RearrangeExpertStatus.FREE.value,
+            RearrangeExpertStatus.DONE.value,
+        ):
+            return {
+                "code": 1,
+                "msg": f"expert rearrange in flight, status {self.rearrange_experts_signal.value[0]}",
+            }, HTTPStatus.SERVICE_UNAVAILABLE
+
+        return {"code": 0, "msg": "ok", "data": self.shm_expert_rank_table_array.value.tolist()}, HTTPStatus.OK
 
     async def check_redundant(self, request_dict: dict):
         """

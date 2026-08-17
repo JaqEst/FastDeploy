@@ -17,7 +17,7 @@
 import threading
 import time
 from http import HTTPStatus
-from multiprocessing import Pipe, Process
+from multiprocessing import get_context
 
 import numpy as np
 import requests
@@ -25,7 +25,12 @@ import requests
 from fastdeploy.config import FDConfig
 from fastdeploy.eplb.async_expert_loader import load_model_weights_process
 from fastdeploy.eplb.eplb import rebalance_experts
-from fastdeploy.eplb.utils import RedundantExpertWorkload
+from fastdeploy.eplb.utils import (
+    RedundantExpertWorkload,
+    expand_expert_rank_table,
+    derive_expert_tables,
+    compact_expert_rank_table,
+)
 from fastdeploy.inter_communicator import IPCSignal, RearrangeExpertStatus
 from fastdeploy.utils import get_logger
 
@@ -41,6 +46,7 @@ class RedundantExpertManager:
         ep_size: int = 32,
         fd_config: FDConfig = None,
         ipc_signal_suffix: int = 0,
+        shm_fd: int = -1,
     ):
         self.logger = get_logger("eplb_expert_manager", "eplb_{0}.log".format(rank))
 
@@ -53,10 +59,8 @@ class RedundantExpertManager:
         self.num_redundant_experts = self.eplb_config.redundant_experts_num
         self.num_hidden_layers = self.fd_config.model_config.num_hidden_layers
         self.num_logical_experts = self.fd_config.model_config.moe_num_experts
-        self.ipc_signal_suffix = ipc_signal_suffix
-        self.local_rank = self.rank % self.fd_config.parallel_config.tensor_parallel_size
-
-        self._is_afd_attn = self.fd_config.afd_config.is_attn
+        self.dp_ipc_signal_suffix = f"{ipc_signal_suffix}_dp{fd_config.parallel_config.local_data_parallel_id}"
+        self.local_rank = self.fd_config.parallel_config.tensor_parallel_rank
 
         if not self.fd_config.afd_config.enable_afd:
             self.num_replicas = self.num_logical_experts + self.num_redundant_experts
@@ -119,7 +123,39 @@ class RedundantExpertManager:
         self.model_tokens_per_expert_stats_list = np.ones(
             (self.num_hidden_layers, self.num_logical_experts), dtype=np.int32
         )
-        self.calculate_expert_rank_table(True)
+
+        self.rearrange_experts_signal = None
+        self.signal_update_weight_from_tensor_array = None
+        if self.local_rank == 0:
+            self.rearrange_experts_signal = IPCSignal(
+                name="rearrange_experts_status",
+                array=np.zeros([1], dtype=np.int32),
+                dtype=np.int32,
+                suffix=self.dp_ipc_signal_suffix,
+                create=False,
+            )
+            self.signal_update_weight_from_tensor_array = IPCSignal(
+                name="signal_update_weight_from_tensor",
+                array=np.zeros([1], dtype=np.int32),
+                dtype=np.int32,
+                suffix=self.dp_ipc_signal_suffix,
+                create=False,
+            )
+
+        shm_expert_rank_table = np.zeros(
+            (self.num_hidden_layers, self.num_logical_experts + self.num_redundant_experts),
+            dtype=np.int32,
+        )
+        self.shm_expert_rank_table = IPCSignal(
+            name="expert_rank_table",
+            array=shm_expert_rank_table,
+            dtype=np.int32,
+            suffix=self.dp_ipc_signal_suffix,
+            create=False,
+        )
+
+        if not self.seed_expert_rank_table():
+            self.calculate_expert_rank_table(True)
 
         self.dp_rank_address = None
         self.need_allgather_load_weight_result = False
@@ -135,10 +171,14 @@ class RedundantExpertManager:
 
         self.tensor_infos = None
 
-        if not self._is_afd_attn:
-            self.parent_data_conn, child_data_conn = Pipe()
-            self.parent_mg_conn, child_mg_conn = Pipe()
-            Process(
+        if not self.fd_config.afd_config.is_attn:
+            # Fork explicitly: shm_fd is handed over by inheritance, and create_mmap has
+            # already unlinked the expert weight file, so this descriptor is the only way
+            # into the buffer.
+            ctx = get_context("fork")
+            self.parent_data_conn, child_data_conn = ctx.Pipe()
+            self.parent_mg_conn, child_mg_conn = ctx.Pipe()
+            ctx.Process(
                 target=load_model_weights_process,
                 name=f"eplb::async_load_model_{rank}",
                 args=(
@@ -147,10 +187,14 @@ class RedundantExpertManager:
                     self.expert_per_rank,
                     self.fd_config.model_config.moe_layer_start_index,
                     self.eplb_config.moe_quant_type,
-                    self.ipc_signal_suffix,
+                    shm_fd,
                     self.eplb_config,
                     child_data_conn,
                     child_mg_conn,
+                    # Handed over only so the child can close them: otherwise it
+                    # never sees EOF when parent process exits.
+                    self.parent_data_conn,
+                    self.parent_mg_conn,
                 ),
             ).start()
             child_data_conn.close()
@@ -178,7 +222,7 @@ class RedundantExpertManager:
         """
         listen_rearrange_expert_signal
         """
-        dp_ipc_signal_suffix = f"{self.ipc_signal_suffix}_dp{self.fd_config.parallel_config.local_data_parallel_id}"
+        dp_ipc_signal_suffix = self.dp_ipc_signal_suffix
         if self.local_rank == 0:
             rearrange_experts_ips_size_array = np.zeros([1], dtype=np.int32)
             rearrange_experts_ips_size_signal = IPCSignal(
@@ -192,24 +236,6 @@ class RedundantExpertManager:
             shm_rearrange_experts_ips_list = IPCSignal(
                 name="rearrange_experts_ips_list",
                 shm_size=self.eplb_config.redundant_expert_ip_shm_size,
-                suffix=dp_ipc_signal_suffix,
-                create=False,
-            )
-
-            rearrange_experts_status = np.zeros([1], dtype=np.int32)
-            rearrange_experts_signal = IPCSignal(
-                name="rearrange_experts_status",
-                array=rearrange_experts_status,
-                dtype=np.int32,
-                suffix=dp_ipc_signal_suffix,
-                create=False,
-            )
-
-            signal_update_weight_from_tensor = np.zeros([1], dtype=np.int32)
-            self.signal_update_weight_from_tensor_array = IPCSignal(
-                name="signal_update_weight_from_tensor",
-                array=signal_update_weight_from_tensor,
-                dtype=np.int32,
                 suffix=dp_ipc_signal_suffix,
                 create=False,
             )
@@ -255,7 +281,7 @@ class RedundantExpertManager:
                     ).decode("utf-8")
                     self.logger.info(f"redundant_expert: all rank ips {address}")
                     rearrange_experts_ips_size_signal.value[0] = 0
-                    rearrange_experts_signal.value[0] = RearrangeExpertStatus.DOING.value
+                    self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DOING.value
                     self.rearrange_end_ts = 0
 
                     self.dp_rank_address = address.strip().split(";")
@@ -264,36 +290,64 @@ class RedundantExpertManager:
                         self.load_weight_begin_ts = now
                         self.logger.info("redundant_expert: all-reduce experts stats success")
                     else:
-                        rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
+                        self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
                         self.logger.warning("redundant_expert: all-reduce experts stats fail")
                 elif self.need_allgather_load_weight_result and self.allreduce_load_weight_result():
                     # step 3. all reduce the result of load weight from disk
                     self.need_allgather_load_weight_result = False
-                    rearrange_experts_signal.value[0] = RearrangeExpertStatus.LOAD_SUCC.value
+                    self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.LOAD_SUCC.value
                     self.rearrange_end_ts = now
                     if self.need_update_weight_from_tensor:
                         if self.notify_update_weight_from_tensor():
                             self.need_update_weight_from_tensor = False
                         else:
                             self.need_allgather_load_weight_result = True
-                if rearrange_experts_signal.value[0] > 1:
+                if self.rearrange_experts_signal.value[0] > 1:
                     if self.rearrange_end_ts == 0:
                         self.rearrange_end_ts = now
                     if now - self.rearrange_end_ts > self.rearrange_reset_interval:
                         # reset rearrange status
-                        rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
+                        self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
                         self.rearrange_end_ts = 0
 
             if signal_update_weight_from_disk_array.value[0] == 1:
                 # step 2. async load weight: disk -> memory
                 self.model_tokens_per_expert_stats_list[:] = shm_all_experts_token_stats.value[:]
                 self.calculate_expert_rank_table()
-                if self._is_afd_attn:
+                if self.fd_config.afd_config.is_attn:
                     self.update_weight_from_disk_result.value[0] = 1
                 else:
                     self.update_weight_from_disk()
                 signal_update_weight_from_disk_array.value[0] = 0
             time.sleep(0.5)
+
+    def seed_expert_rank_table(self) -> bool:
+        """
+        Seed the tables from the placement the engine published, instead of computing a cold start.
+        """
+        compact = np.array(self.shm_expert_rank_table.value, dtype=np.int32)
+        # The engine fills the table with -1 until it holds a placement.
+        if np.any(compact < 0):
+            return False
+
+        phy2log = expand_expert_rank_table(compact, self.fd_config.afd_config)
+        logical_to_physical_map, expert_count = derive_expert_tables(
+            phy2log, self.num_logical_experts, self.num_redundant_experts + 1
+        )
+
+        self.model_ep_rank_to_expert_id_list[:] = phy2log[:]
+        self.model_expert_id_to_ep_rank_array.fill(-1)
+        self.model_expert_id_to_ep_rank_array[..., : logical_to_physical_map.shape[-1]] = logical_to_physical_map[:]
+        self.model_expert_in_rank_num_list[:] = expert_count[:]
+
+        # update_weight_from_disk diffs the new placement against this backup, so the backup has to
+        # be the placement the weights on device were loaded with, not a cold start.
+        self.last_model_ep_rank_to_expert_id_list[:] = self.model_ep_rank_to_expert_id_list[:]
+        self.last_model_expert_id_to_ep_rank_array[:] = self.model_expert_id_to_ep_rank_array[:]
+        self.last_model_expert_in_rank_num_list[:] = self.model_expert_in_rank_num_list[:]
+
+        self.logger.info("redundant_expert: read the expert rank table published by the engine")
+        return True
 
     def calculate_expert_rank_table(self, is_init=False):
         """
@@ -330,6 +384,11 @@ class RedundantExpertManager:
         self.model_expert_id_to_ep_rank_array.fill(-1)
         self.model_expert_id_to_ep_rank_array[..., : logical_to_physical_map.shape[-1]] = logical_to_physical_map[:]
         self.model_expert_in_rank_num_list[:] = expert_count[:]
+
+        if self.local_rank == 0:
+            self.shm_expert_rank_table.value[:] = compact_expert_rank_table(
+                self.model_ep_rank_to_expert_id_list, self.fd_config.afd_config
+            )
 
         if self.local_rank == 0:
             workload = RedundantExpertWorkload(self.eplb_config.redundant_expert_meta_dir)

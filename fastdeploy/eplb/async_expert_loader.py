@@ -16,6 +16,7 @@
 
 import ctypes
 import os
+import signal
 import time
 import traceback
 from typing import List, Tuple
@@ -71,6 +72,8 @@ MAP_SHARED = 0x01
 MAP_ANONYMOUS = 0x20
 MAP_FAILED = -1
 
+PR_SET_PDEATHSIG = 1
+
 G = 1024**3
 TOTAL_MODEL_SIZE = 350
 MAIN_MODEL_REDUNDANT_SHM_SIZE = 5
@@ -91,13 +94,12 @@ def create_mmap(model_name: List, ep_rank: int, ep_size: int, shm_uuid: str, epl
     main_size = main_size * G
 
     mmap_infos = {}
+    shm_fds = {}
     for name in model_name:
         expert_weight_file = f"/dev/shm/{name}_rank_{ep_rank}_expert_weight_{shm_uuid}"
         shm_size = main_size
 
-        if not os.path.isfile(expert_weight_file):
-            open(expert_weight_file, "wb").close()
-        shm_fd = os.open(expert_weight_file, os.O_RDWR)
+        shm_fd = os.open(expert_weight_file, os.O_RDWR | os.O_CREAT, 0o600)
         os.ftruncate(shm_fd, shm_size)
         if logger is not None:
             logger.info(f"redundant_expert: create_mmap file {expert_weight_file}, fd {shm_fd}, size {shm_size}")
@@ -124,40 +126,41 @@ def create_mmap(model_name: List, ep_rank: int, ep_size: int, shm_uuid: str, epl
                 f" address {hex(addr)} size {shm_size}, ret: {ret}"
             )
 
+        # Drop the name once the mapping and the registration hold a reference: the
+        # inode stays alive through shm_fd and the mapping, and the kernel reclaims
+        # the memory as soon as this process dies, SIGKILL included.
+        os.unlink(expert_weight_file)
+
         mmap_infos[name] = shm_ptr
+        shm_fds[name] = shm_fd
 
-    return mmap_infos
+    return mmap_infos, shm_fds
 
 
-def save_tensor_to_shm_mem(cached_weights, file_path, logger=None):
+def save_tensor_to_shm_mem(cached_weights, shm_fd, logger=None):
     """save_tensor_to_shm_mem"""
     tensor_infos = []
     offset = 0
-    if not os.path.exists(file_path):
-        raise OSError("File is not exist")
-
-    shm_size = os.path.getsize(file_path)
+    shm_size = os.fstat(shm_fd).st_size
 
     for name, w in cached_weights:
         size = w.numel().item() * w.element_size()
         # logger.info(f"redundant_expert: save tensor to {name} offset: {offset} size: {size}")
         w_ptr = ctypes.string_at(w.data_ptr(), size)
-        with open(file_path, "r+b") as file:
-            file.seek(offset)
-            if offset + size > shm_size:
-                raise IOError(
-                    f"redundant_expert: Exceeded {file_path} file's size. "
-                    + "Should set a bigger value using env variable."
-                )
-            n = file.write(w_ptr)
-            assert n == size
+        if offset + size > shm_size:
+            raise IOError(
+                f"redundant_expert: Exceeded expert weight shm size {shm_size}. "
+                + "Should set a bigger value using env variable."
+            )
+        n = os.pwrite(shm_fd, w_ptr, offset)
+        assert n == size
         tensor_infos.append((name, offset, size, w.shape, w.dtype))
 
         offset += size
 
     sz = offset / 1024 / 1024 / 1024
     if logger is not None:
-        logger.info(f"redundant_expert: save_tensor_to_shm_mem success. file {file_path} size {sz}G")
+        logger.info(f"redundant_expert: save_tensor_to_shm_mem success. fd {shm_fd} size {sz}G")
 
     return tensor_infos
 
@@ -390,10 +393,12 @@ def load_model_weights_process(
     expert_per_rank: int,
     moe_layer_start_index: int,
     moe_quant_type: str,
-    shm_uuid: str,
+    shm_fd: int,
     eplb_config: EPLBConfig,
     data_conn,
     mg_conn,
+    parent_data_conn,
+    parent_mg_conn,
 ):
     """
     load_model_weights_process
@@ -401,6 +406,19 @@ def load_model_weights_process(
     import faulthandler
 
     from setproctitle import setproctitle
+
+    # Die with the worker. Without this the loader outlives a SIGKILL of its parent
+    # as an orphan.
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    if os.getppid() == 1:
+        # The parent died between the fork and the prctl above, so no signal is coming.
+        os._exit(0)
+
+    # Both pipes were created before the fork, so this process also holds the parent ends.
+    # Keeping them open would make mg_conn.recv() block forever after the worker exits,
+    # since the write end never reaches a refcount of zero.
+    parent_data_conn.close()
+    parent_mg_conn.close()
 
     setproctitle(f"eplb::async_load_model_{rank}")
     faulthandler.enable()
@@ -422,7 +440,11 @@ def load_model_weights_process(
 
     while True:
         ep_loader.reset()
-        data = mg_conn.recv()
+        try:
+            data = mg_conn.recv()
+        except EOFError:
+            logger.info("redundant_expert: manager pipe closed, load_model_weights_process exit")
+            return
 
         result = True
         weight_infos = []
@@ -438,9 +460,7 @@ def load_model_weights_process(
                 + f"succ {success}, cost {begin_time_shm-begin_time_disk}s"
             )
             if success:
-                model_name = MODEL_MAIN_NAME
-                file_path = f"/dev/shm/{model_name}_rank_{rank}_expert_weight_{shm_uuid}"
-                weight_infos = save_tensor_to_shm_mem(ep_loader.cached_weights, file_path, logger)
+                weight_infos = save_tensor_to_shm_mem(ep_loader.cached_weights, shm_fd, logger)
                 logger.info(
                     "redundant_expert: async load save_tensor_to_shm_mem, "
                     + f"tensor nums {len(weight_infos)}, cost {int(time.time()-begin_time_shm)}s"
