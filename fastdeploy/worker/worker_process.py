@@ -410,6 +410,18 @@ class PaddleDisWorkerProc:
         value = model_weights_signal_tensor.numpy()[0]
         return int(value)
 
+    def _get_exist_task_flag(self) -> bool:
+        if self.nnode > 1:
+            return self.task_queue.read_finish_flag.get() == 1
+        else:
+            return self.exist_task_signal.value[0] == ExistTaskStatus.EXIST
+
+    def _update_exist_task_flag(self, flag: bool) -> None:
+        if self.nnode > 1:
+            self.task_queue.read_finish_flag.set(int(flag))
+        else:
+            self.exist_task_signal.value[0] = ExistTaskStatus.EXIST if flag else ExistTaskStatus.EMPTY
+
     def _tp_barrier_wait(self):
         if (
             current_platform.is_xpu()
@@ -608,10 +620,7 @@ class PaddleDisWorkerProc:
                     if envs.ENABLE_V1_KVCACHE_SCHEDULER or not (
                         self.fd_config.enable_mm_runtime and self.worker.exist_prefill()
                     ):
-                        if self.nnode > 1:
-                            self.task_queue.read_finish_flag.set(1)
-                        else:
-                            self.exist_task_signal.value[0] = ExistTaskStatus.EXIST
+                        self._update_exist_task_flag(True)
 
             # Synchronize the signal set by tp_rank0 visiable to other workers
             self._tp_barrier_wait() if tp_size > 1 else None
@@ -669,7 +678,7 @@ class PaddleDisWorkerProc:
                             )  # 所有 Rank 已同步唤醒，启动权重更新流程
                     continue
 
-            if self.exist_task_signal.value[0] == ExistTaskStatus.EXIST or self.task_queue.read_finish_flag.get() == 1:
+            if self._get_exist_task_flag():
                 logger.debug(f"Global rank: {self.global_rank}, Local rank: {self.local_rank} detected new requests.")
                 if not self.fd_config.launch_config.is_extension:
                     self.engine_forward_signal.value[0] = 1
@@ -677,10 +686,7 @@ class PaddleDisWorkerProc:
                 # Only one of all tp_size client will get read_finish == True.
                 if read_finish:
                     # Reset the two signal.
-                    if self.nnode > 1:
-                        self.task_queue.read_finish_flag.set(0)
-                    else:
-                        self.exist_task_signal.value[0] = ExistTaskStatus.EMPTY
+                    self._update_exist_task_flag(False)
                 # Some ranks are deactivated, skip this round.
                 if dropped:
                     continue
