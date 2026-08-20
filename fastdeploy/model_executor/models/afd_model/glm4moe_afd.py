@@ -154,14 +154,20 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
         if forward_meta.timeout_us:
             comm_kwargs["timeout_us"] = forward_meta.timeout_us
 
-        dummy_recv_x, recv_count, dummy_handle = self.afd_runner.dispatch_physical(
+        dummy_recv_x, _, dummy_handle = self.afd_runner.dispatch_physical(
             x,
             physical_topk_idx,
             topk_weights,
             **comm_kwargs,
         )
 
-        # --- 3. combine results from FFN workers ---
+        # --- 3. shared experts ---
+        # Launched before combine so its kernels are enqueued ahead of the combine
+        # recv-wait kernel, overlapping with remote FFN compute and the round trip.
+        if self.shared_experts is not None:
+            shared_out = self.shared_experts(x, forward_meta)
+
+        # --- 4. combine results from FFN workers ---
         routed_out = self.afd_runner.combine(
             dummy_recv_x,
             physical_topk_idx,
@@ -170,9 +176,8 @@ class Glm4AFDAttnMoeBlock(nn.Layer):
             **comm_kwargs
         )
 
-        # --- 4. shared experts ---
         if self.shared_experts is not None:
-            routed_out = routed_out + self.shared_experts(x, forward_meta)
+            routed_out = routed_out + shared_out
 
         return routed_out
 
