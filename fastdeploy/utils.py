@@ -1333,9 +1333,18 @@ else:
 register_custom_python_op = register_op
 
 
-def all_gather_values(value: int | float | bool, group: paddle.distributed.communication.group.Group) -> list:
+def all_gather_values(
+    value: int | float | bool,
+    group: paddle.distributed.communication.group.Group,
+    on_cpu: bool = False,
+) -> list:
+    """Gather a scalar from every rank of ``group``."""
     _type = type(value)
-    _local = paddle.to_tensor([value], dtype="float32")
-    _global = paddle.zeros([group.world_size], dtype="float32")
+    if on_cpu:
+        _local = paddle.to_tensor([value], dtype="float32", place="cpu")
+        _global = paddle.to_tensor([0.0] * group.world_size, dtype="float32", place="cpu")
+    else:
+        _local = paddle.to_tensor([value], dtype="float32")
+        _global = paddle.zeros([group.world_size], dtype="float32")
     paddle.distributed.all_gather(_global, _local, group)
     return [_type(v) if math.isfinite(v) else _type(0) for v in _global.tolist()]

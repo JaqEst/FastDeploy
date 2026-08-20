@@ -721,6 +721,7 @@ class ParallelConfig:
 
     def set_communicate_group(self, afd_config: AFDConfig=None, launch_config: LaunchConfig=None):
         tp_gid_offset = envs.FD_TP_GROUP_GID_OFFSET
+        cpu_gid_offset = envs.FD_TP_GROUP_GID_OFFSET
 
         if self.enable_expert_parallel:
             # same ep group id
@@ -742,8 +743,18 @@ class ParallelConfig:
             self.ep_group = dist.new_group(ep_group_ranks, pg_options=pg_opts)
             dist.collective._set_custom_gid(None)
 
+            if envs.FD_ENABLE_CPU_GROUP:
+                backend = "mooncake" if envs.FD_USE_MOONCAKE_PG else "gloo"
+                cpu_pg_opts = {**pg_opts, "device": "cpu"} if pg_opts else None
+                dist.collective._set_custom_gid(ep_group_gid + cpu_gid_offset)
+                self.ep_group_cpu = dist.new_group(ep_group_ranks, backend=backend, pg_options=cpu_pg_opts)
+                dist.collective._set_custom_gid(None)
+
             if envs.FD_USE_MOONCAKE_PG and self.ep_group.is_member():
-                self.ep_active_ranks = self.ep_group.process_group.get_active_ranks()
+                if envs.FD_ENABLE_CPU_GROUP:
+                    self.ep_active_ranks = self.ep_group_cpu.process_group.get_active_ranks()
+                else:
+                    self.ep_active_ranks = self.ep_group.process_group.get_active_ranks()
 
         # different tp group id
         # prevent different tp_groups using the same group_id
@@ -770,8 +781,18 @@ class ParallelConfig:
         self.tp_group = dist.new_group(tp_group_ranks, pg_options=pg_opts)
         dist.collective._set_custom_gid(None)
 
+        if envs.FD_ENABLE_CPU_GROUP:
+            backend = "mooncake" if envs.FD_USE_MOONCAKE_PG else "gloo"
+            cpu_pg_opts = {**pg_opts, "device": "cpu"} if pg_opts else None
+            dist.collective._set_custom_gid(tp_group_gid + cpu_gid_offset)
+            self.tp_group_cpu = dist.new_group(tp_group_ranks, backend=backend, pg_options=cpu_pg_opts)
+            dist.collective._set_custom_gid(None)
+
         if envs.FD_USE_MOONCAKE_PG and self.tp_group.is_member():
-            self.tp_active_ranks = self.tp_group.process_group.get_active_ranks()
+            if envs.FD_ENABLE_CPU_GROUP:
+                self.tp_active_ranks = self.tp_group_cpu.process_group.get_active_ranks()
+            else:
+                self.tp_active_ranks = self.tp_group.process_group.get_active_ranks()
 
         logger.info(
             f"data_parallel_size: {self.data_parallel_size}, tensor_parallel_size: {self.tensor_parallel_size}, expert_parallel_size: {self.expert_parallel_size}, data_parallel_rank: {self.data_parallel_rank}, tensor_parallel_rank: {self.tensor_parallel_rank}, expert_parallel_rank: {self.expert_parallel_rank}, tp_group: {self.tp_group}."

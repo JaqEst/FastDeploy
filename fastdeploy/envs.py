@@ -126,6 +126,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FD_USE_MOONCAKE_PG": lambda: int(os.getenv("FD_USE_MOONCAKE_PG", "1" if os.getenv("FD_MOE_A2A_BACKEND", "deepep") == "mooncake" else "0")),
     # Offset for Tensor Parallelism group GID.
     "FD_TP_GROUP_GID_OFFSET": lambda: int(os.getenv("FD_TP_GROUP_GID_OFFSET", "1000")),
+    # Create extra CPU process groups used by the worker event loop for host-side signaling.
+    "FD_ENABLE_CPU_GROUP": lambda: bool(int(os.getenv("FD_ENABLE_CPU_GROUP", "0"))),
     # enable multi api server
     "FD_ENABLE_MULTI_API_SERVER": lambda: bool(int(os.getenv("FD_ENABLE_MULTI_API_SERVER", "0"))),
     "FD_FOR_TORCH_MODEL_FORMAT": lambda: bool(int(os.getenv("FD_FOR_TORCH_MODEL_FORMAT", "0"))),

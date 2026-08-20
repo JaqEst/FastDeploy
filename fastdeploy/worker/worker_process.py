@@ -430,7 +430,12 @@ class PaddleDisWorkerProc:
         ):
             self.task_queue.worker_process_tp_barrier.wait()
         else:
-            paddle.distributed.barrier(self.parallel_config.tp_group)
+            # A host-side barrier does not enter the compute stream,
+            # so it does not drain the pending forward.
+            if envs.FD_ENABLE_CPU_GROUP:
+                paddle.distributed.barrier(self.parallel_config.tp_group_cpu)
+            else:
+                paddle.distributed.barrier(self.parallel_config.tp_group)
 
     def init_eplb(self):
         if not self.eplb_config.enable_eplb:
@@ -580,14 +585,26 @@ class PaddleDisWorkerProc:
             logger.info("redundant_expert: update_weight_from_tensor broadcast signal")
             self.experts_manager.signal_update_weight_from_tensor_array.value[0] = 0
             broadcast_value = REARRANGE_EXPERT_MAGIC_NUM
-        data = paddle.to_tensor([broadcast_value])
-        paddle.distributed.broadcast(data, 0, group=self.parallel_config.ep_group)
+
+        if envs.FD_ENABLE_CPU_GROUP:
+            group = self.parallel_config.ep_group_cpu
+            data = paddle.to_tensor([broadcast_value], place="cpu")
+        else:
+            group = self.parallel_config.ep_group
+            data = paddle.to_tensor([broadcast_value])
+
+        paddle.distributed.broadcast(data, 0, group=group)
         if data[0] == REARRANGE_EXPERT_MAGIC_NUM:
+            # update_weights_from_tensor overwrites model weights in place. On the
+            # GPU broadcast path the implicit device sync from reading data[0]
+            # used to guarantee the pending forward had drained; the CPU path has
+            # no such barrier, so drain explicitly before touching the weights.
+            paddle.device.synchronize()
             self.update_weights_from_tensor(self.mmap_infos)
             logger.info(
                 f"redundant_expert: update_weight_from_tensor success, cost {(time.time() - rearrange_time)*1000}ms"
             )
-            paddle.distributed.barrier(self.parallel_config.ep_group)
+            paddle.distributed.barrier(group)
             if tp_rank == 0:
                 self.experts_manager.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
             logger.info("redundant_expert: done")
@@ -748,7 +765,11 @@ class PaddleDisWorkerProc:
 
             # Let the ep group run control method synchronically
             if envs.FD_ENABLE_EP_CONTROL_REQ_POLL and self.parallel_config.use_ep:
-                pendings = all_gather_values(len(self.cached_control_reqs), self.parallel_config.ep_group)
+                pendings = all_gather_values(
+                    len(self.cached_control_reqs),
+                    self.parallel_config.ep_group_cpu if envs.FD_ENABLE_CPU_GROUP else self.parallel_config.ep_group,
+                    on_cpu=envs.FD_ENABLE_CPU_GROUP,
+                )
                 if hasattr(self.parallel_config, "ep_active_ranks"):
                     pendings = [p for p, active in zip(pendings, self.parallel_config.ep_active_ranks.tolist()) if active]
                 if all([p > 0 for p in pendings]):

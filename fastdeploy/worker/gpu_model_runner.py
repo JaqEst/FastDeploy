@@ -2927,6 +2927,7 @@ class GPUModelRunner(ModelRunnerBase):
         if worker_id not in worker_ids:
             return
 
+        paddle.device.synchronize()
         logger.info(f">>> start recover ranks, ranks: {ranks}")
         start_time = time.perf_counter()
 
@@ -2936,7 +2937,7 @@ class GPUModelRunner(ModelRunnerBase):
         if global_rank not in ranks:    # primary ranks
             # recover ranks are not ready to join current group
             while not all(world_group.process_group.get_peer_state(ranks)):
-                time.sleep(0.001)
+                time.sleep(0.01)
             world_group.process_group.recover_ranks(ranks)
         else:    # recover ranks
             world_group.process_group.join_group()
@@ -2950,10 +2951,20 @@ class GPUModelRunner(ModelRunnerBase):
                 ep_rank = self.parallel_config.expert_parallel_rank
                 if ep_rank not in ep_ranks:
                     while not all(ep_group.process_group.get_peer_state(ep_ranks)):
-                        time.sleep(0.001)
+                        time.sleep(0.01)
                     ep_group.process_group.recover_ranks(ep_ranks)
                 else:
                     ep_group.process_group.join_group()
+
+                if envs.FD_ENABLE_CPU_GROUP:
+                    ep_group_cpu = self.parallel_config.ep_group_cpu
+                    if ep_rank not in ep_ranks:
+                        while not all(ep_group_cpu.process_group.get_peer_state(ep_ranks)):
+                            time.sleep(0.01)
+                        ep_group_cpu.process_group.recover_ranks(ep_ranks)
+                    else:
+                        ep_group_cpu.process_group.join_group()
+
                 logger.info(f"ep group recovered! active ranks: {ep_group.process_group.get_active_ranks().tolist()}")
 
         # Skip tp group recovery as we build tp group normally for attn instance
@@ -2964,14 +2975,25 @@ class GPUModelRunner(ModelRunnerBase):
                 tp_rank = self.parallel_config.tensor_parallel_rank
                 if tp_rank not in tp_ranks:
                     while not all(tp_group.process_group.get_peer_state(tp_ranks)):
-                        time.sleep(0.001)
+                        time.sleep(0.01)
                     tp_group.process_group.recover_ranks(tp_ranks)
                 else:
                     tp_group.process_group.join_group()
+
+                if envs.FD_ENABLE_CPU_GROUP:
+                    tp_group_cpu = self.parallel_config.tp_group_cpu
+                    if tp_rank not in tp_ranks:
+                        while not all(tp_group_cpu.process_group.get_peer_state(tp_ranks)):
+                            time.sleep(0.01)
+                        tp_group_cpu.process_group.recover_ranks(tp_ranks)
+                    else:
+                        tp_group_cpu.process_group.join_group()
+
                 logger.info(f"tp group recovered! active ranks: {tp_group.process_group.get_active_ranks().tolist()}")
 
         if self.parallel_config.enable_expert_parallel:
             from fastdeploy.model_executor.layers.moe.ep import EPBackend
+
             backend = EPBackend()
             backend.active_ranks.copy_(ep_group.process_group.get_active_ranks())
             backend.buffer.update_ep_member()
@@ -2986,6 +3008,7 @@ class GPUModelRunner(ModelRunnerBase):
 
         paddle.distributed.barrier(world_group)
         logger.info(f"<<< finish recover ranks! time cost: {time.perf_counter()-start_time:.3f}s")
+        paddle.distributed.barrier(world_group)
         self.fd_config.launch_config.is_extension = False
 
     def update_weights(self, version: str = None, verify_checksum: bool = False):
