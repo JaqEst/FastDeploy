@@ -96,6 +96,18 @@ class ScheduledAbortTask:
     task_type: RequestType = RequestType.ABORT
 
 
+@dataclass
+class ScheduledRetryTask:
+    """Task for re-running a decode step the worker discarded."""
+
+    idx: int
+    request_id: str
+    resume_seq_lens_decoder: int
+    resume_step_idx: int
+    resume_token_id: int
+    task_type: RequestType = RequestType.RETRY
+
+
 class SignalConsumer:
     """
     A class that consumes a signal value up to a specified limit.
@@ -184,6 +196,7 @@ class ResourceManagerV1(ResourceManager):
         self.finish_execution_pool = ThreadPoolExecutor(max_workers=1)
         self.lock = threading.Lock()
         self.to_be_rescheduled_request_id_set = set()
+        self.to_be_retried_request_id_set = set()
         main_process_metrics.max_batch_size.set(max_num_seqs)
 
         self.using_extend_tables_req_id = set()
@@ -260,6 +273,31 @@ class ResourceManagerV1(ResourceManager):
     def _prepare_abort_task(self, request):
         return ScheduledAbortTask(idx=request.idx, request_id=request.request_id)
 
+    def _prepare_retry_task(self, request):
+        return ScheduledRetryTask(
+            idx=request.idx,
+            request_id=request.request_id,
+            resume_seq_lens_decoder=request.num_total_tokens - 1,
+            resume_step_idx=len(request.output_token_ids),
+            resume_token_id=(request.output_token_ids[-1] if request.output_token_ids else -1),
+        )
+
+    def trigger_retry(self, request_id):
+        """Accept a worker-initiated retry for ``request_id``."""
+        with self.lock:
+            if request_id not in self.requests:
+                return
+            request = self.requests[request_id]
+            if not request.output_token_ids:
+                # Nothing committed yet, so there is no decode position to resume from.
+                llm_logger.warning(f"retry requested for {request_id} before any token was committed, ignored")
+                return
+            self.to_be_retried_request_id_set.add(request_id)
+            llm_logger.info(
+                f"worker requested retry for {request_id}, resume at "
+                f"seq_lens_decoder={request.num_total_tokens - 1}"
+            )
+
     def reschedule_preempt_task(self, request_id, process_func=None):
         with self.lock:
             llm_logger.debug(f"reschedule {request_id} into waiting queue")
@@ -282,6 +320,8 @@ class ResourceManagerV1(ResourceManager):
                 del self.requests[request_id]
                 del self.req_dict[request_id]
                 self.to_be_aborted_req_id_set.remove(request_id)
+                # A pending retry is moot once the request is gone.
+                self.to_be_retried_request_id_set.discard(request_id)
         self.update_metrics()
 
     def _trigger_abort(self, request_id, scheduled_reqs):
@@ -294,6 +334,8 @@ class ResourceManagerV1(ResourceManager):
             scheduled_reqs.append(self._prepare_abort_task(abort_request))
             self.to_be_aborted_req_id_set.add(request_id)
             self.waiting_abort_req_id_set.remove(request_id)
+            # Abort wins over a pending retry.
+            self.to_be_retried_request_id_set.discard(request_id)
 
     def _info_each_block(self):
         """
@@ -360,6 +402,9 @@ class ResourceManagerV1(ResourceManager):
                     continue
                 preempted_req.status = RequestStatus.PREEMPTED
                 preempted_req.num_computed_tokens = 0
+                # Preemption resets the request outright, which supersedes any
+                # pending retry for it.
+                self.to_be_retried_request_id_set.discard(preempted_req.request_id)
                 if self.config.scheduler_config.splitwise_role == "decode":
                     self.tasks_list[preempted_req.idx] = None
                     self.stop_flags[preempted_req.idx] = True
@@ -780,6 +825,16 @@ class ResourceManagerV1(ResourceManager):
                 if need_block_num != 0:
                     self.need_block_num_map[request.request_id] = SignalConsumer(need_block_num, 1)
                     self.need_block_num_signal.value[request.idx] = 0
+
+                if request.request_id in self.to_be_retried_request_id_set:
+                    if self.allocated_slots(request) > request.num_total_tokens - 1:
+                        self.to_be_retried_request_id_set.remove(request.request_id)
+                        request.num_computed_tokens = request.num_total_tokens - 1
+                        scheduled_reqs.append(self._prepare_retry_task(request))
+                        # A retry replays one decode token, same budget as a decode task.
+                        token_budget -= 1
+                        req_index += 1
+                        continue
 
                 if request.num_computed_tokens >= request.need_prefill_tokens:  # to be decoding
                     if (
@@ -1528,6 +1583,8 @@ class ResourceManagerV1(ResourceManager):
                         # finished after preempted, blocks have been recycled.
                         llm_logger.info(f"finish preempeted request: {req_id}")
                         self.to_be_rescheduled_request_id_set.remove(request.request_id)
+                    # A pending retry is moot once the request is gone.
+                    self.to_be_retried_request_id_set.discard(request.request_id)
 
                     self.tasks_list[request.idx] = None
                     self.stop_flags[request.idx] = True

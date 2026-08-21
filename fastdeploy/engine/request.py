@@ -62,6 +62,7 @@ class RequestType(Enum):
     PREEMPTED = 2
     EXTEND = 3
     ABORT = 4
+    RETRY = 5
 
 
 @dataclass

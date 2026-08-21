@@ -29,7 +29,7 @@ import zmq
 
 import fastdeploy.metrics.trace as tracing
 from fastdeploy import envs
-from fastdeploy.config import PREEMPTED_TOKEN_ID
+from fastdeploy.config import PREEMPTED_TOKEN_ID, RETRY_TOKEN_ID
 from fastdeploy.engine.request import (
     CompletionOutput,
     PoolingOutput,
@@ -285,6 +285,11 @@ class TokenProcessor:
             token_ids = stream_data.tokens  # numpy.array
             if token_ids is not None and token_ids[-1] < 0:
                 if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+                    if token_ids[-1] == RETRY_TOKEN_ID:
+                        # Worker-initiated: the last decode step was discarded and
+                        # must be re-run from the last committed token.
+                        self.resource_manager.trigger_retry(task_id)
+                        continue
                     if (
                         task_id in self.resource_manager.to_be_aborted_req_id_set
                         and token_ids[-1] == PREEMPTED_TOKEN_ID
@@ -788,6 +793,9 @@ class TokenProcessor:
                     llm_logger.info(f"recovery stop signal found at task {task_id}")
                 if not recovery_stop and token_id < 0:
                     if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+                        if token_id == RETRY_TOKEN_ID:
+                            self.resource_manager.trigger_retry(task_id)
+                            continue
                         if (
                             task_id in self.resource_manager.to_be_aborted_req_id_set
                             and token_id == PREEMPTED_TOKEN_ID

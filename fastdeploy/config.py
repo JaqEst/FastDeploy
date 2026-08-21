@@ -67,6 +67,7 @@ _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
 }
 
 PREEMPTED_TOKEN_ID = -9
+RETRY_TOKEN_ID = -10
 
 # Some model suffixes are based on auto classes from Transformers:
 # https://huggingface.co/docs/transformers/en/model_doc/auto

@@ -21,7 +21,7 @@ import numpy as np
 import paddle
 
 from fastdeploy import envs
-from fastdeploy.config import SpeculativeConfig
+from fastdeploy.config import SpeculativeConfig, RETRY_TOKEN_ID
 from fastdeploy.platforms import current_platform
 from fastdeploy.worker.input_batch import (
     InputBatch,
@@ -364,6 +364,50 @@ def post_process_normal(
                 sampler_output.sampled_token_ids,
                 model_output.is_block_step,
             )
+
+
+def save_output_retry(
+    model_output: ModelOutputData,
+    sampler_output: SamplerOutput,
+    share_inputs: InputBatch,
+    async_output_queue: queue.Queue = None,
+    save_each_rank: bool = False,
+):
+    """Discard an uncommitted decode step and ask the engine to re-run its batch."""
+    # Idle slots were normalised to -1 by set_stop_value_multi_ends, so token >= 0 marks the
+    # slots that ran. Freeze and report exactly those: freezing a slot without reporting it
+    # leaves it stuck forever. Slots inserted by the step issued after this one keep running,
+    # since that step's postprocess is skipped and their cursors are untouched.
+    sampled_token_ids = share_inputs["sampled_token_ids"]
+    real_bsz = sampled_token_ids.shape[0]
+    tokens = sampled_token_ids.numpy().reshape([-1])
+    ran = tokens >= 0
+    if not ran.any():
+        return
+
+    stop_flags = share_inputs["stop_flags"][:real_bsz]
+    stop_flags_np = stop_flags.numpy().reshape([-1])
+    stop_flags_np[ran] = True
+    async_set_value(stop_flags, stop_flags_np.reshape(stop_flags.shape))
+
+    seq_lens_this_time = share_inputs["seq_lens_this_time_buffer"][:real_bsz]
+    seq_lens_this_time_np = seq_lens_this_time.numpy().reshape([-1])
+    seq_lens_this_time_np[ran] = 0
+    async_set_value(seq_lens_this_time, seq_lens_this_time_np)
+
+    tokens[ran] = RETRY_TOKEN_ID
+    host_tokens = paddle.to_tensor(tokens.reshape(sampled_token_ids.shape), place="cpu")
+    sampled_token_ids.copy_(host_tokens, False)
+
+    # Reuse save_output_normal so the channel, message layout and last_preempted_idx
+    # handling stay identical to a normal step.
+    save_output_normal(
+        model_output=model_output,
+        sampler_output=sampler_output,
+        share_inputs=share_inputs,
+        async_output_queue=async_output_queue,
+        save_each_rank=save_each_rank,
+    )
 
 
 def save_output_normal(

@@ -97,6 +97,7 @@ from fastdeploy.model_executor.pre_and_post_process import (
     post_process,
     pre_process,
     rebuild_padding,
+    save_output_retry,
     save_output_normal,
     save_output_specualate,
 )
@@ -151,6 +152,15 @@ class GPUModelRunner(ModelRunnerBase):
         if self.speculative_decoding:
             self._real_output_token_num_host = paddle.empty([1], dtype="int32").pin_memory()
             self.output_token_num_event = paddle.device.cuda.Event()
+
+        self.detect_rank_liveness = False
+        if self.parallel_config.enable_expert_parallel and envs.FD_MOE_A2A_BACKEND == "mooncake":
+            self.detect_rank_liveness = True
+            self._changed_ranks = paddle.empty(
+                [self.parallel_config.expert_parallel_size],
+                dtype="int32"
+            ).pin_memory()
+        self.rank_liveness_changed = False
 
         # VL model config:
         if self.enable_mm:
@@ -922,6 +932,26 @@ class GPUModelRunner(ModelRunnerBase):
                         request.block_tables, dtype="int32"
                     )
                 # CPU Tensor
+                self.share_inputs["preempted_idx"][idx : idx + 1, :] = 0
+                continue
+            elif request.task_type.value == RequestType.RETRY.value:  # retry task
+                # Re-run a decode step the worker discarded. Block tables and the
+                # KV cache of the committed prefix are still valid, so only the
+                # decode cursors are restored, using the position the engine
+                # computed from the committed tokens.
+                logger.info(
+                    f"Handle retry request {request.request_id} at idx {idx}, "
+                    f"resume at seq_lens_decoder={request.resume_seq_lens_decoder}"
+                )
+                async_set_value(self.share_inputs["seq_lens_decoder"][idx : idx + 1], request.resume_seq_lens_decoder)
+                async_set_value(self.share_inputs["step_seq_lens_decoder"][idx : idx + 1], request.resume_seq_lens_decoder)
+                async_set_value(self.share_inputs["seq_lens_encoder"][idx : idx + 1], 0)
+                async_set_value(self.share_inputs["seq_lens_this_time_buffer"][idx : idx + 1], 1)
+                async_set_value(self.share_inputs["step_idx"][idx : idx + 1], request.resume_step_idx)
+                async_set_value(self.share_inputs["stop_flags"][idx : idx + 1], False)
+                async_set_value(self.share_inputs["is_block_step"][idx : idx + 1], False)
+                if request.resume_token_id >= 0:
+                    async_set_value(self.share_inputs["input_ids"][idx : idx + 1, :1], [request.resume_token_id])
                 self.share_inputs["preempted_idx"][idx : idx + 1, :] = 0
                 continue
             else:  # preempted task
@@ -2226,10 +2256,35 @@ class GPUModelRunner(ModelRunnerBase):
         model_output_data, sampler_output, post_process_event = self._postprocess(
             model_output, p_done_idxs, model_forward_batch, num_running_requests, real_bsz
         )
+        self.rank_liveness_changed = False
         if model_output_data is not None:
             # synchronizes the async DtoH copies of sampled_token_ids.
             post_process_event.synchronize()
+            self.rank_liveness_changed = self._is_ep_active_ranks_changed()
             self._save_model_output(model_output_data, sampler_output)
+
+    def _check_ep_active_ranks(self) -> None:
+        if not self.detect_rank_liveness:
+            return
+
+        from fastdeploy.model_executor.layers.moe.ep import EPBackend
+
+        backend = EPBackend()
+        changed = (backend.active_ranks != backend.last_active_ranks).astype("int32")
+        self._changed_ranks.copy_(changed, False)
+
+    def _is_ep_active_ranks_changed(self) -> bool:
+        if not self.detect_rank_liveness or not np.any(self._changed_ranks.numpy()):
+            return False
+        from fastdeploy.model_executor.layers.moe.ep import EPBackend
+
+        backend = EPBackend()
+        backend.last_active_ranks.copy_(backend.active_ranks, False)
+        logger.warning(
+            "EP active ranks changed during the last forward: "
+            f"{np.nonzero(self._changed_ranks.numpy())[0].tolist()}"
+        )
+        return True
 
     def execute_model_overlap(
         self,
@@ -2241,10 +2296,12 @@ class GPUModelRunner(ModelRunnerBase):
             model_forward_batch, num_running_requests, self._cached_launch_token_num, self._cached_real_bsz
         )
         model_output = self._execute(model_inputs)
+        self.rank_liveness_changed = False
         # save output (last batch)
         if self._cached_model_output_data is not None:
             # synchronizes the async DtoH copies of sampled_token_ids.
             self._cached_post_process_event.synchronize()
+            self.rank_liveness_changed = self._is_ep_active_ranks_changed()
             self._save_model_output(
                 self._cached_model_output_data,
                 self._cached_sampler_output,
@@ -2256,7 +2313,14 @@ class GPUModelRunner(ModelRunnerBase):
         token_num_event.synchronize()
         next_launch_token_num, next_real_bsz = self._predict_next_launch_token_num()
         real_bsz = (self.share_inputs["seq_lens_this_time_cpu"].numpy() > 0).sum().item()
-        if real_bsz > 0 and model_output is not None:
+        if self.rank_liveness_changed:  # discard current step
+            self._cached_model_output_data = None
+            self._cached_sampler_output = None
+            self._cached_post_process_event = None
+            # The cached prediction describes the discarded batch, so make the next
+            # round recompute it (see _resolve_current_launch_token_num).
+            next_launch_token_num, next_real_bsz = -1, -1
+        elif real_bsz > 0 and model_output is not None:
             model_output_data, sampler_output, post_process_event = self._postprocess(
                 model_output, p_done_idxs, model_forward_batch, num_running_requests, real_bsz
             )
@@ -2610,6 +2674,7 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["accept_num_cpu"].copy_(self.share_inputs["accept_num"], False)
                 self.share_inputs["seq_lens_decoder_cpu"].copy_(self.share_inputs["seq_lens_decoder"], False)
                 self.share_inputs["prompt_lens_cpu"].copy_(self.share_inputs["prompt_lens"], False)
+            self._check_ep_active_ranks()
             post_process_event.record()
 
             # 6. Speculative decode -- proposer run (method="naive" has proposer=None, skip)
@@ -2661,7 +2726,18 @@ class GPUModelRunner(ModelRunnerBase):
         model_output_data,
         sampler_output,
     ):
-        if self.speculative_decoding:
+        if self.rank_liveness_changed:
+            # Guided decoding is off by default, so it is not handled here: the discarded
+            # step already fed its token to the grammar matcher and nothing rewinds it,
+            # leaving the matcher one token ahead of the committed output.
+            save_output_retry(
+                model_output=model_output_data,
+                sampler_output=sampler_output,
+                share_inputs=self.share_inputs,
+                async_output_queue=self.async_output_queue,
+                save_each_rank=self.parallel_config.use_ep,
+            )
+        elif self.speculative_decoding:
             skip_save_output = self.spec_method == SpecMethod.MTP and self.scheduler_config.splitwise_role == "prefill"
             save_output_specualate(
                 sampler_output=sampler_output,
