@@ -3076,13 +3076,9 @@ class GPUModelRunner(ModelRunnerBase):
             logger.info(f"ep buffer recovered! active ranks: {backend.active_ranks.tolist()}")
 
             if self.fd_config.eplb_config.enable_eplb:
-                self.get_model().redundant_table_manger.refresh_active_expert_rank_table_by_ranks(
-                    backend.last_active_ranks,
-                    backend.active_ranks,
-                )
-            backend.last_active_ranks.copy_(backend.active_ranks)
+                self.get_model().redundant_table_manger.refresh_active_expert_rank_table()
+            backend.last_active_ranks.copy_(backend.active_ranks, False)
 
-        paddle.distributed.barrier(world_group)
         logger.info(f"<<< finish recover ranks! time cost: {time.perf_counter()-start_time:.3f}s")
         paddle.distributed.barrier(world_group)
         self.fd_config.launch_config.is_extension = False

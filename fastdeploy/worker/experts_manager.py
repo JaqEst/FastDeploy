@@ -21,6 +21,7 @@ import numpy as np
 import paddle
 from paddleformers.utils.log import logger
 
+from fastdeploy import envs
 from fastdeploy.eplb.eplb import rebalance_experts
 from fastdeploy.eplb.utils import (
     derive_expert_tables,
@@ -109,6 +110,9 @@ class RedundantExpertManger:
             )
 
         self.update_expert_rank_table(rank_expert_list, logical_to_physical_map, expert_count, False)
+
+        self.model_active_expert_id_to_ep_rank_array.copy_(self.model_expert_id_to_ep_rank_array, True)
+        self.model_active_expert_in_rank_num_list.copy_(self.model_expert_in_rank_num_list, True)
 
         logger.info(
             f"moe experts table manager init successfully, ep_size {ep_size} \
@@ -228,9 +232,6 @@ class RedundantExpertManger:
         )
         self.model_expert_in_rank_num_list.copy_(paddle.to_tensor(expert_count), True)
 
-        self.model_active_expert_id_to_ep_rank_array.copy_(self.model_expert_id_to_ep_rank_array, True)
-        self.model_active_expert_in_rank_num_list.copy_(self.model_expert_in_rank_num_list, True)
-
         if self.fd_config is not None and clear_stat:
             try:
                 dump_path, snapshot = dump_redundant_expert_table_snapshot(
@@ -254,18 +255,16 @@ class RedundantExpertManger:
         if clear_stat:
             self.model_tokens_per_expert_stats_list.zero_()
 
-    def refresh_active_expert_rank_table_by_ranks(
-        self,
-        last_active_ranks: paddle.Tensor,
-        active_ranks: paddle.Tensor,
-    ):
+    def refresh_active_expert_rank_table(self):
         """
-        Rebuild the active expert routing table after FFN rank liveness changes.
+        Rebuild the active expert routing table after rank liveness changes.
         """
-        if not self.fd_config.afd_config.enable_afd:
+        if not self.fd_config.afd_config.enable_afd or envs.FD_MOE_A2A_BACKEND != "mooncake":
             return
-        if bool(paddle.all(last_active_ranks == active_ranks)):
-            return
+
+        from fastdeploy.model_executor.layers.moe.ep import EPBackend
+
+        active_ranks = EPBackend().active_ranks
 
         local_physical_experts = self.fd_config.afd_config.num_local_physical_experts
         fallback_physical_expert_id = self.fd_config.afd_config.ffn_ranks[0] * local_physical_experts
@@ -311,12 +310,7 @@ class RedundantExpertManger:
             keep_int.sum(axis=-1).clip(min=1).astype("int32"),
             True,
         )
-        logger.info(
-            "AFD EPLB active expert table refreshed by ranks: "
-            f"changed_ranks={paddle.nonzero(last_active_ranks != active_ranks).reshape([-1]).tolist()}, "
-            f"active_ranks={active_ranks.tolist()}, "
-            f"fallback_physical_expert_id={fallback_physical_expert_id}"
-        )
+        logger.info("redundant_expert: refresh active expert table.")
 
 if __name__ == "__main__":
     print(RedundantExpertManger(64, 2, 8, 8).model_expert_id_to_ep_rank_array)

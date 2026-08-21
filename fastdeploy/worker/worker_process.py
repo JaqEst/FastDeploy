@@ -379,6 +379,7 @@ class PaddleDisWorkerProc:
                 self.experts_manager.get_ep_rank_to_expert_id_list()
             )
             redundant_table_manger.update_expert_rank_table(rank_expert_list, logical_to_physical_map, expert_count)
+            redundant_table_manger.refresh_active_expert_rank_table()
             valid_phy = rank_expert_list[rank_expert_list >= 0]
             valid_log2phy = logical_to_physical_map[logical_to_physical_map >= 0]
             logger.info(
@@ -498,65 +499,44 @@ class PaddleDisWorkerProc:
         logger.info(f"Initialize eplb took {end_time - start_time} seconds.")
         paddle.distributed.barrier(self.parallel_config.ep_group)
 
-    def _maybe_refresh_eplb_expert_rank_table(self):
-
-        mc_backend = self.worker.get_model()._afd_runner.a2a_backend
-
-        if mc_backend.name != "mooncake":
-            return
-
-        changed_ranks = paddle.nonzero(mc_backend.last_active_ranks != mc_backend.active_ranks).reshape([-1])
-        if changed_ranks.shape[0] == 0:
-            return
-
-        ffn_ranks = paddle.to_tensor(
-            self.fd_config.afd_config.ffn_ranks,
-            dtype=changed_ranks.dtype,
-            place=changed_ranks.place,
-        )
-        is_ffn_changed = bool(paddle.any(changed_ranks.unsqueeze(-1) == ffn_ranks).item())
-        if not is_ffn_changed:
-            logger.info(f"active_ranks changed only on non-FFN ranks, skip expert rank table refresh: {changed_ranks.tolist()}")
-            mc_backend.last_active_ranks.copy_(mc_backend.active_ranks, True)
-            return
-
-        logger.info("active_ranks change, need to refresh expert rank table")
+    def refresh_expert_rank_table(self, dump_table_snapshot: bool = False):
         redundant_table_manger = self.worker.get_model().redundant_table_manger
 
-        dump_redundant_expert_table_snapshot(
-            fd_config=self.fd_config,
-            rank_expert_list=redundant_table_manger.model_ep_rank_to_expert_id_list,
-            logical_to_physical_map=redundant_table_manger.model_active_expert_id_to_ep_rank_array,
-            expert_count=redundant_table_manger.model_active_expert_in_rank_num_list,
-            source="active_table_before",
-            local_rank=self.fd_config.parallel_config.expert_parallel_rank,
-            clear_stat=False,
-        )
+        if dump_table_snapshot:
+            dump_redundant_expert_table_snapshot(
+                fd_config=self.fd_config,
+                rank_expert_list=redundant_table_manger.model_ep_rank_to_expert_id_list,
+                logical_to_physical_map=redundant_table_manger.model_active_expert_id_to_ep_rank_array,
+                expert_count=redundant_table_manger.model_active_expert_in_rank_num_list,
+                source="active_table_before",
+                local_rank=self.fd_config.parallel_config.expert_parallel_rank,
+                clear_stat=False,
+            )
 
-        redundant_table_manger.refresh_active_expert_rank_table_by_ranks(
-            mc_backend.last_active_ranks,
-            mc_backend.active_ranks,
-        )
+        redundant_table_manger.refresh_active_expert_rank_table()
 
-        dump_redundant_expert_table_snapshot(
-            fd_config=self.fd_config,
-            rank_expert_list=redundant_table_manger.model_ep_rank_to_expert_id_list,
-            logical_to_physical_map=redundant_table_manger.model_active_expert_id_to_ep_rank_array,
-            expert_count=redundant_table_manger.model_active_expert_in_rank_num_list,
-            source="active_table_after",
-            local_rank=self.fd_config.parallel_config.expert_parallel_rank,
-            clear_stat=False,
-        )
-        mc_backend.last_active_ranks.copy_(mc_backend.active_ranks, True)
+        if dump_table_snapshot:
+            dump_redundant_expert_table_snapshot(
+                fd_config=self.fd_config,
+                rank_expert_list=redundant_table_manger.model_ep_rank_to_expert_id_list,
+                logical_to_physical_map=redundant_table_manger.model_active_expert_id_to_ep_rank_array,
+                expert_count=redundant_table_manger.model_active_expert_in_rank_num_list,
+                source="active_table_after",
+                local_rank=self.fd_config.parallel_config.expert_parallel_rank,
+                clear_stat=False,
+            )
 
     def _run_eplb(self, tp_rank):
         """internal call to run eplb"""
         if not self.eplb_config.enable_eplb:
             return
 
-        # if self.fd_config.afd_config.enable_afd and self.fd_config.afd_config.afd_role != "attn":
-        if self.fd_config.afd_config.enable_afd:
-            self._maybe_refresh_eplb_expert_rank_table()
+        if (
+            self.fd_config.afd_config.enable_afd
+            and hasattr(self.worker.model_runner, "rank_liveness_changed")
+            and self.worker.model_runner.rank_liveness_changed
+        ):
+            self.refresh_expert_rank_table(dump_table_snapshot=False)
 
         rearrange_time = time.time()
         # Get expert load
