@@ -302,6 +302,7 @@ elif paddle.is_compiled_with_cuda():
         "gpu_ops/step_reschedule.cu",
         "gpu_ops/fused_get_rotary_embedding.cu",
         "gpu_ops/get_padding_offset.cu",
+        "gpu_ops/dbo_split_micro_inputs.cu",
         "gpu_ops/update_inputs.cu",
         "gpu_ops/update_inputs_beam.cu",
         "gpu_ops/beam_search_softmax.cu",

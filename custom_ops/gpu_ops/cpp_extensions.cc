@@ -429,6 +429,26 @@ std::vector<paddle::Tensor> GetPaddingOffset(
     const paddle::optional<paddle::Tensor>& seq_lens_encoder,
     const int64_t token_num_cpu);
 
+void BuildDboMicroInputs(const paddle::Tensor& ids_remove_padding,
+                         const paddle::Tensor& batch_id_per_token,
+                         const paddle::Tensor& cu_seqlens_q,
+                         const paddle::Tensor& seq_lens_this_time,
+                         const paddle::Tensor& seq_lens_decoder,
+                         const paddle::Tensor& a_ids,
+                         const paddle::Tensor& a_batch_id,
+                         const paddle::Tensor& a_cu_seqlens_q,
+                         const paddle::Tensor& a_cu_seqlens_k,
+                         const paddle::Tensor& a_seq_lens_this_time,
+                         const paddle::Tensor& a_seq_lens_decoder,
+                         const paddle::Tensor& b_ids,
+                         const paddle::Tensor& b_batch_id,
+                         const paddle::Tensor& b_cu_seqlens_q,
+                         const paddle::Tensor& b_cu_seqlens_k,
+                         const paddle::Tensor& b_seq_lens_this_time,
+                         const paddle::Tensor& b_seq_lens_decoder,
+                         const int token_num,
+                         const int split_token_num);
+
 void SetValueByFlagsAndIdx(const paddle::Tensor& token_ids_all,
                            const paddle::Tensor& input_ids,
                            const paddle::Tensor& seq_lens_this_time,
@@ -1540,6 +1560,14 @@ PYBIND11_MODULE(fastdeploy_ops, m) {
    * get_padding_offset
    */
   m.def("get_padding_offset", &GetPaddingOffset, "get_padding_offset function");
+
+  /**
+   * dbo_split_micro_inputs.cu
+   * build_dbo_micro_inputs
+   */
+  m.def("build_dbo_micro_inputs",
+        &BuildDboMicroInputs,
+        "build_dbo_micro_inputs function");
 
   /**
    * get_padding_offset.cu
