@@ -38,6 +38,13 @@ from fastdeploy.model_executor.guided_decoding import (
     LogitsProcessorBase,
     get_guided_backend,
 )
+from fastdeploy.model_executor.dual_batch_overlap.dbo_runner import (
+    assert_backend_supports_dbo,
+)
+from fastdeploy.model_executor.dual_batch_overlap.dbo_split import (
+    allocate_dbo_token_buffer,
+    build_dbo_micro_inputs,
+)
 from fastdeploy.model_executor.layers.attention import get_attention_backend
 from fastdeploy.model_executor.layers.attention.append_attn_backend import (
     allocate_launch_related_buffer,
@@ -214,6 +221,16 @@ class GPUModelRunner(ModelRunnerBase):
         # Initialize input batch
         self.share_inputs = InputBatch(self.fd_config)
         self.share_inputs.init_share_inputs()
+
+        if self.fd_config.afd_config.enable_dbo:
+            self.dbo_token_buffers = [
+                allocate_dbo_token_buffer(
+                    max_num_seqs=self.scheduler_config.max_num_seqs,
+                    decoder_step_token_num=self.speculative_config.num_speculative_tokens + 1,
+                )
+                for _ in range(2)
+            ]
+
         self.increment_value = (
             4 if not self.speculative_decoding else (self.speculative_config.num_speculative_tokens + 1) * 4
         )
@@ -1230,6 +1247,8 @@ class GPUModelRunner(ModelRunnerBase):
         token_num, real_bsz = self._resolve_current_launch_token_num(
             cached_token_num, cached_real_bsz, token_num_event, is_dummy_or_profile_run
         )
+        if self.fd_config.afd_config.enable_dbo and self.use_cudagraph:
+            token_num = self.graph_opt_config.real_shape_to_captured_size.get(token_num, token_num)
         (
             ids_remove_padding,
             batch_id_per_token,
@@ -1265,6 +1284,18 @@ class GPUModelRunner(ModelRunnerBase):
         # Initialize forward meta data
         self.initialize_forward_meta(is_dummy_or_profile_run=is_dummy_or_profile_run)
         self.forward_meta.real_bsz = real_bsz
+
+        if self.fd_config.afd_config.enable_dbo:
+            self.forward_meta.dbo_micro_inputs = build_dbo_micro_inputs(
+                self.share_inputs["ids_remove_padding"],
+                self.share_inputs["batch_id_per_token"],
+                self.share_inputs["seq_lens_this_time"],
+                self.share_inputs["seq_lens_decoder"],
+                self.share_inputs["cu_seqlens_q"],
+                token_num,
+                self.dbo_attn_buffers,
+                self.dbo_token_buffers,
+            )
 
         # Get sampling metadata
         self.sampling_metadata = SamplingMetadata(
@@ -1635,6 +1666,9 @@ class GPUModelRunner(ModelRunnerBase):
             for j in range(2):
                 GLOBAL_ATTN_BUFFERS[j] = allocate_launch_related_buffer(**buffer_kwargs)
 
+        if self.fd_config.afd_config.enable_dbo:
+            self.dbo_attn_buffers = [allocate_launch_related_buffer(**buffer_kwargs) for _ in range(2)]
+
         # Get the attention backend
         attn_cls = get_attention_backend()
         attn_backend = attn_cls(
@@ -1647,6 +1681,9 @@ class GPUModelRunner(ModelRunnerBase):
         )
 
         self.attn_backends.append(attn_backend)
+
+        if self.fd_config.afd_config.enable_dbo:
+            assert_backend_supports_dbo(attn_backend)
 
     def _dummy_pooler_run_task(
         self,

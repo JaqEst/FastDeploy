@@ -823,12 +823,15 @@ class AFDConfig:
         self.inst_first_rank = 0
         self.inst_last_rank = 1
         self.attn_inst_size = 1
+        self.enable_dbo = False
 
         for key, value in args.items():
             if hasattr(self, key) and value != "None":
                 setattr(self, key, value)
 
         if not self.enable_afd:
+            if self.enable_dbo:
+                raise ValueError("AFDConfig.enable_dbo requires afd_role to be 'attn' or 'ffn'.")
             return
 
         if not(os.getenv("GATHERED_AFD_ROLE", None) and os.getenv("GATHERED_TENSOR_PARALLEL_SIZE", None)):
@@ -894,13 +897,6 @@ class AFDConfig:
 
         self.num_local_physical_experts = self.num_ffn_physical_experts // self.num_ffn_ranks
         self.num_physical_experts = self.num_local_physical_experts * self.afd_world_size
-
-        self.static_log2phy = []
-        for logical_id in range(num_logical_experts):
-            ffn_rank_index = logical_id // self.num_local_physical_experts
-            ffn_global_rank = self.ffn_ranks[ffn_rank_index]
-            local_offset = logical_id % self.num_local_physical_experts
-            self.static_log2phy.append(ffn_global_rank * self.num_local_physical_experts + local_offset)
 
     def print(self):
         logger.info("AFD Configuration Information :")
@@ -2373,18 +2369,30 @@ class FDConfig:
         else:
             raise NotImplementedError
 
+        if self.afd_config.enable_dbo and self.graph_opt_config.use_cudagraph:
+            # Both AFD roles issue one dispatch/combine pair per micro-batch, so a
+            # shape only one side captured leaves the other waiting on a peer that
+            # never sends. Even shapes also keep both micro-batches non-degenerate.
+            self.graph_opt_config.filter_capture_size(tp_size=2)
+
         if self.parallel_config.use_sequence_parallel_moe and self.graph_opt_config.use_cudagraph:
-            if self.scheduler_config.max_num_seqs < self.parallel_config.tensor_parallel_size:
+            # DBO halves the batch before the sequence-parallel split, so it is the
+            # micro-batch, not the batch, that has to cover the TP ranks.
+            dbo_factor = 2 if self.afd_config.enable_dbo else 1
+            # Both AFD roles must reach the same verdict, so both read the ATTN
+            # instance size rather than their own mesh.
+            tp_size = self.parallel_config.tensor_parallel_size
+            if self.afd_config.enable_afd:
+                tp_size = self.afd_config.attn_inst_size
+            min_num_seqs = tp_size * dbo_factor
+            if self.scheduler_config.max_num_seqs < min_num_seqs:
                 self.parallel_config.use_sequence_parallel_moe = False
                 logger.info(
-                    "Warning: sequence parallel moe do not support max_num_seqs < tensor_parallel_size when cudagraph enabled. We set use_sequence_parallel_moe to False."
+                    f"Warning: sequence parallel moe do not support max_num_seqs < {min_num_seqs} when cudagraph enabled. We set use_sequence_parallel_moe to False."
                 )
             else:
-                tp_size = self.parallel_config.tensor_parallel_size
-                if self.afd_config is not None and self.afd_config.is_ffn:
-                    tp_size = self.afd_config.attn_inst_size
                 # It will hang when real batch_size < tp_size
-                self.graph_opt_config.filter_capture_size(tp_size=tp_size)
+                self.graph_opt_config.filter_capture_size(tp_size=min_num_seqs)
 
         if ErnieArchitectures.is_ernie5_arch(self.model_config.architectures):
             # ernie5 model not support chunked_mm_input

@@ -371,8 +371,8 @@ class PaddleDisWorkerProc:
         """
         import time
 
+        redundant_table_manger = self.worker.get_model().redundant_table_manger
         if self.fd_config.afd_config.is_attn:
-            redundant_table_manger = self.worker.get_model().redundant_table_manger
             if redundant_table_manger is None:
                 raise RuntimeError("AFD ATTN EPLB update requires a redundant table manager.")
             rank_expert_list, logical_to_physical_map, expert_count = (
@@ -398,9 +398,8 @@ class PaddleDisWorkerProc:
                 break
         state_dicts = load_tensor_from_shm_mem(self.experts_manager.tensor_infos, mmap_infos[MODEL_MAIN_NAME], logger)
         rank_expert_list, logical_to_physical_map, expert_count = self.experts_manager.get_ep_rank_to_expert_id_list()
-        self.worker.get_model().redundant_table_manger.update_expert_rank_table(
-            rank_expert_list, logical_to_physical_map, expert_count
-        )
+        redundant_table_manger.update_expert_rank_table(rank_expert_list, logical_to_physical_map, expert_count)
+        redundant_table_manger.refresh_active_expert_rank_table()
         # TO BE FIXED
         self.worker.get_model().update_state_dict(state_dicts)
         self.experts_manager.tensor_infos = None
@@ -1025,6 +1024,11 @@ def parse_args():
     parser.add_argument("--ninsts", type=int, default=1, help="AFD instance count.")
     parser.add_argument("--inst_rank", type=int, default=0, help="AFD instance rank.")
     parser.add_argument(
+        "--enable_dbo",
+        action="store_true",
+        help="Enable AFD dual-batch overlap.",
+    )
+    parser.add_argument(
         "--tensor_parallel_size",
         type=int,
         default=1,
@@ -1348,6 +1352,11 @@ def initialize_fd_config(
         )
         num_redundant_experts = eplb_config.redundant_experts_num if eplb_config.enable_eplb else 0
         afd_config.set_expert_layout(num_logical_experts, num_redundant_experts)
+        # The token dimension is sharded by the ATTN instance, so both roles must
+        # decide this from the ATTN instance size.
+        parallel_config.use_sequence_parallel_moe = (
+            parallel_config.use_sequence_parallel_moe and afd_config.attn_inst_size > 1
+        )
 
     local_rank = global_rank
     if afd_config.enable_afd:

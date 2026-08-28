@@ -2668,6 +2668,8 @@ class EngineService:
                 f" --ninsts {self.cfg.afd_config.ninsts}"
                 f" --inst_rank {self.cfg.afd_config.inst_rank}"
             )
+            if self.cfg.afd_config.enable_dbo:
+                arguments += " --enable_dbo"
 
         if ips is not None:
             arguments += f" --ips {ips}"

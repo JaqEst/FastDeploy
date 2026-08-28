@@ -324,6 +324,11 @@ class EngineArgs:
     AFD role: attn, ffn, or None (disabled).
     """
 
+    enable_dbo: bool = False
+    """
+    Enable AFD dual-batch overlap; only valid together with afd_role.
+    """
+
     data_parallel_size: int = 1
     """
     Number of data parallelism.
@@ -653,6 +658,8 @@ class EngineArgs:
                 raise ValueError(
                     f"inst_rank must be in [0, {self.ninsts}), got {self.inst_rank}"
                 )
+        elif self.enable_dbo:
+            raise ValueError("enable_dbo requires afd_role to be set to 'attn' or 'ffn'")
 
         if not (
             current_platform.is_cuda()
@@ -1327,6 +1334,13 @@ class EngineArgs:
             type=int,
             default=EngineArgs.inst_rank,
             help="Current api_server instance rank in the AFD world.",
+        )
+        afd_group.add_argument(
+            "--afd-enable-dbo",
+            dest="enable_dbo",
+            action="store_true",
+            default=EngineArgs.enable_dbo,
+            help="Enable AFD dual-batch overlap. All AFD participants must set it identically.",
         )
 
         splitwise_group.add_argument(

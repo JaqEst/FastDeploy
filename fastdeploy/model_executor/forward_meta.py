@@ -124,6 +124,9 @@ class ForwardMeta:
 
     decoder_chunk_size_device: Optional[paddle.Tensor] = None
 
+    # Per-micro-batch ForwardMeta overrides for AFD dual-batch overlap.
+    dbo_micro_inputs: Optional[list] = None
+
     # Sequence length of encoder for ever batch
     seq_lens_encoder: Optional[paddle.Tensor] = None
     # Sequence length of Encoder for ever batch
