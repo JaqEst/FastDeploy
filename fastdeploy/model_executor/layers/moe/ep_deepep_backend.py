@@ -656,8 +656,12 @@ class DeepEPDecoderRunner(DeepEPRunner):
         use_fp8: bool = False,
         quant_group_size: int = 128,
         use_ue8m0: bool = False,
+        return_hook: bool = False,
         **kwargs,
     ):
+        assert not (
+            return_hook and self.use_internode_ll_two_stage
+        ), "return_hook does not support internode_ll_two_stage yet."
         if not self.use_internode_ll_two_stage:
             recv_hidden_states, recv_expert_count, handle, dispatch_hook = self.ep_engine.low_latency_dispatch(
                 x, topk_idx, expertwise_scale, use_fp8, quant_group_size, use_ue8m0
@@ -670,12 +674,26 @@ class DeepEPDecoderRunner(DeepEPRunner):
                     x, topk_idx, topk_weights, expertwise_scale, use_fp8, quant_group_size
                 )
             )
+        if return_hook:
+            return recv_hidden_states, recv_expert_count, handle, dispatch_hook
         if dispatch_hook is not None:
             dispatch_hook()
 
         return recv_hidden_states, recv_expert_count, handle
 
-    def combine(self, ffn_out, topk_idx, topk_weights, handle, quant_group_size: int = 128, **kwargs):
+    def combine(
+        self,
+        ffn_out,
+        topk_idx,
+        topk_weights,
+        handle,
+        quant_group_size: int = 128,
+        return_hook: bool = False,
+        **kwargs,
+    ):
+        assert not (
+            return_hook and self.use_internode_ll_two_stage
+        ), "return_hook does not support internode_ll_two_stage yet."
         if not self.use_internode_ll_two_stage:
             combined_hidden_states, combine_hook = self.ep_engine.low_latency_combine(
                 ffn_out, topk_idx, topk_weights, handle
@@ -689,6 +707,8 @@ class DeepEPDecoderRunner(DeepEPRunner):
                 quant_group_size,
                 handle,  # just supports dispatch_use_fp8 = True now!
             )
+        if return_hook:
+            return combined_hidden_states, combine_hook
         if combine_hook is not None:
             combine_hook()
 

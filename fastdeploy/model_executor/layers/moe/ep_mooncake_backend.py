@@ -189,20 +189,34 @@ class MooncakeEPDecoderRunner(MooncakeEPRunner):
         topk_weights: paddle.Tensor,
         timeout: int = -1,
         use_fp8: bool = False,
+        return_hook: bool = False,
         **kwargs,
     ):
         recv_hidden_states, recv_expert_count, handle, dispatch_hook = (
             self.ep_engine.low_latency_dispatch(x, topk_idx, use_fp8=use_fp8, timeout=timeout)
         )
+        if return_hook:
+            return recv_hidden_states, recv_expert_count, handle, dispatch_hook
         if dispatch_hook is not None:
             dispatch_hook()
 
         return recv_hidden_states, recv_expert_count, handle
 
-    def combine(self, ffn_out, topk_idx, topk_weights, handle, timeout: int = -1, **kwargs):
+    def combine(
+        self,
+        ffn_out,
+        topk_idx,
+        topk_weights,
+        handle,
+        timeout: int = -1,
+        return_hook: bool = False,
+        **kwargs,
+    ):
         combined_hidden_states, combine_hook = (
             self.ep_engine.low_latency_combine(ffn_out, topk_idx, topk_weights, handle, timeout=timeout)
         )
+        if return_hook:
+            return combined_hidden_states, combine_hook
         if combine_hook is not None:
             combine_hook()
 
