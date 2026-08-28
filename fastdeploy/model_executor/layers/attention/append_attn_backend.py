@@ -118,6 +118,7 @@ class AppendAttentionBackend(AttentionBackend):
     __infer_dynamic_dims_fields__ = ["attention_metadata"]
     attention_metadata: AppendAttentionMetadata
     enable_ids_reorder: bool = envs.FD_PD_REORDER
+    supports_dbo: bool = True
 
     def __init__(
         self,
@@ -270,6 +271,30 @@ class AppendAttentionBackend(AttentionBackend):
         value_cache_shape = key_cache_shape
         return key_cache_shape, value_cache_shape
 
+    def plan_split_kv_block(self, forward_meta: ForwardMeta):
+        """Fill ``forward_meta``'s split-kv launch buffers for this step's shape."""
+        get_block_shape_and_split_kv_block(
+            forward_meta.seq_lens_encoder,
+            forward_meta.seq_lens_decoder,
+            forward_meta.seq_lens_this_time,
+            forward_meta.decoder_batch_ids,
+            forward_meta.decoder_tile_ids_per_batch,
+            forward_meta.decoder_num_blocks_cpu,
+            forward_meta.decoder_num_blocks_device,
+            forward_meta.decoder_chunk_size_device,
+            forward_meta.max_len_tensor_cpu,
+            forward_meta.encoder_batch_ids,
+            forward_meta.encoder_tile_ids_per_batch,
+            forward_meta.encoder_num_blocks_x_cpu,
+            forward_meta.kv_batch_ids,
+            forward_meta.kv_tile_ids_per_batch,
+            forward_meta.kv_num_blocks_x_cpu,
+            self.encoder_block_shape_q,
+            self.decoder_block_shape_q,
+            self.group_size,
+            self.block_size,
+        )
+
     def forward_mixed(
         self,
         q: paddle.Tensor,
@@ -326,27 +351,7 @@ class AppendAttentionBackend(AttentionBackend):
             cache_v_scales = getattr(layer, "cache_v_scale", None)
 
         if layer.layer_id == 0:
-            get_block_shape_and_split_kv_block(
-                forward_meta.seq_lens_encoder,
-                forward_meta.seq_lens_decoder,
-                forward_meta.seq_lens_this_time,
-                forward_meta.decoder_batch_ids,
-                forward_meta.decoder_tile_ids_per_batch,
-                forward_meta.decoder_num_blocks_cpu,
-                forward_meta.decoder_num_blocks_device,
-                forward_meta.decoder_chunk_size_device,
-                forward_meta.max_len_tensor_cpu,
-                forward_meta.encoder_batch_ids,
-                forward_meta.encoder_tile_ids_per_batch,
-                forward_meta.encoder_num_blocks_x_cpu,
-                forward_meta.kv_batch_ids,
-                forward_meta.kv_tile_ids_per_batch,
-                forward_meta.kv_num_blocks_x_cpu,
-                self.encoder_block_shape_q,
-                self.decoder_block_shape_q,
-                self.group_size,
-                self.block_size,
-            )
+            self.plan_split_kv_block(forward_meta)
 
         if self.use_output:
             quant_max_bound = getattr(layer, "quant_max_bound", 0.0)

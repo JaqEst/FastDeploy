@@ -37,10 +37,16 @@ class AttentionMetadata(ABC):
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    supports_dbo: bool = False
+
     @abstractmethod
     def init_attention_metadata(self, forward_meta: ForwardMeta):
         """Initialize the forward metadata."""
         raise NotImplementedError
+
+    def plan_split_kv_block(self, forward_meta: ForwardMeta):
+        """Fill ``forward_meta``'s split-kv launch buffers for this step's shape."""
+        pass
 
     def forward(
         self,

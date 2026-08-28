@@ -323,6 +323,30 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.attention_metadata = metadata
 
+    def plan_split_kv_block(self, forward_meta: ForwardMeta):
+        """Fill ``forward_meta``'s split-kv launch buffers for this step's shape."""
+        get_block_shape_and_split_kv_block(
+            forward_meta.seq_lens_encoder,
+            forward_meta.seq_lens_decoder,
+            forward_meta.seq_lens_this_time,
+            forward_meta.decoder_batch_ids,
+            forward_meta.decoder_tile_ids_per_batch,
+            forward_meta.decoder_num_blocks_cpu,
+            forward_meta.decoder_num_blocks_device,
+            forward_meta.decoder_chunk_size_device,
+            forward_meta.max_len_tensor_cpu,
+            forward_meta.encoder_batch_ids,
+            forward_meta.encoder_tile_ids_per_batch,
+            forward_meta.encoder_num_blocks_x_cpu,
+            forward_meta.kv_batch_ids,
+            forward_meta.kv_tile_ids_per_batch,
+            forward_meta.kv_num_blocks_x_cpu,
+            self.encoder_block_shape_q,
+            self.decoder_block_shape_q,
+            self.group_size,
+            self.block_size,
+        )
+
     def forward_mixed(
         self,
         q: paddle.Tensor,
@@ -367,27 +391,7 @@ class FlashAttentionBackend(AttentionBackend):
             cache_v_scales = getattr(layer, "cache_v_scale", None)
 
         if layer.layer_id == 0:
-            get_block_shape_and_split_kv_block(
-                forward_meta.seq_lens_encoder,
-                forward_meta.seq_lens_decoder,
-                forward_meta.seq_lens_this_time,
-                forward_meta.decoder_batch_ids,
-                forward_meta.decoder_tile_ids_per_batch,
-                forward_meta.decoder_num_blocks_cpu,
-                forward_meta.decoder_num_blocks_device,
-                forward_meta.decoder_chunk_size_device,
-                forward_meta.max_len_tensor_cpu,
-                forward_meta.encoder_batch_ids,
-                forward_meta.encoder_tile_ids_per_batch,
-                forward_meta.encoder_num_blocks_x_cpu,
-                forward_meta.kv_batch_ids,
-                forward_meta.kv_tile_ids_per_batch,
-                forward_meta.kv_num_blocks_x_cpu,
-                self.encoder_block_shape_q,
-                self.decoder_block_shape_q,
-                self.group_size,
-                self.block_size,
-            )
+            self.plan_split_kv_block(forward_meta)
 
             if forward_meta.max_len_tensor_cpu[1].item() > 0:
 

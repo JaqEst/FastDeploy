@@ -321,24 +321,8 @@ class MLAAttentionBackend(AttentionBackend):
                     "The current platform does not support Flash Attention V3, so Flash Attention V2 will be used instead."
                 )
 
-    def init_attention_metadata(self, forward_meta: ForwardMeta):
-        """Initialize attention metadata hence all layers in the forward pass can reuse it."""
-        metadata = MLAAttentionMetadata()
-        metadata.max_partition_size = 32768
-        metadata.encoder_max_partition_size = self.max_seq_len
-        metadata._dtype = paddle.get_default_dtype()
-        if metadata._dtype == "bfloat16":
-            metadata._fuse_kernel_compute_dtype = "bf16"
-        elif metadata._dtype == "float16":
-            metadata._fuse_kernel_compute_dtype = "fp16"
-        elif metadata._dtype == "float32":
-            metadata._fuse_kernel_compute_dtype = "fp32"
-
-        metadata.block_tables = forward_meta.block_tables
-        metadata.rotary_embs = forward_meta.rotary_embs
-        metadata.attn_mask = forward_meta.attn_mask
-        metadata.pre_caches_length = forward_meta.pre_caches_length
-
+    def plan_split_kv_block(self, forward_meta: ForwardMeta):
+        """Fill ``forward_meta``'s split-kv launch buffers for this step's shape."""
         get_block_shape_and_split_kv_block(
             forward_meta.seq_lens_encoder,
             forward_meta.seq_lens_decoder,
@@ -360,6 +344,26 @@ class MLAAttentionBackend(AttentionBackend):
             -1,  # not need.
             self.block_size,
         )
+
+    def init_attention_metadata(self, forward_meta: ForwardMeta):
+        """Initialize attention metadata hence all layers in the forward pass can reuse it."""
+        metadata = MLAAttentionMetadata()
+        metadata.max_partition_size = 32768
+        metadata.encoder_max_partition_size = self.max_seq_len
+        metadata._dtype = paddle.get_default_dtype()
+        if metadata._dtype == "bfloat16":
+            metadata._fuse_kernel_compute_dtype = "bf16"
+        elif metadata._dtype == "float16":
+            metadata._fuse_kernel_compute_dtype = "fp16"
+        elif metadata._dtype == "float32":
+            metadata._fuse_kernel_compute_dtype = "fp32"
+
+        metadata.block_tables = forward_meta.block_tables
+        metadata.rotary_embs = forward_meta.rotary_embs
+        metadata.attn_mask = forward_meta.attn_mask
+        metadata.pre_caches_length = forward_meta.pre_caches_length
+
+        self.plan_split_kv_block(forward_meta)
         # MLA
         metadata.max_enc_len_this_time = forward_meta.max_len_tensor_cpu[1]
         metadata.max_dec_len_this_time = forward_meta.max_len_tensor_cpu[2]
