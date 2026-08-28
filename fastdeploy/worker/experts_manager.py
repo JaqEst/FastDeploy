@@ -111,9 +111,6 @@ class RedundantExpertManger:
 
         self.update_expert_rank_table(rank_expert_list, logical_to_physical_map, expert_count, False)
 
-        self.model_active_expert_id_to_ep_rank_array.copy_(self.model_expert_id_to_ep_rank_array, True)
-        self.model_active_expert_in_rank_num_list.copy_(self.model_expert_in_rank_num_list, True)
-
         logger.info(
             f"moe experts table manager init successfully, ep_size {ep_size} \
             num_replicas {self.num_replicas} export_per_rank {self.export_per_rank}"
@@ -134,19 +131,6 @@ class RedundantExpertManger:
     ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, paddle.Tensor]:
         """
         get_ep_rank_to_expert_id_list_by_layer
-        """
-        return (
-            self.model_ep_rank_to_expert_id_list[layer_id],
-            self.model_expert_id_to_ep_rank_array[layer_id],
-            self.model_expert_in_rank_num_list[layer_id],
-            self.model_tokens_per_expert_stats_list[layer_id],
-        )
-
-    def get_active_ep_rank_to_expert_id_list_by_layer(
-        self, layer_id: int
-    ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, paddle.Tensor]:
-        """
-        get_active_ep_rank_to_expert_id_list_by_layer
         """
         return (
             self.model_ep_rank_to_expert_id_list[layer_id],
@@ -231,6 +215,9 @@ class RedundantExpertManger:
             logical_to_physical_map
         )
         self.model_expert_in_rank_num_list.copy_(paddle.to_tensor(expert_count), True)
+
+        self.model_active_expert_id_to_ep_rank_array.copy_(self.model_expert_id_to_ep_rank_array, True)
+        self.model_active_expert_in_rank_num_list.copy_(self.model_expert_in_rank_num_list, True)
 
         if self.fd_config is not None and clear_stat:
             try:
