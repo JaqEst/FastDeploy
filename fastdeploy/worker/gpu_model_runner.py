@@ -38,9 +38,6 @@ from fastdeploy.model_executor.guided_decoding import (
     LogitsProcessorBase,
     get_guided_backend,
 )
-from fastdeploy.model_executor.dual_batch_overlap.dbo_runner import (
-    assert_backend_supports_dbo,
-)
 from fastdeploy.model_executor.dual_batch_overlap.dbo_split import (
     allocate_dbo_token_buffer,
     build_dbo_micro_inputs,
@@ -213,7 +210,7 @@ class GPUModelRunner(ModelRunnerBase):
 
         # CUDA Graph
         self.use_cudagraph = self.graph_opt_config.use_cudagraph
-        self.cudagraph_capture_sizes = list(reversed(self.graph_opt_config.cudagraph_capture_sizes))
+        self.cudagraph_capture_sizes = sorted(list(self.graph_opt_config.cudagraph_capture_sizes), reverse=True)
         self.cudagraph_capture_sizes_prefill = list(reversed(self.graph_opt_config.cudagraph_capture_sizes_prefill))
         self.sot_warmup_sizes = self.graph_opt_config.sot_warmup_sizes
         self.cudagraph_only_prefill = self.graph_opt_config.cudagraph_only_prefill
@@ -1247,6 +1244,11 @@ class GPUModelRunner(ModelRunnerBase):
         token_num, real_bsz = self._resolve_current_launch_token_num(
             cached_token_num, cached_real_bsz, token_num_event, is_dummy_or_profile_run
         )
+        if token_num == 0 and self.use_cudagraph and self.parallel_config.use_ep and not is_dummy_or_profile_run:
+            # An idle EP rank still runs the model to stay in step with the busy ranks.
+            # Pad it to the smallest captured shape so it replays instead of pacing the
+            # group with an eager step.
+            token_num = self.cudagraph_capture_sizes[-1]    # min graph shape
         if self.fd_config.afd_config.enable_dbo and self.use_cudagraph:
             token_num = self.graph_opt_config.real_shape_to_captured_size.get(token_num, token_num)
         (
@@ -1339,7 +1341,7 @@ class GPUModelRunner(ModelRunnerBase):
         ):
             token_num_event.synchronize()
 
-        token_num = sorted(self.cudagraph_capture_sizes, reverse=True)[0]
+        token_num = self.cudagraph_capture_sizes[0]    # max graph shape
         ids_remove_padding = paddle.empty([token_num], dtype=paddle.int64, device=self.device)
         self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
 
@@ -1682,8 +1684,12 @@ class GPUModelRunner(ModelRunnerBase):
 
         self.attn_backends.append(attn_backend)
 
-        if self.fd_config.afd_config.enable_dbo:
-            assert_backend_supports_dbo(attn_backend)
+        if self.fd_config.afd_config.enable_dbo and not getattr(attn_backend, "supports_dbo", False):
+            raise NotImplementedError(
+                f"{type(attn_backend).__name__} is not validated for AFD DBO. The backend must plan "
+                "every ForwardMeta it is handed and must not cache per-step values on itself. Set "
+                "supports_dbo = True once verified, or disable afd_config.enable_dbo."
+            )
 
     def _dummy_pooler_run_task(
         self,
