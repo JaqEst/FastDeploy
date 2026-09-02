@@ -141,11 +141,13 @@ class MoEMethodBase(QuantMethodBase):
                     **common_args,
                     use_internode_ll_two_stage=layer.fd_config.parallel_config.use_internode_ll_two_stage,
                     prefill_num_worst_tokens=prefill_num_worst_tokens,
+                    is_extension=config.launch_config.is_extension,
                 )
             else:
                 self.ep_decoder_runner = self.EPDecoderRunner(
                     **common_args,
                     use_internode_ll_two_stage=layer.fd_config.parallel_config.use_internode_ll_two_stage,
+                    is_extension=config.launch_config.is_extension,
                 )
         else:
             if phase == "prefill":

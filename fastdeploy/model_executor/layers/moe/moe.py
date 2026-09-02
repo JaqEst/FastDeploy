@@ -269,7 +269,14 @@ class FusedMoE(nn.Layer):
             self.quant_method = get_moe_method(self)
         assert self.quant_method is not None, "self.quant_method should not be None"
         self.is_rearrange = False
-        if self.ep_size > 1 and not fd_config.afd_config.enable_afd:
+        # AFD role trimming. ATTN owns the gate and dispatch/combine but no expert
+        # weights; FFN owns the experts but receives routing from the ATTN worker.
+        self.afd_skip_ffn = fd_config.afd_config.is_attn
+        self.afd_skip_gate = fd_config.afd_config.is_ffn
+        # Per-step EP dispatch/combine timeout, refreshed in forward(). -1 leaves the
+        # backend default; only the mooncake EP backend honours it today.
+        self.timeout_us = -1
+        if self.ep_size > 1:
             self.quant_method.init_ep(self)
         self.enable_routing_replay = fd_config.routing_replay_config.enable_routing_replay
         # Merge normal and RL build model
@@ -277,14 +284,26 @@ class FusedMoE(nn.Layer):
             self.gate_correction_bias = gate_correction_bias
         else:
             self.gate_correction_bias = None
-        self.quant_method.create_weights(
-            self,
-            weight_loader=self.weight_loader,
-            model_format=fd_config.model_config.model_format if model_format is None else model_format,
-            num_experts=self.num_local_experts if self.ep_size > 1 else self.num_experts,
-            hidden_size=self.hidden_size,
-            moe_intermediate_size=self.moe_intermediate_size,
-        )
+        if self.afd_skip_ffn:
+            # ATTN worker: dispatch/combine only, the expert weights live on the FFN workers.
+            self.up_gate_proj_weight = None
+            self.down_proj_weight = None
+        else:
+            self.quant_method.create_weights(
+                self,
+                weight_loader=self.weight_loader,
+                model_format=fd_config.model_config.model_format if model_format is None else model_format,
+                num_experts=self.num_local_experts if self.ep_size > 1 else self.num_experts,
+                hidden_size=self.hidden_size,
+                moe_intermediate_size=self.moe_intermediate_size,
+            )
+
+        if self.afd_skip_gate:
+            # FFN worker: routing is decided on the ATTN worker, so dispatch is called
+            # with empty local tokens and placeholder routing of the right dtype/width.
+            self.afd_dummy_x = paddle.empty([0, self.hidden_size], dtype=self._dtype)
+            self.afd_dummy_topk_idx = paddle.empty([0, self.top_k], dtype=paddle.int64)
+            self.afd_dummy_topk_weights = paddle.empty([0, self.top_k], dtype=paddle.float32)
 
         logger.info(
             f"{moe_tag}MoE config is {num_experts=}, "
@@ -759,6 +778,9 @@ class FusedMoE(nn.Layer):
             Tensor: Output tensor.s
 
         """
+        if forward_meta is not None and forward_meta.timeout_us:
+            self.timeout_us = forward_meta.timeout_us
+
         topk_ids_hookfunc = None
         if self.enable_routing_replay:
             # When execute empty_input_forward forward_meta is None. When execute mtp layer routing_replay_table is None.

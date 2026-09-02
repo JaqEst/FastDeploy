@@ -253,6 +253,8 @@ def process_final_after_loading(model, fd_config: FDConfig):
     for name, sublayer in model.named_sublayers():
         if isinstance(sublayer, KVBatchLinear):
             continue
+        if getattr(sublayer, "afd_skip_ffn", False):
+            continue
         quant_method = getattr(sublayer, "quant_method", None)
         if quant_method is not None:
             unquant_moe_layer = get_moe_method()

@@ -23,6 +23,12 @@ from paddleformers.utils.log import logger
 
 import fastdeploy
 from fastdeploy.platforms import current_platform
+from fastdeploy.model_executor.dual_batch_overlap.dbo_wrapper import (
+    dbo_enabled,
+    dbo_maybe_run_recv_hook,
+    dbo_register_recv_hook,
+    dbo_yield,
+)
 
 from ..utils import get_tensor, group_wise_int4_weight_quantize, pack, rotate_model
 from .fused_moe_backend_base import UnquantizedFusedMoEMethod
@@ -258,14 +264,21 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
         """
         Apply the EP decoder method.
         """
-        gate_out = gate(x)
-        gate_out = gate_out.cast("float32")
-        estimate_total_token_nums = gate_out.shape[0] * layer.top_k
-        # 1. Select topk experts and weights
-        topk_idx, topk_weights = self.ep_decoder_runner.moe_select(layer, gate_out)
+        split_comm = dbo_enabled()
 
-        if topk_ids_hookfunc is not None:
-            topk_ids_hookfunc(topk_ids=topk_idx)
+        if layer.afd_skip_gate:
+            x = layer.afd_dummy_x
+            topk_idx = layer.afd_dummy_topk_idx
+            topk_weights = layer.afd_dummy_topk_weights
+        else:
+            gate_out = gate(x)
+            gate_out = gate_out.cast("float32")
+            estimate_total_token_nums = gate_out.shape[0] * layer.top_k
+            # 1. Select topk experts and weights
+            topk_idx, topk_weights = self.ep_decoder_runner.moe_select(layer, gate_out)
+
+            if topk_ids_hookfunc is not None:
+                topk_ids_hookfunc(topk_ids=topk_idx)
 
         expertwise_scale = None
         if hasattr(layer, "up_gate_proj_in_scale_all_experts"):  # only use in w4a8
@@ -273,40 +286,71 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
         use_fp8 = self.moe_quant_type == "w4afp8"
         quant_group_size = -1 if self.moe_quant_type == "w4afp8" else 128
         # 2. EP Dispatch
-        permute_input, token_nums_per_expert, handle = self.ep_decoder_runner.dispatch(
+        dbo_maybe_run_recv_hook()
+        dispatched = self.ep_decoder_runner.dispatch(
             x,
             topk_idx,
             topk_weights,
             expertwise_scale=expertwise_scale,
             use_fp8=use_fp8,
             quant_group_size=quant_group_size,
+            return_hook=split_comm,
+            timeout=layer.timeout_us,
         )
+        if split_comm:
+            permute_input, token_nums_per_expert, handle, dispatch_hook = dispatched
+            dbo_register_recv_hook(dispatch_hook)
+        else:
+            permute_input, token_nums_per_expert, handle = dispatched
+        dbo_yield()
         dequant_scale = None
         if self.moe_quant_type == "w4afp8" and expertwise_scale is None:
             (permute_input, dequant_scale) = permute_input
-        # 3. Compute ffn
-        if self.moe_quant_type == "w4a8" or self.moe_quant_type == "w4afp8":
-            num_local_experts, max_num, _ = permute_input.shape
-            expert_idx_per_token = paddle.arange(num_local_experts)[:, None].tile([1, max_num])
-        elif self.moe_quant_type in ["weight_only_int8", "weight_only_int4", "w16a16"]:
-            expert_idx_per_token = None
-        else:
-            raise NotImplementedError
 
-        ffn_out = self.compute_ffn(
-            layer,
-            permute_input,
-            token_nums_per_expert.cast("int64"),
-            expert_idx_per_token,
-            True,
-            estimate_total_token_nums,
-            dequant_scale,
-        )
+        if layer.afd_skip_ffn:
+            ffn_out = permute_input
+        else:
+            # 3. Compute ffn
+            if self.moe_quant_type == "w4a8" or self.moe_quant_type == "w4afp8":
+                num_local_experts, max_num, _ = permute_input.shape
+                expert_idx_per_token = paddle.arange(num_local_experts)[:, None].tile([1, max_num])
+            elif self.moe_quant_type in ["weight_only_int8", "weight_only_int4", "w16a16"]:
+                expert_idx_per_token = None
+            else:
+                raise NotImplementedError
+
+            if layer.afd_skip_gate:
+                # No gate output to size this from; every received slot is a candidate.
+                estimate_total_token_nums = permute_input.shape[0] * permute_input.shape[1]
+
+            ffn_out = self.compute_ffn(
+                layer,
+                permute_input,
+                token_nums_per_expert.cast("int64"),
+                expert_idx_per_token,
+                True,
+                estimate_total_token_nums,
+                dequant_scale,
+            )
 
         # 4. EP combine
-        return self.ep_decoder_runner.combine(
-            ffn_out, topk_idx, topk_weights, handle, quant_group_size=quant_group_size
+        dbo_maybe_run_recv_hook()
+        combined = self.ep_decoder_runner.combine(
+            ffn_out,
+            topk_idx,
+            topk_weights,
+            handle,
+            quant_group_size=quant_group_size,
+            return_hook=split_comm,
+            timeout=layer.timeout_us,
         )
+        if split_comm:
+            out, combine_hook = combined
+            dbo_register_recv_hook(combine_hook)
+        else:
+            out = combined
+        dbo_yield()
+        return out
 
     def apply_tp(
         self,
