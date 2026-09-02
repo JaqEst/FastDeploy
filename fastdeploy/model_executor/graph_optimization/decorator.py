@@ -54,6 +54,8 @@ def support_graph_optimization(cls: Optional[_T] = None) -> _T:
         """Decorator model.__init__() func"""
         origin_init(self, fd_config=fd_config, **kwargs)
         self.use_graph_opt = fd_config.graph_opt_config.graph_opt_level > 0 or fd_config.graph_opt_config.use_cudagraph
+        if fd_config.afd_config.enable_dbo and not self.use_graph_opt:
+            raise NotImplementedError("AFD DBO requires CUDA Graph; enable use_cudagraph or disable enable_dbo.")
         if self.use_graph_opt:
             GraphOptWrapper.__init__(self, fd_config=fd_config, graph_opt_backend=None)
         else:
@@ -81,7 +83,14 @@ class GraphOptWrapper:
         fd_config: FDConfig = None,
     ):
         if graph_opt_backend is None:
-            graph_opt_backend = GraphOptBackend(self.forward, fd_config)
+            runnable = self.forward
+            if fd_config.afd_config.enable_dbo:
+                from fastdeploy.model_executor.dual_batch_overlap.dbo_wrapper import (
+                    DBOWrapper,
+                )
+
+                runnable = DBOWrapper(runnable, fd_config)
+            graph_opt_backend = GraphOptBackend(runnable, fd_config)
         self.graph_opt_backend = graph_opt_backend
 
     @abstractmethod

@@ -12,66 +12,94 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the AFD dual-batch overlap driver and batch split.
-
-The schedule tests need no GPU: the stages only record themselves, so the
-ordering invariants are checked against the resulting op log.  The split tests
-do run paddle ops.
-"""
-
+import threading
 import unittest
+from types import SimpleNamespace
 
-from fastdeploy.model_executor.dual_batch_overlap.dbo_runner import (
-    DBOMicroState,
-    assert_supports_dbo,
-    run_dbo_pipeline,
+import paddle
+
+from fastdeploy.model_executor.dual_batch_overlap.dbo_wrapper import (
+    DBOWrapper,
+    dbo_enabled,
+    dbo_maybe_run_recv_hook,
+    dbo_register_recv_hook,
+    dbo_yield,
 )
 
 
-class FakeDBOLayer:
-    supports_dbo = True
+def make_config(enable_dbo=True, is_ffn=False):
+    """The three fd_config fields DBOWrapper reads."""
+    return SimpleNamespace(
+        afd_config=SimpleNamespace(enable_dbo=enable_dbo, is_ffn=is_ffn),
+        speculative_config=SimpleNamespace(enabled_speculative_decoding=lambda: False),
+    )
 
-    def __init__(self, layer_id, log):
-        self.layer_id = layer_id
+
+class FakeModel:
+    """A fake model that records the order of its calls."""
+
+    STAGES = (
+        "attn_route",
+        "dispatch_send",
+        "dispatch_recv",
+        "local",
+        "combine_send",
+        "combine_recv",
+    )
+
+    def __init__(self, log, num_layers, fail_on=None):
         self.log = log
+        self.num_layers = num_layers
+        self.fail_on = fail_on
 
-    def _record(self, st, stage):
-        self.log.append((st.microbatch_id, self.layer_id, stage))
+    def _record(self, micro_batch_id, layer_id, stage):
+        self.log.append((micro_batch_id, layer_id, stage))
+        if self.fail_on == (micro_batch_id, layer_id, stage):
+            raise RuntimeError("stage failed")
 
-    def dbo_attn(self, st):
-        self._record(st, "attn")
+    def _comm(self, micro_batch_id, layer_id, phase):
+        dbo_maybe_run_recv_hook()
+        self._record(micro_batch_id, layer_id, f"{phase}_send")
+        dbo_register_recv_hook(lambda: self._record(micro_batch_id, layer_id, f"{phase}_recv"))
+        if not dbo_enabled():
+            # No peer to hand the wait to: the transfer completes inline.
+            self._record(micro_batch_id, layer_id, f"{phase}_recv")
+        dbo_yield()
 
-    def dbo_dispatch_send(self, st):
-        self._record(st, "dispatch_send")
-
-    def dbo_dispatch_recv(self, st):
-        self._record(st, "dispatch_recv")
-
-    def dbo_local(self, st):
-        self._record(st, "local")
-
-    def dbo_combine_send(self, st):
-        self._record(st, "combine_send")
-
-    def dbo_combine_recv(self, st):
-        self._record(st, "combine_recv")
+    def __call__(self, ids_remove_padding=None, forward_meta=None):
+        micro_batch_id = {"thread0": 0, "thread1": 1}.get(threading.current_thread().name, 0)
+        for layer_id in range(self.num_layers):
+            self._record(micro_batch_id, layer_id, "attn_route")
+            self._comm(micro_batch_id, layer_id, "dispatch")
+            self._record(micro_batch_id, layer_id, "local")
+            self._comm(micro_batch_id, layer_id, "combine")
+        return paddle.zeros([1], dtype="float32")
 
 
-def run(num_layers):
+def make_forward_meta():
+    from fastdeploy.model_executor.forward_meta import ForwardMeta
+
+    return ForwardMeta(
+        ids_remove_padding=paddle.zeros([2], dtype="int64"),
+        dbo_micro_inputs=[{}, {}],
+    )
+
+
+def run(num_layers, fail_on=None):
     log = []
-    layers = [FakeDBOLayer(i, log) for i in range(num_layers)]
-    run_dbo_pipeline(layers, DBOMicroState(None, None, None, 0), DBOMicroState(None, None, None, 1))
+    wrapper = DBOWrapper(FakeModel(log, num_layers, fail_on=fail_on), make_config())
+    wrapper(ids_remove_padding=None, forward_meta=make_forward_meta())
     return log
 
 
 class TestDBOSchedule(unittest.TestCase):
-    def test_interleaved_order(self):
-        """B trails A by one op, A first in every step."""
+    def test_b_trails_a_by_one_section(self):
+        """A is one section ahead, then the two threads strictly take turns."""
         log = run(num_layers=2)
         expected_head = [
-            (0, 0, "attn"),
+            (0, 0, "attn_route"),
             (0, 0, "dispatch_send"),
-            (1, 0, "attn"),
+            (1, 0, "attn_route"),
             (0, 0, "dispatch_recv"),
             (1, 0, "dispatch_send"),
             (0, 0, "local"),
@@ -80,42 +108,26 @@ class TestDBOSchedule(unittest.TestCase):
             (1, 0, "local"),
             (0, 0, "combine_recv"),
             (1, 0, "combine_send"),
-            (0, 1, "attn"),
+            (0, 1, "attn_route"),
             (1, 0, "combine_recv"),
         ]
         self.assertEqual(log[: len(expected_head)], expected_head)
 
-    def test_every_op_runs_exactly_once(self):
-        num_layers = 4
-        log = run(num_layers)
-        self.assertEqual(len(log), 2 * num_layers * 6)
-        self.assertEqual(len(set(log)), len(log))
+    def test_only_one_transfer_is_in_flight(self):
+        """Both micro-batches share one DeepEP low-latency buffer.
 
-    def test_communication_is_covered_by_compute(self):
-        """Each send is followed by at least one compute op before its recv."""
-        num_layers = 3
-        log = run(num_layers)
-        compute = {"attn", "local"}
-        drain_tail = (1, num_layers - 1, "combine_send")
-        for i, (mb, layer, stage) in enumerate(log):
-            if not stage.endswith("_send") or (mb, layer, stage) == drain_tail:
-                continue
-            recv_stage = stage.replace("_send", "_recv")
-            recv_at = log.index((mb, layer, recv_stage))
-            covered = [op for op in log[i + 1 : recv_at] if op[2] in compute]
-            self.assertTrue(covered, f"{log[i]} has no compute between send and recv")
-
-        # The exposed tail must be exactly that one send, i.e. the pipeline only
-        # loses coverage while draining, never in steady state.
-        self.assertEqual(log[-2:], [drain_tail, (1, num_layers - 1, "combine_recv")])
-
-    def test_sends_are_consumed_before_the_next_one(self):
-        """Only one transfer is in flight at a time, and its recv is the matching one."""
+        A send must be consumed by its own recv before either thread starts the
+        next one, otherwise the second transfer overwrites the first's receive
+        buffer.
+        """
         for num_layers in (1, 2, 3, 8):
             in_flight = None
             for mb, layer, stage in run(num_layers):
                 if stage.endswith("_send"):
-                    self.assertIsNone(in_flight, f"num_layers={num_layers}: {(mb, layer, stage)} overlaps {in_flight}")
+                    self.assertIsNone(
+                        in_flight,
+                        f"num_layers={num_layers}: {(mb, layer, stage)} starts while {in_flight} is unconsumed",
+                    )
                     in_flight = (mb, layer, stage)
                 elif stage.endswith("_recv"):
                     expected = (mb, layer, stage.replace("_recv", "_send"))
@@ -123,21 +135,62 @@ class TestDBOSchedule(unittest.TestCase):
                     in_flight = None
             self.assertIsNone(in_flight, f"num_layers={num_layers}: unconsumed send")
 
-    def test_missing_stage_raises(self):
-        class NoStages:
-            pass
+    def test_transfers_are_covered_by_peer_compute(self):
+        """Each send has real peer compute, not just a launch, before its recv."""
+        compute = {"attn_route", "local"}
+        num_layers = 3
+        log = run(num_layers)
+        # B's final combine is the drain tail: A has already finished, so there is
+        # no peer left to cover it.
+        drain_tail = (1, num_layers - 1, "combine_send")
+        for i, (mb, layer, stage) in enumerate(log):
+            if not stage.endswith("_send") or (mb, layer, stage) == drain_tail:
+                continue
+            recv_at = log.index((mb, layer, stage.replace("_send", "_recv")))
+            covered = [op for op in log[i + 1 : recv_at] if op[2] in compute]
+            self.assertTrue(covered, f"{log[i]} has no peer compute before its recv")
 
-        with self.assertRaises(NotImplementedError):
-            assert_supports_dbo([NoStages()])
+        # The exposed tail is exactly that one transfer, i.e. coverage is only lost
+        # while draining, never in steady state.
+        self.assertEqual(log[-2:], [drain_tail, (1, num_layers - 1, "combine_recv")])
 
-        class Partial:
-            supports_dbo = True
+    def test_every_section_runs_exactly_once(self):
+        num_layers = 4
+        log = run(num_layers)
+        self.assertEqual(len(log), 2 * num_layers * len(FakeModel.STAGES))
+        self.assertEqual(len(set(log)), len(log))
 
-            def dbo_attn(self, st):
-                pass
+    def test_failure_propagates_without_hanging(self):
+        """A dead thread must release its peer, not park it forever."""
+        with self.assertRaises(RuntimeError):
+            run(num_layers=2, fail_on=(0, 0, "local"))
 
-        with self.assertRaises(NotImplementedError):
-            assert_supports_dbo([Partial()])
+        with self.assertRaises(RuntimeError):
+            run(num_layers=2, fail_on=(1, 1, "attn_route"))
+
+    def test_dbo_runs_two_micro_batches_without_splitting_on_the_ffn_role(self):
+        """The FFN role owns no tokens but must still issue two micro-batches."""
+        log = []
+        wrapper = DBOWrapper(FakeModel(log, num_layers=2), make_config(is_ffn=True))
+        forward_meta = make_forward_meta()
+        forward_meta.dbo_micro_inputs = None
+        wrapper(ids_remove_padding=None, forward_meta=forward_meta)
+        self.assertEqual(sorted(mb for mb, _, _ in log), sorted([0, 1] * 2 * len(FakeModel.STAGES)))
+
+    def test_missing_micro_inputs_is_an_error_on_a_token_owning_role(self):
+        log = []
+        wrapper = DBOWrapper(FakeModel(log, num_layers=1), make_config())
+        forward_meta = make_forward_meta()
+        forward_meta.dbo_micro_inputs = None
+        with self.assertRaises(AssertionError):
+            wrapper(ids_remove_padding=None, forward_meta=forward_meta)
+
+    def test_dbo_is_skipped_when_disabled(self):
+        """Without DBO the transfers complete inline, in one micro-batch."""
+        log = []
+        wrapper = DBOWrapper(FakeModel(log, num_layers=1), make_config(enable_dbo=False))
+        wrapper(ids_remove_padding=None, forward_meta=make_forward_meta())
+        self.assertEqual([mb for mb, _, _ in log], [0] * len(FakeModel.STAGES))
 
 
 class TestDBOSplit(unittest.TestCase):
