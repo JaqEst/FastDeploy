@@ -254,7 +254,6 @@ class RedundantExpertManger:
         active_ranks = EPBackend().active_ranks
 
         local_physical_experts = self.fd_config.afd_config.num_local_physical_experts
-        fallback_physical_expert_id = self.fd_config.afd_config.ffn_ranks[0] * local_physical_experts
 
         # Candidate physical-expert ids per (layer, logical_expert), -1 padded.
         # In AFD, valid physical experts are only placed on FFN ranks. ATTN rank slots stay -1.
@@ -282,21 +281,11 @@ class RedundantExpertManger:
             base,
             axis=-1,
         )[:, :, :num_candidates]
-
-        # An expert whose replicas all sit on inactive ranks routes to a fixed FFN rank,
-        # so dispatch never sees -1. Column 0 is -1 exactly when no replica survived.
-        active_table[:, :, 0] = paddle.where(
-            active_table[:, :, 0] < 0,
-            paddle.full_like(active_table[:, :, 0], fallback_physical_expert_id),
-            active_table[:, :, 0],
-        )
+        active_count = keep_int.sum(axis=-1).astype("int32")
 
         # Publish refreshed active expert table.
         self.model_active_expert_id_to_ep_rank_array.copy_(active_table, True)
-        self.model_active_expert_in_rank_num_list.copy_(
-            keep_int.sum(axis=-1).clip(min=1).astype("int32"),
-            True,
-        )
+        self.model_active_expert_in_rank_num_list.copy_(active_count, True)
         logger.info("redundant_expert: refresh active expert table.")
 
 if __name__ == "__main__":

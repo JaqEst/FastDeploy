@@ -812,6 +812,15 @@ __global__ void group_idx_and_topk_idx_redundant_kernel(
   if (case_id < num_tokens) {
     if (if_proceed_next_topk) {
       for (int i = lane_id; i < topk; i += WARP_SIZE) {
+        int expert_topk = s_topk_idx[i];
+        int len = expert_in_rank_num_list[expert_topk];
+        if (len == 0) {
+          // No replica of this logical expert lives. Drop the term.
+          topk_indices[i] = (IdxT)(-1);
+          topk_values[i] = cuda_cast<T, float>(0.0f);
+          continue;
+        }
+
         float value;
         if (renormalize) {
           value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum *
@@ -821,10 +830,7 @@ __global__ void group_idx_and_topk_idx_redundant_kernel(
         }
         scores[s_topk_idx[i]] = value;
 
-        int expert_topk = s_topk_idx[i];
-        int len = expert_in_rank_num_list[expert_topk];
         int select = (int)xorwow_moe(state) % len;
-        // int select = 0;
         int selected_rank =
             expert_id_to_ep_rank_array[expert_topk *
                                            redundant_ep_rank_num_plus_one +
@@ -837,8 +843,12 @@ __global__ void group_idx_and_topk_idx_redundant_kernel(
       for (int i = lane_id; i < topk; i += WARP_SIZE) {
         int expert_topk = i;
         int len = expert_in_rank_num_list[expert_topk];
+        if (len == 0) {
+          topk_indices[i] = (IdxT)(-1);
+          topk_values[i] = cuda_cast<T, float>(0.0f);
+          continue;
+        }
         int select = (int)xorwow_moe(state) % len;
-        // int select = 0;
         int selected_rank =
             expert_id_to_ep_rank_array[expert_topk *
                                            redundant_ep_rank_num_plus_one +
