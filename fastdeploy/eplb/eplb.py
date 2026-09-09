@@ -19,13 +19,16 @@ from typing import Tuple
 import numpy as np
 
 
-def balanced_packing(weight: np.ndarray, num_packs: int) -> Tuple[np.ndarray, np.ndarray]:
+def balanced_packing(
+    weight: np.ndarray, num_packs: int, item_group: np.ndarray = None
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Pack n weighted objects to m packs, such that each bin contains exactly n/m objects and the weights of all packs
     are as balanced as possible.
     Parameters:
         weight: [X, n], the weight of each item
         num_packs: number of packs
+        item_group: [X, n], group id per item
     Returns:
         pack_index: [X, n], the pack index of each item
         rank_in_pack: [X, n], the rank of the item in the pack
@@ -39,31 +42,60 @@ def balanced_packing(weight: np.ndarray, num_packs: int) -> Tuple[np.ndarray, np
         rank_in_pack = np.zeros_like(weight, dtype=np.int32)
         return pack_index, rank_in_pack
 
+    if item_group is None:
+        item_group = np.arange(num_groups, dtype=np.int32).reshape(1, -1).repeat(num_layers, axis=0)
+
     indices = np.argsort(-weight.astype(np.float32), axis=-1)
-    pack_index = np.full_like(weight, fill_value=-1, dtype=np.int32)
-    rank_in_pack = np.full_like(pack_index, fill_value=-1)
+    pack_index = np.empty((num_layers, num_groups), dtype=np.int32)
+    rank_in_pack = np.empty((num_layers, num_groups), dtype=np.int32)
     for i in range(num_layers):
-        pack_weights = [0] * num_packs
+        order = indices[i].tolist()
+        groups = item_group[i].tolist()
+        weights = weight[i].tolist()
+        row_pack = [0] * num_groups
+        row_rank = [0] * num_groups
+        pack_weights = [0.0] * num_packs
         pack_items = [0] * num_packs
-        for group in indices[i]:
-            pack = min(
-                (i for i in range(num_packs) if pack_items[i] < groups_per_pack),
-                key=pack_weights.__getitem__,
-            )
-            assert pack_items[pack] < groups_per_pack
-            pack_index[i, group] = pack
-            rank_in_pack[i, group] = pack_items[pack]
-            pack_weights[pack] += weight[i, group]
+        pack_group_ids = [set() for _ in range(num_packs)]
+        # A pack never reopens once full, so drop it instead of re-testing every item.
+        open_packs = list(range(num_packs))
+
+        for group in order:
+            group_id = groups[group]
+            lightest = lightest_spread = -1
+            for pack in open_packs:
+                pack_weight = pack_weights[pack]
+                if lightest < 0 or pack_weight < pack_weights[lightest]:
+                    lightest = pack
+                if group_id not in pack_group_ids[pack] and (
+                    lightest_spread < 0 or pack_weight < pack_weights[lightest_spread]
+                ):
+                    lightest_spread = pack
+            # Co-locate only when no pack with room is free of this group.
+            pack = lightest_spread if lightest_spread >= 0 else lightest
+
+            row_pack[group] = pack
+            row_rank[group] = pack_items[pack]
+            pack_weights[pack] += weights[group]
             pack_items[pack] += 1
+            pack_group_ids[pack].add(group_id)
+            if pack_items[pack] == groups_per_pack:
+                open_packs.remove(pack)
+
+        pack_index[i] = row_pack
+        rank_in_pack[i] = row_rank
     return pack_index, rank_in_pack
 
 
-def replicate_experts(weight: np.ndarray, num_phy: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def replicate_experts(
+    weight: np.ndarray, num_phy: int, max_replicas: int = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Replicate `num_log` experts to `num_phy` replicas, such that the maximum load of all replicas is minimized.
     Parameters:
         weight: [X, num_log]
         num_phy: total number of experts after replication
+        max_replicas: cap on replicas per logical expert
     Returns:
         phy2log: [X, num_phy], logical expert id of each physical expert
         rank: [X, num_phy], the replica rank
@@ -72,12 +104,17 @@ def replicate_experts(weight: np.ndarray, num_phy: int) -> Tuple[np.ndarray, np.
     n, num_log = weight.shape
     num_redundant = num_phy - num_log
     assert num_redundant >= 0
+    cap = max_replicas if max_replicas is not None and num_phy <= num_log * max_replicas else None
     phy2log = np.arange(num_phy, dtype=np.int32).reshape(1, -1).repeat(n, axis=0)
     rank = np.zeros((n, num_phy), dtype=np.int32)
     logcnt = np.ones((n, num_log), dtype=np.int32)
     arangen = np.arange(n, dtype=np.int32)
+    score = np.empty((n, num_log), dtype=np.float64)
     for i in range(num_log, num_phy):
-        redundant_indices = np.argmax(weight / logcnt, axis=-1)
+        np.divide(weight, logcnt, out=score)
+        if cap is not None:
+            score[logcnt >= cap] = -np.inf
+        redundant_indices = np.argmax(score, axis=-1)
         phy2log[:, i] = redundant_indices
         rank[:, i] = logcnt[arangen, redundant_indices]
         logcnt[arangen, redundant_indices] += 1
@@ -130,7 +167,7 @@ def rebalance_experts_intra_node(
     # Step 1: generate redundant experts by weight.
     # shape of tmp2log, tmprank is [num_layers, num_physical_experts]
     # shape of logcnt is [num_layers, num_logical_experts]
-    tmp2log, tmprank, logcnt = replicate_experts(weight, num_physical_experts)
+    tmp2log, tmprank, logcnt = replicate_experts(weight, num_physical_experts, num_gpus_per_node)
 
     # Step 2: compute num_tokens of physical experts
     # shape of tokens_per_tmp is [num_layers * num_nodes, num_physical_experts_per_node]
@@ -138,7 +175,8 @@ def rebalance_experts_intra_node(
 
     # STEP 3: take load balance of gpu cards in node
     # shape of gpu_index, rank_in_gpu, tmp2phy, phy2tmp is [num_layers * num_nodes, num_physical_experts_per_node]
-    gpu_index, rank_in_gpu = balanced_packing(tokens_per_tmp, num_gpus_per_node)
+    tmp2log_per_node = tmp2log.reshape(-1, num_physical_experts_per_node)
+    gpu_index, rank_in_gpu = balanced_packing(tokens_per_tmp, num_gpus_per_node, tmp2log_per_node)
     tmp2phy = gpu_index * num_physical_experts_per_gpu + rank_in_gpu
     phy2tmp = inverse(tmp2phy)
 
@@ -194,11 +232,13 @@ def rebalance_experts_hierarchical(
 
     # Step 2: construct redundant experts within nodes
     tokens_per_mlog = np.take_along_axis(weight, mlog2log, axis=-1).reshape(-1, num_logical_experts // num_nodes)
-    phy2mlog, phyrank, mlogcnt = replicate_experts(tokens_per_mlog, num_physical_experts // num_nodes)
+    phy2mlog, phyrank, mlogcnt = replicate_experts(
+        tokens_per_mlog, num_physical_experts // num_nodes, num_gpus // num_nodes
+    )
 
     # Step 3: pack physical_experts to GPUs
     tokens_per_phy = np.take_along_axis(tokens_per_mlog / mlogcnt, phy2mlog, axis=-1)
-    pack_index, rank_in_pack = balanced_packing(tokens_per_phy, num_gpus // num_nodes)
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy, num_gpus // num_nodes, phy2mlog)
     phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
     pphy2phy = inverse(phy2pphy)
 
@@ -246,7 +286,9 @@ def _rebalance_experts(
             )
         else:
             # use global load-balance policy
-            phy2log, phyrank, logcnt = replicate_experts(weight, num_replicas)
+            phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+                weight, num_replicas, 1, 1, num_gpus
+            )
     maxlogcnt = logcnt.max()
     log2phy = np.full((num_layers, num_logical_experts, maxlogcnt), -1, dtype=np.int32)
     np.put_along_axis(
@@ -266,79 +308,69 @@ def rebalance_experts(
     num_gpus: int,
     eplb_strategy: str = "",
     fd_config=None,
+    active_ffn_ranks: list = None,
+    keep: np.ndarray = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     afd_config = fd_config.afd_config if fd_config is not None else None
     if afd_config is None or not afd_config.enable_afd:
-        return _rebalance_experts(
-            weight,
-            num_replicas,
-            num_groups,
-            num_nodes,
-            num_gpus,
-            eplb_strategy,
-        )
+        return _rebalance_experts(weight, num_replicas, num_groups, num_nodes, num_gpus, eplb_strategy)
+    return _rebalance_experts_afd(weight, num_groups, num_nodes, eplb_strategy, afd_config, active_ffn_ranks, keep)
 
-    if weight.ndim != 2:
-        raise ValueError(f"weight must be [layers, logical_experts], got shape={weight.shape}")
 
+def _rebalance_experts_afd(
+    weight: np.ndarray,
+    num_groups: int,
+    num_nodes: int,
+    eplb_strategy: str,
+    afd_config,
+    active_ffn_ranks: list = None,
+    keep: np.ndarray = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Solve on the surviving FFN geometry, then lift the result into the global slot space.
+
+    `active_ffn_ranks` and `keep` default to the full layout, so the healthy path is the
+    same code with nothing masked out.
+    """
     num_layers, num_logical_experts = weight.shape
-    if num_logical_experts != afd_config.num_logical_experts:
-        raise ValueError(
-            "AFD EPLB weight shape does not match config: "
-            f"weight_logical_experts={num_logical_experts}, "
-            f"config_logical_experts={afd_config.num_logical_experts}"
-        )
-    if afd_config.num_redundant_experts < 0:
-        raise ValueError(f"AFD redundant experts must be non-negative, got {afd_config.num_redundant_experts}")
-
-    ffn_ranks = afd_config.ffn_ranks
-    ffn_replicas = afd_config.num_ffn_physical_experts
+    ffn_ranks = list(afd_config.ffn_ranks if active_ffn_ranks is None else active_ffn_ranks)
     local_physical_experts = afd_config.num_local_physical_experts
-    global_physical_experts = afd_config.num_physical_experts
-    if ffn_replicas != num_logical_experts + afd_config.num_redundant_experts:
+    ffn_slots = local_physical_experts * len(ffn_ranks)
+
+    # eplb only replicates, never drops, so the logical set has to fit before we solve.
+    num_kept = keep.sum(axis=1) if keep is not None else np.full(num_layers, num_logical_experts)
+    if num_kept.min() != num_kept.max() or num_kept[0] > ffn_slots:
         raise ValueError(
-            "AFD EPLB config layout is inconsistent: "
-            f"ffn_replicas={ffn_replicas}, logical={num_logical_experts}, "
-            f"redundant={afd_config.num_redundant_experts}"
-        )
-    if num_replicas != global_physical_experts:
-        raise ValueError(
-            "AFD num_replicas must match global physical expert slots: "
-            f"num_replicas={num_replicas}, expected={global_physical_experts}"
+            f"keep must hold one count per layer and fit {ffn_slots} slots, "
+            f"got {num_kept.min()}..{num_kept.max()}"
         )
 
-    ffn_phy2log, ffn_log2phy, expert_count = _rebalance_experts(
-        weight,
-        ffn_replicas,
-        num_groups,
-        num_nodes,
-        num_gpus,
-        eplb_strategy,
+    kept_ids = None
+    if keep is not None and not keep.all():
+        kept_ids = np.stack([np.flatnonzero(row) for row in keep]).astype(np.int32)
+        weight = np.take_along_axis(weight, kept_ids, axis=1)
+
+    phy2log, log2phy, expert_count = _rebalance_experts(
+        weight, ffn_slots, num_groups, num_nodes, len(ffn_ranks), eplb_strategy
     )
 
-    global_phy2log = np.full((num_layers, global_physical_experts), -1, dtype=np.int32)
-    for ffn_rank_index, global_rank in enumerate(ffn_ranks):
-        ffn_start = ffn_rank_index * local_physical_experts
-        ffn_end = ffn_start + local_physical_experts
-        global_start = global_rank * local_physical_experts
-        global_end = global_start + local_physical_experts
-        global_phy2log[:, global_start:global_end] = ffn_phy2log[:, ffn_start:ffn_end]
+    if kept_ids is not None:
+        rows = np.arange(num_layers)[:, None]
+        phy2log = np.take_along_axis(kept_ids, phy2log, axis=1)
+        wide_log2phy = np.full((num_layers, num_logical_experts, log2phy.shape[-1]), -1, dtype=np.int32)
+        wide_log2phy[rows, kept_ids] = log2phy
+        wide_count = np.zeros((num_layers, num_logical_experts), dtype=expert_count.dtype)
+        wide_count[rows, kept_ids] = expert_count
+        log2phy, expert_count = wide_log2phy, wide_count
 
-    max_replicas = afd_config.num_redundant_experts + 1
-    global_log2phy = np.full((num_layers, num_logical_experts, max_replicas), -1, dtype=np.int32)
-    mapped_log2phy = np.full_like(ffn_log2phy, -1, dtype=np.int32)
-    valid = ffn_log2phy >= 0
-    if np.any(valid):
-        ffn_rank_indexes = ffn_log2phy[valid] // local_physical_experts
-        local_offsets = ffn_log2phy[valid] % local_physical_experts
-        ffn_rank_array = np.asarray(ffn_ranks, dtype=np.int32)
-        mapped_log2phy[valid] = ffn_rank_array[ffn_rank_indexes] * local_physical_experts + local_offsets
-    if mapped_log2phy.shape[-1] > max_replicas:
-        raise ValueError(
-            "AFD EPLB generated more replicas per logical expert than expected: "
-            f"actual={mapped_log2phy.shape[-1]}, max={max_replicas}"
-        )
-    global_log2phy[:, :, : mapped_log2phy.shape[-1]] = mapped_log2phy
+    # FFN slot i lives on ffn_ranks[i // local]; attn ranks and lost ranks keep their -1.
+    rank_base = np.asarray(ffn_ranks, np.int32)[:, None] * local_physical_experts
+    to_global = (rank_base + np.arange(local_physical_experts)).ravel()
+    global_phy2log = np.full((num_layers, afd_config.num_physical_experts), -1, dtype=np.int32)
+    global_phy2log[:, to_global] = phy2log
+    global_log2phy = np.where(log2phy >= 0, to_global[np.maximum(log2phy, 0)], -1).astype(np.int32)
+    padding = afd_config.num_redundant_experts + 1 - global_log2phy.shape[-1]
+    if padding:
+        global_log2phy = np.pad(global_log2phy, ((0, 0), (0, 0), (0, padding)), constant_values=-1)
     return global_phy2log, global_log2phy, expert_count
 
 
