@@ -16,7 +16,7 @@
 
 import numpy as np
 
-__all__ = ["evict_order", "keep_from_order"]
+__all__ = ["evict_order", "keep_from_order", "card_imbalance", "coverage_repair"]
 
 
 def evict_order(importance: np.ndarray, similarity: np.ndarray):
@@ -123,3 +123,135 @@ def keep_from_order(order: np.ndarray, capacity: int) -> np.ndarray:
         return keep
     keep[np.arange(num_layers)[:, None], order[:, :num_evict]] = False
     return keep
+
+
+def card_imbalance(slots: np.ndarray, load: np.ndarray, num_cards: int) -> float:
+    """
+    Peak over mean card load for one layer. A logical expert's load splits evenly
+    over its replicas, matching the kernel's uniform pick among them.
+
+    Args:
+        slots: [C] logical expert per surviving slot, ordered by (card, slot).
+        load: [E] recent token count per logical expert.
+        num_cards: surviving FFN cards; len(slots) must divide by it.
+    """
+    count = np.bincount(slots, minlength=load.shape[0])
+    per_card = (load[slots] / count[slots]).reshape(num_cards, -1).sum(axis=1)
+    mean = per_card.mean()
+    return float(per_card.max() / mean) if mean > 0 else 1.0
+
+
+def coverage_repair(
+    keep: np.ndarray,
+    slots: np.ndarray,
+    importance: np.ndarray,
+    load: np.ndarray,
+    num_cards: int,
+    target_imbalance: float = 1.05,
+    max_swap_rounds: int = 400,
+):
+    """
+    Turn a target keep set into the H2D writes that realise it.
+
+    Two phases per layer. First refill coverage, taking slots from experts with a
+    spare replica before slots holding the last copy of an expert `keep` drops.
+    Then trade slots between the hottest and coldest card until the load spread
+    is acceptable; a trade costs two writes but no coverage.
+
+    Args:
+        keep: [L, E] bool, from `keep_from_order`.
+        slots: [L, C] logical expert per surviving slot, ordered by (card, slot).
+            Not modified.
+        importance: [L, E], orders which expert to bring back first and which to
+            give up when no spare replica is left.
+        load: [L, E] recent token count per logical expert.
+        num_cards: surviving FFN cards; C must divide by it.
+        target_imbalance: stop trading once peak/mean card load is at most this.
+        max_swap_rounds: cap on trades per layer.
+
+    Returns:
+        moves: list of (layer, slot, expert), in the order they should be
+            applied. Coverage comes first, so truncating still leaves a valid
+            placement.
+        new_slots: [L, C] the placement after every move.
+    """
+    num_layers, num_experts = keep.shape
+    capacity = slots.shape[1]
+    if slots.shape[0] != num_layers:
+        raise ValueError(f"keep has {num_layers} layers, slots has {slots.shape[0]}")
+    if capacity % num_cards:
+        raise ValueError(f"capacity {capacity} is not a multiple of num_cards {num_cards}")
+    over = keep.sum(axis=1) > capacity
+    if over.any():
+        raise ValueError(
+            f"layer {int(np.flatnonzero(over)[0])} keeps "
+            f"{int(keep.sum(axis=1).max())} experts but only has {capacity} slots"
+        )
+
+    new_slots = np.array(slots)
+    moves = []
+    for layer in range(num_layers):
+        row = new_slots[layer]
+        for slot, expert in _refill_layer(keep[layer], row, importance[layer]):
+            moves.append((layer, slot, expert))
+        for slot, expert in _balance_layer(
+            row, load[layer], num_cards, target_imbalance, max_swap_rounds
+        ):
+            moves.append((layer, slot, expert))
+    return moves, new_slots
+
+
+def _refill_layer(keep: np.ndarray, slots: np.ndarray, importance: np.ndarray):
+    """Bring every kept expert back into `slots` (modified in place)."""
+    count = np.bincount(slots, minlength=keep.shape[0])
+    incoming = np.flatnonzero(keep & (count == 0))
+    incoming = incoming[np.argsort(-importance[incoming])]
+
+    moves = []
+    for expert in incoming:
+        spare = np.flatnonzero(count >= 2)
+        if spare.size:
+            donor = int(spare[np.argmax(count[spare])])
+        else:
+            doomed = np.flatnonzero((count >= 1) & ~keep)
+            donor = int(doomed[np.argmin(importance[doomed])])
+        slot = int(np.flatnonzero(slots == donor)[-1])
+        count[donor] -= 1
+        slots[slot] = expert
+        count[expert] += 1
+        moves.append((slot, int(expert)))
+    return moves
+
+
+def _balance_layer(
+    slots: np.ndarray, load: np.ndarray, num_cards: int, target: float, max_rounds: int
+):
+    """Trade slots between the hottest and coldest card (`slots` modified in place)."""
+    count = np.bincount(slots, minlength=load.shape[0])
+    per_slot = load[slots] / count[slots]
+    slots_per_card = slots.shape[0] // num_cards
+
+    moves = []
+    for _ in range(max_rounds):
+        per_card = per_slot.reshape(num_cards, slots_per_card).sum(axis=1)
+        mean = per_card.mean()
+        if mean <= 0 or per_card.max() / mean <= target:
+            break
+
+        hot, cold = int(per_card.argmax()), int(per_card.argmin())
+        hot_slots = slice(hot * slots_per_card, (hot + 1) * slots_per_card)
+        cold_slots = slice(cold * slots_per_card, (cold + 1) * slots_per_card)
+        # Trading slot i of the hot card for slot j of the cold one moves this
+        # much load. Refuse trades that overshoot, or the pair oscillates.
+        gain = per_slot[hot_slots][:, None] - per_slot[cold_slots][None, :]
+        allowed = (gain > 0) & (per_card[hot] - gain > per_card[cold] + gain - 1e-9)
+        if not allowed.any():
+            break
+
+        i, j = divmod(int(np.where(allowed, gain, -np.inf).argmax()), slots_per_card)
+        left, right = hot * slots_per_card + i, cold * slots_per_card + j
+        slots[left], slots[right] = slots[right], slots[left]
+        per_slot[left], per_slot[right] = per_slot[right], per_slot[left]
+        moves.append((left, int(slots[left])))
+        moves.append((right, int(slots[right])))
+    return moves

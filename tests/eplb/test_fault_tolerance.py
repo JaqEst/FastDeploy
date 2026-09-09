@@ -18,7 +18,12 @@ import unittest
 
 import numpy as np
 
-from fastdeploy.eplb.fault_tolerance import evict_order, keep_from_order
+from fastdeploy.eplb.fault_tolerance import (
+    card_imbalance,
+    evict_order,
+    keep_from_order,
+    coverage_repair,
+)
 
 
 def reference_loss(importance, similarity, keep):
@@ -215,5 +220,164 @@ class TestKeepFromOrder(unittest.TestCase):
         np.testing.assert_array_equal(np.flatnonzero(keep[1]), [0, 1])
 
 
+class TestCoverageRepair(unittest.TestCase):
+    """Test cases for the coverage repair in fault_tolerance.py"""
+
+    def test_spare_replica_is_taken_first(self):
+        """
+        3 cards of 3 slots hold 6 experts plus 3 replicas. Losing card 0 leaves
+        expert 2 gone and expert 3 holding two slots, so one write restores full
+        coverage at no coverage cost.
+        """
+        keep = np.ones((1, 6), dtype=bool)
+        slots = np.array([[3, 4, 0, 5, 1, 3]])
+        importance = np.array([[10.0, 9.0, 8.0, 7.0, 2.0, 1.0]])
+        load = np.zeros((1, 6))
+
+        moves, new_slots = coverage_repair(keep, slots, importance, load, num_cards=2)
+        self.assertEqual(len(moves), 1)
+        layer, slot, expert = moves[0]
+        self.assertEqual((layer, expert), (0, 2))
+        self.assertEqual(slots[0][slot], 3)
+        np.testing.assert_array_equal(np.bincount(new_slots[0], minlength=6), [1, 1, 1, 1, 1, 1])
+
+    def test_last_copy_is_taken_when_no_spare(self):
+        """Without replicas a bring-back has to displace an expert keep drops"""
+        keep = np.array([[True, True, True, True, False, False]])
+        slots = np.array([[2, 3, 4, 5]])
+        importance = np.array([[10.0, 9.0, 8.0, 7.0, 2.0, 1.0]])
+        load = np.zeros((1, 6))
+
+        moves, new_slots = coverage_repair(keep, slots, importance, load, num_cards=2)
+        self.assertEqual(len(moves), 2)
+        # The most important expert is brought back first, the cheapest gives way.
+        self.assertEqual([expert for _, _, expert in moves], [0, 1])
+        self.assertEqual(sorted(new_slots[0].tolist()), [0, 1, 2, 3])
+
+    def test_coverage_matches_keep(self):
+        """After repair the placement holds exactly the kept experts"""
+        rng = np.random.default_rng(3)
+        num_experts, num_cards, slots_per_card = 16, 4, 5
+        capacity = num_cards * slots_per_card
+        for _ in range(20):
+            slots = rng.integers(0, num_experts, (1, capacity))
+            resident = np.bincount(slots[0], minlength=num_experts) > 0
+            keep = resident.copy()
+            spare = capacity - int(resident.sum())
+            missing = np.flatnonzero(~resident)
+            keep[missing[: min(spare, missing.size)]] = True
+            importance = rng.random((1, num_experts))
+            load = rng.random((1, num_experts))
+
+            _, new_slots = coverage_repair(keep[None], slots, importance, load, num_cards)
+            present = np.bincount(new_slots[0], minlength=num_experts) > 0
+            np.testing.assert_array_equal(present, keep)
+
+    def test_move_count_is_bounded_by_the_lost_experts(self):
+        """A bring-back can only target an expert that is currently absent"""
+        rng = np.random.default_rng(4)
+        num_experts, num_cards, slots_per_card = 16, 4, 5
+        capacity = num_cards * slots_per_card
+        for _ in range(20):
+            slots = rng.integers(0, num_experts, (1, capacity))
+            resident = np.bincount(slots[0], minlength=num_experts) > 0
+            keep = resident.copy()
+            missing = np.flatnonzero(~resident)
+            keep[missing[: capacity - int(resident.sum())]] = True
+            importance = rng.random((1, num_experts))
+
+            moves, _ = coverage_repair(
+                keep[None], slots, importance, np.zeros((1, num_experts)), num_cards
+            )
+            self.assertLessEqual(len(moves), int((~resident).sum()))
+
+    def test_balance_worked_example(self):
+        """
+        3 cards of 3 slots, experts 0 and 1 replicated. Card loads start at
+        15/12/7; one trade brings the peak to the best a 3-slot split allows.
+        """
+        keep = np.ones((1, 7), dtype=bool)
+        slots = np.array([[0, 1, 2, 3, 4, 0, 5, 6, 1]])
+        load = np.array([[10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 1.0]])
+        importance = np.ones((1, 7))
+
+        before = card_imbalance(slots[0], load[0], 3)
+        self.assertAlmostEqual(before, 15 / (34 / 3), places=6)
+
+        moves, new_slots = coverage_repair(keep, slots, importance, load, 3, target_imbalance=1.05)
+        self.assertEqual(len(moves), 2)
+        np.testing.assert_array_equal(new_slots[0], [6, 1, 2, 3, 4, 0, 5, 0, 1])
+        # 34 over three cards of three slots cannot go below a peak of 12.
+        self.assertAlmostEqual(card_imbalance(new_slots[0], load[0], 3), 12 / (34 / 3), places=6)
+
+    def test_balance_stops_when_target_is_unreachable(self):
+        """No improving trade left is a normal exit, not a hang"""
+        keep = np.ones((1, 7), dtype=bool)
+        slots = np.array([[0, 1, 2, 3, 4, 0, 5, 6, 1]])
+        load = np.array([[10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 1.0]])
+        moves, new_slots = coverage_repair(
+            keep, slots, np.ones((1, 7)), load, 3, target_imbalance=1.0
+        )
+        self.assertGreater(card_imbalance(new_slots[0], load[0], 3), 1.0)
+        self.assertLess(len(moves), 20)
+
+    def test_balance_never_makes_it_worse(self):
+        rng = np.random.default_rng(5)
+        num_experts, num_cards, slots_per_card = 16, 4, 5
+        for _ in range(20):
+            slots = rng.integers(0, num_experts, (1, num_cards * slots_per_card))
+            keep = np.bincount(slots[0], minlength=num_experts) > 0
+            load = np.exp(rng.normal(0.0, 1.0, (1, num_experts)))
+            before = card_imbalance(slots[0], load[0], num_cards)
+            _, new_slots = coverage_repair(keep[None], slots, np.ones((1, num_experts)), load, num_cards)
+            self.assertLessEqual(card_imbalance(new_slots[0], load[0], num_cards), before + 1e-9)
+
+    def test_zero_load_is_not_a_division(self):
+        """Load stats are zeroed after a reset; balancing must just do nothing"""
+        keep = np.ones((1, 4), dtype=bool)
+        slots = np.array([[0, 1, 2, 3]])
+        moves, new_slots = coverage_repair(keep, slots, np.ones((1, 4)), np.zeros((1, 4)), 2)
+        self.assertEqual(moves, [])
+        np.testing.assert_array_equal(new_slots, slots)
+        self.assertEqual(card_imbalance(slots[0], np.zeros(4), 2), 1.0)
+
+    def test_inputs_are_not_modified(self):
+        keep = np.ones((1, 7), dtype=bool)
+        slots = np.array([[0, 1, 2, 3, 4, 0, 5, 6, 1]])
+        load = np.array([[10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 1.0]])
+        slots_before = slots.copy()
+        load_before = load.copy()
+        coverage_repair(keep, slots, np.ones((1, 7)), load, 3)
+        np.testing.assert_array_equal(slots, slots_before)
+        np.testing.assert_array_equal(load, load_before)
+
+    def test_rejects_keep_larger_than_capacity(self):
+        keep = np.ones((1, 6), dtype=bool)
+        slots = np.array([[0, 1, 2, 3]])
+        with self.assertRaises(ValueError):
+            coverage_repair(keep, slots, np.ones((1, 6)), np.zeros((1, 6)), 2)
+
+    def test_rejects_capacity_not_divisible_by_cards(self):
+        keep = np.ones((1, 4), dtype=bool)
+        slots = np.array([[0, 1, 2, 3]])
+        with self.assertRaises(ValueError):
+            coverage_repair(keep, slots, np.ones((1, 4)), np.zeros((1, 4)), 3)
+
+    def test_moves_replay_to_the_returned_placement(self):
+        """Applying the move list in order reproduces new_slots"""
+        rng = np.random.default_rng(6)
+        num_experts, num_cards, slots_per_card = 16, 4, 5
+        slots = rng.integers(0, num_experts, (2, num_cards * slots_per_card))
+        keep = np.stack([np.bincount(slots[i], minlength=num_experts) > 0 for i in range(2)])
+        load = np.exp(rng.normal(0.0, 1.0, (2, num_experts)))
+
+        moves, new_slots = coverage_repair(keep, slots, np.ones((2, num_experts)), load, num_cards)
+        replayed = slots.copy()
+        for layer, slot, expert in moves:
+            replayed[layer, slot] = expert
+        np.testing.assert_array_equal(replayed, new_slots)
+
+
 if __name__ == "__main__":
     unittest.main()
+
