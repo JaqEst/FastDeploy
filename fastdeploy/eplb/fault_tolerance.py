@@ -16,7 +16,7 @@
 
 import numpy as np
 
-__all__ = ["evict_order", "keep_from_order", "card_imbalance", "coverage_repair"]
+__all__ = ["evict_order", "keep_from_order", "gpu_imbalance", "coverage_repair"]
 
 
 def evict_order(importance: np.ndarray, similarity: np.ndarray):
@@ -125,20 +125,20 @@ def keep_from_order(order: np.ndarray, capacity: int) -> np.ndarray:
     return keep
 
 
-def card_imbalance(slots: np.ndarray, load: np.ndarray, num_cards: int) -> float:
+def gpu_imbalance(slots: np.ndarray, load: np.ndarray, num_gpus: int) -> float:
     """
-    Peak over mean card load for one layer. A logical expert's load splits evenly
+    Peak over mean GPU load for one layer. A logical expert's load splits evenly
     over its replicas, matching the kernel's uniform pick among them.
 
     Args:
-        slots: [C] logical expert per surviving slot, ordered by (card, slot).
+        slots: [C] logical expert per surviving slot, ordered by (gpu, slot).
         load: [E] recent token count per logical expert.
-        num_cards: surviving FFN cards; len(slots) must divide by it.
+        num_gpus: surviving GPUs; len(slots) must divide by it.
     """
     count = np.bincount(slots, minlength=load.shape[0])
-    per_card = (load[slots] / count[slots]).reshape(num_cards, -1).sum(axis=1)
-    mean = per_card.mean()
-    return float(per_card.max() / mean) if mean > 0 else 1.0
+    per_gpu = (load[slots] / count[slots]).reshape(num_gpus, -1).sum(axis=1)
+    mean = per_gpu.mean()
+    return float(per_gpu.max() / mean) if mean > 0 else 1.0
 
 
 def coverage_repair(
@@ -146,7 +146,7 @@ def coverage_repair(
     slots: np.ndarray,
     importance: np.ndarray,
     load: np.ndarray,
-    num_cards: int,
+    num_gpus: int,
     target_imbalance: float = 1.05,
     max_swap_rounds: int = 400,
 ):
@@ -155,18 +155,18 @@ def coverage_repair(
 
     Two phases per layer. First refill coverage, taking slots from experts with a
     spare replica before slots holding the last copy of an expert `keep` drops.
-    Then trade slots between the hottest and coldest card until the load spread
+    Then trade slots between the hottest and coldest GPU until the load spread
     is acceptable; a trade costs two writes but no coverage.
 
     Args:
         keep: [L, E] bool, from `keep_from_order`.
-        slots: [L, C] logical expert per surviving slot, ordered by (card, slot).
+        slots: [L, C] logical expert per surviving slot, ordered by (gpu, slot).
             Not modified.
         importance: [L, E], orders which expert to bring back first and which to
             give up when no spare replica is left.
         load: [L, E] recent token count per logical expert.
-        num_cards: surviving FFN cards; C must divide by it.
-        target_imbalance: stop trading once peak/mean card load is at most this.
+        num_gpus: surviving FFN GPUs; C must divide by it.
+        target_imbalance: stop trading once peak/mean GPU load is at most this.
         max_swap_rounds: cap on trades per layer.
 
     Returns:
@@ -179,8 +179,8 @@ def coverage_repair(
     capacity = slots.shape[1]
     if slots.shape[0] != num_layers:
         raise ValueError(f"keep has {num_layers} layers, slots has {slots.shape[0]}")
-    if capacity % num_cards:
-        raise ValueError(f"capacity {capacity} is not a multiple of num_cards {num_cards}")
+    if capacity % num_gpus:
+        raise ValueError(f"capacity {capacity} is not a multiple of num_gpus {num_gpus}")
     over = keep.sum(axis=1) > capacity
     if over.any():
         raise ValueError(
@@ -189,69 +189,77 @@ def coverage_repair(
         )
 
     new_slots = np.array(slots)
-    moves = []
+    slots_per_gpu = capacity // num_gpus
+    gpu_writes = np.zeros(num_gpus, dtype=np.int64)
     for layer in range(num_layers):
         row = new_slots[layer]
-        for slot, expert in _refill_layer(keep[layer], row, importance[layer]):
-            moves.append((layer, slot, expert))
-        for slot, expert in _balance_layer(
-            row, load[layer], num_cards, target_imbalance, max_swap_rounds
-        ):
-            moves.append((layer, slot, expert))
+        _refill_layer(keep[layer], row, importance[layer], num_gpus, gpu_writes)
+        _balance_layer(row, load[layer], num_gpus, target_imbalance, max_swap_rounds)
+        np.add.at(gpu_writes, np.flatnonzero(slots[layer] != row) // slots_per_gpu, 1)
+
+    changed = np.nonzero(slots != new_slots)
+    moves = [(int(layer), int(slot), int(new_slots[layer, slot])) for layer, slot in zip(*changed)]
     return moves, new_slots
 
 
-def _refill_layer(keep: np.ndarray, slots: np.ndarray, importance: np.ndarray):
+def _refill_layer(
+    keep: np.ndarray,
+    slots: np.ndarray,
+    importance: np.ndarray,
+    num_gpus: int,
+    gpu_writes: np.ndarray,
+) -> None:
     """Bring every kept expert back into `slots` (modified in place)."""
     count = np.bincount(slots, minlength=keep.shape[0])
     incoming = np.flatnonzero(keep & (count == 0))
     incoming = incoming[np.argsort(-importance[incoming])]
+    slots_per_gpu = slots.shape[0] // num_gpus
+    load = gpu_writes.astype(np.int64).copy()
 
-    moves = []
     for expert in incoming:
-        spare = np.flatnonzero(count >= 2)
-        if spare.size:
-            donor = int(spare[np.argmax(count[spare])])
-        else:
-            doomed = np.flatnonzero((count >= 1) & ~keep)
-            donor = int(doomed[np.argmin(importance[doomed])])
-        slot = int(np.flatnonzero(slots == donor)[-1])
-        count[donor] -= 1
+        spare = count[slots] >= 2
+        donors = np.flatnonzero(spare) if spare.any() else np.flatnonzero(~keep[slots])
+        gpus = donors // slots_per_gpu
+        # Least loaded GPU, then lowest slot: donors is ascending and argmin takes the
+        # first minimum.
+        pick = int(np.argmin(load[gpus]))
+        slot, gpu = int(donors[pick]), int(gpus[pick])
+
+        count[slots[slot]] -= 1
         slots[slot] = expert
         count[expert] += 1
-        moves.append((slot, int(expert)))
-    return moves
+        load[gpu] += 1
 
 
 def _balance_layer(
-    slots: np.ndarray, load: np.ndarray, num_cards: int, target: float, max_rounds: int
-):
-    """Trade slots between the hottest and coldest card (`slots` modified in place)."""
+    slots: np.ndarray,
+    load: np.ndarray,
+    num_gpus: int,
+    target: float,
+    max_rounds: int,
+) -> None:
+    """Trade slots between the hottest and coldest GPU (`slots` modified in place)."""
     count = np.bincount(slots, minlength=load.shape[0])
     per_slot = load[slots] / count[slots]
-    slots_per_card = slots.shape[0] // num_cards
+    slots_per_gpu = slots.shape[0] // num_gpus
 
-    moves = []
     for _ in range(max_rounds):
-        per_card = per_slot.reshape(num_cards, slots_per_card).sum(axis=1)
-        mean = per_card.mean()
-        if mean <= 0 or per_card.max() / mean <= target:
+        per_gpu = per_slot.reshape(num_gpus, slots_per_gpu).sum(axis=1)
+        mean = per_gpu.mean()
+        if mean <= 0 or per_gpu.max() / mean <= target:
             break
 
-        hot, cold = int(per_card.argmax()), int(per_card.argmin())
-        hot_slots = slice(hot * slots_per_card, (hot + 1) * slots_per_card)
-        cold_slots = slice(cold * slots_per_card, (cold + 1) * slots_per_card)
-        # Trading slot i of the hot card for slot j of the cold one moves this
+        hot, cold = int(per_gpu.argmax()), int(per_gpu.argmin())
+        hot_slots = slice(hot * slots_per_gpu, (hot + 1) * slots_per_gpu)
+        cold_slots = slice(cold * slots_per_gpu, (cold + 1) * slots_per_gpu)
+        # Trading slot i of the hot GPU for slot j of the cold one moves this
         # much load. Refuse trades that overshoot, or the pair oscillates.
         gain = per_slot[hot_slots][:, None] - per_slot[cold_slots][None, :]
-        allowed = (gain > 0) & (per_card[hot] - gain > per_card[cold] + gain - 1e-9)
+        allowed = (gain > 0) & (per_gpu[hot] - gain > per_gpu[cold] + gain - 1e-9)
         if not allowed.any():
             break
 
-        i, j = divmod(int(np.where(allowed, gain, -np.inf).argmax()), slots_per_card)
-        left, right = hot * slots_per_card + i, cold * slots_per_card + j
+        i, j = divmod(int(np.where(allowed, gain, -np.inf).argmax()), slots_per_gpu)
+        left, right = hot * slots_per_gpu + i, cold * slots_per_gpu + j
         slots[left], slots[right] = slots[right], slots[left]
         per_slot[left], per_slot[right] = per_slot[right], per_slot[left]
-        moves.append((left, int(slots[left])))
-        moves.append((right, int(slots[right])))
-    return moves

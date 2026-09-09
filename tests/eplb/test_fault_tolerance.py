@@ -19,7 +19,7 @@ import unittest
 import numpy as np
 
 from fastdeploy.eplb.fault_tolerance import (
-    card_imbalance,
+    gpu_imbalance,
     evict_order,
     keep_from_order,
     coverage_repair,
@@ -225,7 +225,7 @@ class TestCoverageRepair(unittest.TestCase):
 
     def test_spare_replica_is_taken_first(self):
         """
-        3 cards of 3 slots hold 6 experts plus 3 replicas. Losing card 0 leaves
+        3 GPUs of 3 slots hold 6 experts plus 3 replicas. Losing GPU 0 leaves
         expert 2 gone and expert 3 holding two slots, so one write restores full
         coverage at no coverage cost.
         """
@@ -234,7 +234,7 @@ class TestCoverageRepair(unittest.TestCase):
         importance = np.array([[10.0, 9.0, 8.0, 7.0, 2.0, 1.0]])
         load = np.zeros((1, 6))
 
-        moves, new_slots = coverage_repair(keep, slots, importance, load, num_cards=2)
+        moves, new_slots = coverage_repair(keep, slots, importance, load, num_gpus=2)
         self.assertEqual(len(moves), 1)
         layer, slot, expert = moves[0]
         self.assertEqual((layer, expert), (0, 2))
@@ -248,7 +248,7 @@ class TestCoverageRepair(unittest.TestCase):
         importance = np.array([[10.0, 9.0, 8.0, 7.0, 2.0, 1.0]])
         load = np.zeros((1, 6))
 
-        moves, new_slots = coverage_repair(keep, slots, importance, load, num_cards=2)
+        moves, new_slots = coverage_repair(keep, slots, importance, load, num_gpus=2)
         self.assertEqual(len(moves), 2)
         # The most important expert is brought back first, the cheapest gives way.
         self.assertEqual([expert for _, _, expert in moves], [0, 1])
@@ -257,8 +257,8 @@ class TestCoverageRepair(unittest.TestCase):
     def test_coverage_matches_keep(self):
         """After repair the placement holds exactly the kept experts"""
         rng = np.random.default_rng(3)
-        num_experts, num_cards, slots_per_card = 16, 4, 5
-        capacity = num_cards * slots_per_card
+        num_experts, num_gpus, slots_per_gpu = 16, 4, 5
+        capacity = num_gpus * slots_per_gpu
         for _ in range(20):
             slots = rng.integers(0, num_experts, (1, capacity))
             resident = np.bincount(slots[0], minlength=num_experts) > 0
@@ -269,15 +269,15 @@ class TestCoverageRepair(unittest.TestCase):
             importance = rng.random((1, num_experts))
             load = rng.random((1, num_experts))
 
-            _, new_slots = coverage_repair(keep[None], slots, importance, load, num_cards)
+            _, new_slots = coverage_repair(keep[None], slots, importance, load, num_gpus)
             present = np.bincount(new_slots[0], minlength=num_experts) > 0
             np.testing.assert_array_equal(present, keep)
 
     def test_move_count_is_bounded_by_the_lost_experts(self):
         """A bring-back can only target an expert that is currently absent"""
         rng = np.random.default_rng(4)
-        num_experts, num_cards, slots_per_card = 16, 4, 5
-        capacity = num_cards * slots_per_card
+        num_experts, num_gpus, slots_per_gpu = 16, 4, 5
+        capacity = num_gpus * slots_per_gpu
         for _ in range(20):
             slots = rng.integers(0, num_experts, (1, capacity))
             resident = np.bincount(slots[0], minlength=num_experts) > 0
@@ -287,13 +287,13 @@ class TestCoverageRepair(unittest.TestCase):
             importance = rng.random((1, num_experts))
 
             moves, _ = coverage_repair(
-                keep[None], slots, importance, np.zeros((1, num_experts)), num_cards
+                keep[None], slots, importance, np.zeros((1, num_experts)), num_gpus
             )
             self.assertLessEqual(len(moves), int((~resident).sum()))
 
     def test_balance_worked_example(self):
         """
-        3 cards of 3 slots, experts 0 and 1 replicated. Card loads start at
+        3 GPUs of 3 slots, experts 0 and 1 replicated. GPU loads start at
         15/12/7; one trade brings the peak to the best a 3-slot split allows.
         """
         keep = np.ones((1, 7), dtype=bool)
@@ -301,14 +301,14 @@ class TestCoverageRepair(unittest.TestCase):
         load = np.array([[10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 1.0]])
         importance = np.ones((1, 7))
 
-        before = card_imbalance(slots[0], load[0], 3)
+        before = gpu_imbalance(slots[0], load[0], 3)
         self.assertAlmostEqual(before, 15 / (34 / 3), places=6)
 
         moves, new_slots = coverage_repair(keep, slots, importance, load, 3, target_imbalance=1.05)
         self.assertEqual(len(moves), 2)
         np.testing.assert_array_equal(new_slots[0], [6, 1, 2, 3, 4, 0, 5, 0, 1])
-        # 34 over three cards of three slots cannot go below a peak of 12.
-        self.assertAlmostEqual(card_imbalance(new_slots[0], load[0], 3), 12 / (34 / 3), places=6)
+        # 34 over three GPUs of three slots cannot go below a peak of 12.
+        self.assertAlmostEqual(gpu_imbalance(new_slots[0], load[0], 3), 12 / (34 / 3), places=6)
 
     def test_balance_stops_when_target_is_unreachable(self):
         """No improving trade left is a normal exit, not a hang"""
@@ -318,19 +318,19 @@ class TestCoverageRepair(unittest.TestCase):
         moves, new_slots = coverage_repair(
             keep, slots, np.ones((1, 7)), load, 3, target_imbalance=1.0
         )
-        self.assertGreater(card_imbalance(new_slots[0], load[0], 3), 1.0)
+        self.assertGreater(gpu_imbalance(new_slots[0], load[0], 3), 1.0)
         self.assertLess(len(moves), 20)
 
     def test_balance_never_makes_it_worse(self):
         rng = np.random.default_rng(5)
-        num_experts, num_cards, slots_per_card = 16, 4, 5
+        num_experts, num_gpus, slots_per_gpu = 16, 4, 5
         for _ in range(20):
-            slots = rng.integers(0, num_experts, (1, num_cards * slots_per_card))
+            slots = rng.integers(0, num_experts, (1, num_gpus * slots_per_gpu))
             keep = np.bincount(slots[0], minlength=num_experts) > 0
             load = np.exp(rng.normal(0.0, 1.0, (1, num_experts)))
-            before = card_imbalance(slots[0], load[0], num_cards)
-            _, new_slots = coverage_repair(keep[None], slots, np.ones((1, num_experts)), load, num_cards)
-            self.assertLessEqual(card_imbalance(new_slots[0], load[0], num_cards), before + 1e-9)
+            before = gpu_imbalance(slots[0], load[0], num_gpus)
+            _, new_slots = coverage_repair(keep[None], slots, np.ones((1, num_experts)), load, num_gpus)
+            self.assertLessEqual(gpu_imbalance(new_slots[0], load[0], num_gpus), before + 1e-9)
 
     def test_zero_load_is_not_a_division(self):
         """Load stats are zeroed after a reset; balancing must just do nothing"""
@@ -339,7 +339,7 @@ class TestCoverageRepair(unittest.TestCase):
         moves, new_slots = coverage_repair(keep, slots, np.ones((1, 4)), np.zeros((1, 4)), 2)
         self.assertEqual(moves, [])
         np.testing.assert_array_equal(new_slots, slots)
-        self.assertEqual(card_imbalance(slots[0], np.zeros(4), 2), 1.0)
+        self.assertEqual(gpu_imbalance(slots[0], np.zeros(4), 2), 1.0)
 
     def test_inputs_are_not_modified(self):
         keep = np.ones((1, 7), dtype=bool)
@@ -357,21 +357,41 @@ class TestCoverageRepair(unittest.TestCase):
         with self.assertRaises(ValueError):
             coverage_repair(keep, slots, np.ones((1, 6)), np.zeros((1, 6)), 2)
 
-    def test_rejects_capacity_not_divisible_by_cards(self):
+    def test_rejects_capacity_not_divisible_by_gpus(self):
         keep = np.ones((1, 4), dtype=bool)
         slots = np.array([[0, 1, 2, 3]])
         with self.assertRaises(ValueError):
             coverage_repair(keep, slots, np.ones((1, 4)), np.zeros((1, 4)), 3)
 
+    def test_each_slot_is_written_at_most_once(self):
+        """
+        A trade can move away an expert the refill just put there, so the plan is reduced
+        to the slots whose final content differs. The mover can then treat one entry as
+        one H2D.
+        """
+        rng = np.random.default_rng(8)
+        num_experts, num_gpus, slots_per_gpu = 16, 4, 5
+        slots = rng.integers(0, num_experts, (3, num_gpus * slots_per_gpu))
+        keep = np.stack([np.bincount(slots[i], minlength=num_experts) > 0 for i in range(3)])
+        load = np.exp(rng.normal(0.0, 1.0, (3, num_experts)))
+
+        moves, new_slots = coverage_repair(keep, slots, np.ones((3, num_experts)), load, num_gpus)
+        targets = [(layer, slot) for layer, slot, _ in moves]
+        self.assertEqual(len(targets), len(set(targets)))
+        self.assertEqual(len(moves), int((slots != new_slots).sum()))
+        # Nothing is written back to the value it already held.
+        for layer, slot, expert in moves:
+            self.assertNotEqual(slots[layer, slot], expert)
+
     def test_moves_replay_to_the_returned_placement(self):
         """Applying the move list in order reproduces new_slots"""
         rng = np.random.default_rng(6)
-        num_experts, num_cards, slots_per_card = 16, 4, 5
-        slots = rng.integers(0, num_experts, (2, num_cards * slots_per_card))
+        num_experts, num_gpus, slots_per_gpu = 16, 4, 5
+        slots = rng.integers(0, num_experts, (2, num_gpus * slots_per_gpu))
         keep = np.stack([np.bincount(slots[i], minlength=num_experts) > 0 for i in range(2)])
         load = np.exp(rng.normal(0.0, 1.0, (2, num_experts)))
 
-        moves, new_slots = coverage_repair(keep, slots, np.ones((2, num_experts)), load, num_cards)
+        moves, new_slots = coverage_repair(keep, slots, np.ones((2, num_experts)), load, num_gpus)
         replayed = slots.copy()
         for layer, slot, expert in moves:
             replayed[layer, slot] = expert
