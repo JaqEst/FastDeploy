@@ -189,7 +189,6 @@ class TestInitEplbSignals(unittest.TestCase):
             "redundant_expert_api_user": "test_user",
             "redundant_expert_api_password": "test_pass",
             "redundant_expert_eplb_strategy": "",
-            "redundant_expert_ip_shm_size": 1024,
             "moe_quant_type": "",
             "redundant_expert_enable_schedule_cordon": False,
         }
@@ -220,16 +219,24 @@ class TestInitEplbSignals(unittest.TestCase):
 
         # Verify IPCSignal was called for rank 0 specific signals
         expected_calls = [
-            # Rank 0 specific signals
             ("rearrange_experts_status", np.zeros([1], dtype=np.int32), np.int32, ipc_signal_suffix, True),
-            ("rearrange_experts_ips_size", np.zeros([1], dtype=np.int32), np.int32, ipc_signal_suffix, True),
-            ("rearrange_experts_ips_list", 1024, None, ipc_signal_suffix, True),  # shm_size
+            (
+                "signal_allreduce_expert_tokens_stats",
+                np.zeros([1], dtype=np.int32),
+                np.int32,
+                ipc_signal_suffix,
+                True,
+            ),
+            (
+                "signal_allreduce_load_weight_result",
+                np.zeros([1], dtype=np.int32),
+                np.int32,
+                ipc_signal_suffix,
+                True,
+            ),
             ("signal_update_weight_from_tensor", np.zeros([1], dtype=np.int32), np.int32, ipc_signal_suffix, True),
-            # Common signals
-            ("all_experts_token_stats", np.zeros((3, 64), dtype=np.int32), np.int32, ipc_signal_suffix, True),
-            ("local_experts_token_stats", np.zeros((3, 64), dtype=np.int32), np.int32, ipc_signal_suffix, True),
-            ("signal_update_weight_from_disk", np.zeros([1], dtype=np.int32), np.int32, ipc_signal_suffix, True),
-            ("signal_clear_experts_token_stats", np.zeros([1], dtype=np.int32), np.int32, ipc_signal_suffix, True),
+            ("expert_rank_table", np.full((3, 64), -1, dtype=np.int32), np.int32, ipc_signal_suffix, True),
+            # Per tp rank signals
             ("result_update_weight_from_disk", np.zeros([1], dtype=np.int32), np.int32, ipc_signal_suffix, True),
         ]
 
@@ -246,7 +253,6 @@ class TestInitEplbSignals(unittest.TestCase):
         self.fd_config.parallel_config.tensor_parallel_rank = 0
         self.fd_config.parallel_config.tensor_parallel_size = 1
         self.fd_config.parallel_config.local_data_parallel_id = 1
-        self.fd_config.eplb_config.redundant_expert_ip_shm_size = 1024
         ipc_signal_suffix = 123
         init_eplb_signals(self.fd_config, ipc_signal_suffix)
 
@@ -256,13 +262,22 @@ class TestInitEplbSignals(unittest.TestCase):
         expected_calls = [
             # Common signals (no rank 0 specific signals)
             ("rearrange_experts_status", np.zeros([1], dtype=np.int32), np.int32, dp_ipc_signal_suffix, True),
-            ("rearrange_experts_ips_size", np.zeros([1], dtype=np.int32), np.int32, dp_ipc_signal_suffix, True),
-            ("rearrange_experts_ips_list", 1024, dp_ipc_signal_suffix, True),
+            (
+                "signal_allreduce_expert_tokens_stats",
+                np.zeros([1], dtype=np.int32),
+                np.int32,
+                dp_ipc_signal_suffix,
+                True,
+            ),
+            (
+                "signal_allreduce_load_weight_result",
+                np.zeros([1], dtype=np.int32),
+                np.int32,
+                dp_ipc_signal_suffix,
+                True,
+            ),
             ("signal_update_weight_from_tensor", np.zeros([1], dtype=np.int32), np.int32, dp_ipc_signal_suffix, True),
-            ("all_experts_token_stats", np.zeros((3, 64), dtype=np.int32), np.int32, tp_ipc_signal_suffix, True),
-            ("local_experts_token_stats", np.zeros((3, 64), dtype=np.int32), np.int32, tp_ipc_signal_suffix, True),
-            ("signal_update_weight_from_disk", np.zeros([1], dtype=np.int32), np.int32, tp_ipc_signal_suffix, True),
-            ("signal_clear_experts_token_stats", np.zeros([1], dtype=np.int32), np.int32, tp_ipc_signal_suffix, True),
+            ("expert_rank_table", np.full((3, 64), -1, dtype=np.int32), np.int32, dp_ipc_signal_suffix, True),
             ("result_update_weight_from_disk", np.zeros([1], dtype=np.int32), np.int32, tp_ipc_signal_suffix, True),
         ]
 
@@ -292,10 +307,6 @@ class TestInitEplbSignals(unittest.TestCase):
             if len(actual_args) > 0:
                 self.assertEqual(actual_args[0], expected[0], f"Signal name mismatch at call {i}")
             else:
-                continue
-
-            # Special handling for rearrange_experts_ips_list
-            if expected[0] == "rearrange_experts_ips_list":
                 continue
 
             # Verify array/values if present

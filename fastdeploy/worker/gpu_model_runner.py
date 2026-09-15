@@ -2717,6 +2717,10 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["accept_num_cpu"].copy_(self.share_inputs["accept_num"], False)
                 self.share_inputs["seq_lens_decoder_cpu"].copy_(self.share_inputs["seq_lens_decoder"], False)
                 self.share_inputs["prompt_lens_cpu"].copy_(self.share_inputs["prompt_lens"], False)
+            if self.fd_config.eplb_config.enable_eplb:
+                self.get_model().redundant_table_manger.maybe_copy_tokens_stats(
+                    self.fd_config.eplb_config.redundant_expert_dump_workload_interval
+                )
             self._check_ep_active_ranks()
             post_process_event.record()
 

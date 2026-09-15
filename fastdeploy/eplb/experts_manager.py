@@ -16,11 +16,10 @@
 
 import threading
 import time
-from http import HTTPStatus
 from multiprocessing import get_context
 
 import numpy as np
-import requests
+import paddle
 
 from fastdeploy.config import FDConfig
 from fastdeploy.eplb.async_expert_loader import load_model_weights_process
@@ -54,8 +53,6 @@ class RedundantExpertManager:
         self.ep_size = ep_size
         self.fd_config = fd_config
         self.eplb_config = fd_config.eplb_config
-        self.api_user = self.eplb_config.redundant_expert_api_user
-        self.api_passwd = self.eplb_config.redundant_expert_api_password
         self.num_redundant_experts = self.eplb_config.redundant_experts_num
         self.num_hidden_layers = self.fd_config.model_config.num_hidden_layers
         self.num_logical_experts = self.fd_config.model_config.moe_num_experts
@@ -126,6 +123,8 @@ class RedundantExpertManager:
 
         self.rearrange_experts_signal = None
         self.signal_update_weight_from_tensor_array = None
+        self.signal_allreduce_expert_tokens_stats_array = None
+        self.signal_allreduce_load_weight_result_array = None
         if self.local_rank == 0:
             self.rearrange_experts_signal = IPCSignal(
                 name="rearrange_experts_status",
@@ -136,6 +135,20 @@ class RedundantExpertManager:
             )
             self.signal_update_weight_from_tensor_array = IPCSignal(
                 name="signal_update_weight_from_tensor",
+                array=np.zeros([1], dtype=np.int32),
+                dtype=np.int32,
+                suffix=self.dp_ipc_signal_suffix,
+                create=False,
+            )
+            self.signal_allreduce_expert_tokens_stats_array = IPCSignal(
+                name="signal_allreduce_expert_tokens_stats",
+                array=np.zeros([1], dtype=np.int32),
+                dtype=np.int32,
+                suffix=self.dp_ipc_signal_suffix,
+                create=False,
+            )
+            self.signal_allreduce_load_weight_result_array = IPCSignal(
+                name="signal_allreduce_load_weight_result",
                 array=np.zeros([1], dtype=np.int32),
                 dtype=np.int32,
                 suffix=self.dp_ipc_signal_suffix,
@@ -154,17 +167,27 @@ class RedundantExpertManager:
             create=False,
         )
 
+        tp_ipc_signal_suffix = f"{self.dp_ipc_signal_suffix}_tp{self.local_rank}"
+        self.update_weight_from_disk_result = IPCSignal(
+            name="result_update_weight_from_disk",
+            array=np.zeros([1], dtype=np.int32),
+            dtype=np.int32,
+            suffix=tp_ipc_signal_suffix,
+            create=False,
+        )
+
         if not self.seed_expert_rank_table():
             self.calculate_expert_rank_table(True)
 
-        self.dp_rank_address = None
-        self.need_allgather_load_weight_result = False
-        self.need_update_weight_from_tensor = False
+        # Handed over by the worker event loop, consumed by the listen thread.
+        self.pending_tokens_stats = None
+        self.disk_load_in_flight = False
+        self.disk_load_begin_ts = 0
+        self.need_load_weight_result_allreduce = False
         self.load_weight_begin_ts = 0
         self.load_weight_timeout = 300  # 5min
-        self.need_rearrange_expert = False
-        self.need_update_expert_tokens_stat = True
-        self.http_timeout = 1
+        self.load_weight_result_allreduce_interval = 3
+        self.last_load_weight_result_allreduce_ts = 0
         # 重置重排状态: 'done' -> 'free'
         self.rearrange_end_ts = 0
         self.rearrange_reset_interval = 30
@@ -222,104 +245,31 @@ class RedundantExpertManager:
         """
         listen_rearrange_expert_signal
         """
-        dp_ipc_signal_suffix = self.dp_ipc_signal_suffix
-        if self.local_rank == 0:
-            rearrange_experts_ips_size_array = np.zeros([1], dtype=np.int32)
-            rearrange_experts_ips_size_signal = IPCSignal(
-                name="rearrange_experts_ips_size",
-                array=rearrange_experts_ips_size_array,
-                dtype=np.int32,
-                suffix=dp_ipc_signal_suffix,
-                create=False,
-            )
-
-            shm_rearrange_experts_ips_list = IPCSignal(
-                name="rearrange_experts_ips_list",
-                shm_size=self.eplb_config.redundant_expert_ip_shm_size,
-                suffix=dp_ipc_signal_suffix,
-                create=False,
-            )
-
-        tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{self.local_rank}"
-        signal_update_weight_from_disk = np.zeros([1], dtype=np.int32)
-        signal_update_weight_from_disk_array = IPCSignal(
-            name="signal_update_weight_from_disk",
-            array=signal_update_weight_from_disk,
-            dtype=np.int32,
-            suffix=tp_ipc_signal_suffix,
-            create=False,
-        )
-
-        experts_token_stats = np.zeros(
-            (self.fd_config.model_config.num_hidden_layers, self.fd_config.model_config.moe_num_experts),
-            dtype=np.int32,
-        )
-        shm_all_experts_token_stats = IPCSignal(
-            name="all_experts_token_stats",
-            array=experts_token_stats,
-            dtype=np.int32,
-            suffix=tp_ipc_signal_suffix,
-            create=False,
-        )
-
-        result_update_weight_from_disk = np.zeros([1], dtype=np.int32)
-        self.update_weight_from_disk_result = IPCSignal(
-            name="result_update_weight_from_disk",
-            array=result_update_weight_from_disk,
-            dtype=np.int32,
-            suffix=tp_ipc_signal_suffix,
-            create=False,
-        )
-
         while True:
-            if self.local_rank == 0:
-                now = int(time.time())
-                if rearrange_experts_ips_size_signal.value[0] > 0:
-                    # step 1. all reduce experts token stats
-                    address = bytes(
-                        shm_rearrange_experts_ips_list.shm.buf[: rearrange_experts_ips_size_signal.value[0]]
-                    ).decode("utf-8")
-                    self.logger.info(f"redundant_expert: all rank ips {address}")
-                    rearrange_experts_ips_size_signal.value[0] = 0
-                    self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DOING.value
-                    self.rearrange_end_ts = 0
-
-                    self.dp_rank_address = address.strip().split(";")
-                    if self.allreduce_experts_stat():
-                        self.need_allgather_load_weight_result = True
-                        self.load_weight_begin_ts = now
-                        self.logger.info("redundant_expert: all-reduce experts stats success")
-                    else:
-                        self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
-                        self.logger.warning("redundant_expert: all-reduce experts stats fail")
-                elif self.need_allgather_load_weight_result and self.allreduce_load_weight_result():
-                    # step 3. all reduce the result of load weight from disk
-                    self.need_allgather_load_weight_result = False
-                    self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.LOAD_SUCC.value
-                    self.rearrange_end_ts = now
-                    if self.need_update_weight_from_tensor:
-                        if self.notify_update_weight_from_tensor():
-                            self.need_update_weight_from_tensor = False
-                        else:
-                            self.need_allgather_load_weight_result = True
-                if self.rearrange_experts_signal.value[0] > 1:
-                    if self.rearrange_end_ts == 0:
-                        self.rearrange_end_ts = now
-                    if now - self.rearrange_end_ts > self.rearrange_reset_interval:
-                        # reset rearrange status
-                        self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
-                        self.rearrange_end_ts = 0
-
-            if signal_update_weight_from_disk_array.value[0] == 1:
-                # step 2. async load weight: disk -> memory
-                self.model_tokens_per_expert_stats_list[:] = shm_all_experts_token_stats.value[:]
-                self.calculate_expert_rank_table()
-                if self.fd_config.afd_config.is_attn:
-                    self.update_weight_from_disk_result.value[0] = 1
-                else:
-                    self.update_weight_from_disk()
-                signal_update_weight_from_disk_array.value[0] = 0
+            self.advance_rearrange()
             time.sleep(0.5)
+
+    def advance_rearrange(self):
+        """
+        Drive one step of the rearrange state machine.
+        """
+        tokens_stats = self.pending_tokens_stats
+        if tokens_stats is not None:
+            self.pending_tokens_stats = None
+            self.begin_rearrange(tokens_stats)
+
+        self.poll_update_weight_from_disk()
+
+        if self.local_rank == 0:
+            self.drive_load_weight_result_allreduce()
+            now = int(time.time())
+            if self.rearrange_experts_signal.value[0] > RearrangeExpertStatus.DOING.value:
+                if self.rearrange_end_ts == 0:
+                    self.rearrange_end_ts = now
+                if now - self.rearrange_end_ts > self.rearrange_reset_interval:
+                    # reset rearrange status
+                    self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
+                    self.rearrange_end_ts = 0
 
     def seed_expert_rank_table(self) -> bool:
         """
@@ -390,7 +340,6 @@ class RedundantExpertManager:
                 self.model_ep_rank_to_expert_id_list, self.fd_config.afd_config
             )
 
-        if self.local_rank == 0:
             workload = RedundantExpertWorkload(self.eplb_config.redundant_expert_meta_dir)
             workload.tokens_per_expert_stats_list = self.model_tokens_per_expert_stats_list.tolist()
             workload.ep_rank_to_expert_id_list = rank_expert_list.tolist()
@@ -402,253 +351,124 @@ class RedundantExpertManager:
         """
         update_weight_from_disk
         """
-        begin_time = time.time()
-        self.update_weight_from_disk_result.value[0] = 0
+        if self.disk_load_in_flight:
+            self.logger.warning(f"redundant_expert: a disk load is still in flight, rank {self.rank}")
+            return
 
-        self.logger.info(f"redundant_expert: update_weight_from_disk send to async process, rank {self.rank}")
+        self.update_weight_from_disk_result.value[0] = 0
+        self.disk_load_begin_ts = int(time.time())
+        self.disk_load_in_flight = True
         self.parent_mg_conn.send(
             {
                 "old_model_ep_rank_to_expert_id_list": self.last_model_ep_rank_to_expert_id_list,
                 "new_model_ep_rank_to_expert_id_list": self.model_ep_rank_to_expert_id_list,
             }
         )
-        self.logger.info(f"redundant_expert: update_weight_from_disk recv from async process, rank {self.rank}")
-        response = self.parent_data_conn.recv()
-        self.tensor_infos = response["weights"]
+        self.logger.info(f"redundant_expert: update_weight_from_disk send to async process, rank {self.rank}")
 
+    def poll_update_weight_from_disk(self):
+        """
+        Collect the async loader's answer if it is ready, without blocking.
+        """
+        if not self.disk_load_in_flight or not self.parent_data_conn.poll():
+            return
+
+        response = self.parent_data_conn.recv()
+        self.disk_load_in_flight = False
+        self.tensor_infos = response["weights"]
         # 更新权重加载结果
         self.update_weight_from_disk_result.value[0] = 1 if response["result"] else -1
         self.logger.info(
             "redundant_expert: update_weight_from_disk end, rank"
-            + f" {self.rank} {response['result']}, cost {int(time.time() - begin_time)}s"
+            + f" {self.rank} {response['result']}, cost {int(time.time() - self.disk_load_begin_ts)}s"
         )
 
-    def allreduce_experts_stat(self):
-        """
-        专家负载
-        """
-        if not self.allgather_expert_token_stats():
-            return False
-        return self.broadcast_expert_token_stats()
+    def allreduce_expert_tokens_stats(self, tokens_stats, ep_group):
+        paddle.distributed.all_reduce(tokens_stats, op=paddle.distributed.ReduceOp.SUM, group=ep_group)
 
-    def allgather_expert_token_stats(self):
-        """
-        allgather_expert_token_stats
-        """
-        expert_token_stats = np.zeros((self.num_hidden_layers, self.num_logical_experts), dtype=np.int32)
-        success_count = 0
-        for addr in self.dp_rank_address:
-            try:
-                # TODO: 请求失败重试
-                params = {"user": self.api_user, "passwd": self.api_passwd}
-                res = requests.post(
-                    f"http://{addr}/get_per_expert_tokens_stats",
-                    json=params,
-                    timeout=self.http_timeout,
-                )
-                if res.status_code != HTTPStatus.OK:
-                    self.logger.warning(
-                        "redundant_expert: allgather_expert_token_stats fail. "
-                        + f"addr {addr}, res {res.status_code} {res.json()}"
-                    )
-                    break
+        if self.pending_tokens_stats is not None or self.disk_load_in_flight:
+            self.logger.warning("redundant_expert: previous rearrange still in flight, drop this trigger")
+            return
+        # Invalidate the previous round's result here rather than on the listen thread:
+        # every rank runs this in the same event loop step, so the result all-reduce
+        # cannot observe a stale success from a rank whose listen thread is still asleep.
+        self.update_weight_from_disk_result.value[0] = 0
+        self.pending_tokens_stats = np.array(tokens_stats.numpy(), dtype=np.int32)
 
-                for meta_data in res.json()["data"]:
-                    expert_token_stats += np.array(meta_data, dtype=np.int32)
-                success_count += 1
-            except Exception as e:
-                self.logger.error(f"redundant_expert: allgather_expert_token_stats fail. addr {addr}, error {e}")
-        if success_count == len(self.dp_rank_address):
-            self.need_rearrange_expert = True
-            self.model_tokens_per_expert_stats_list[:] = expert_token_stats[:]
-            self.logger.info("redundant_expert: allgather_expert_token_stats success")
-            return True
-        self.logger.info(
-            "redundant_expert: allgather_expert_token_stats fail. "
-            + f"succ {success_count} total {len(self.dp_rank_address)}"
-        )
-        return False
+    def begin_rearrange(self, tokens_stats: np.ndarray):
+        """
+        Rebalance for the reduced expert load and start loading the weights it needs.
+        """
+        self.model_tokens_per_expert_stats_list[:] = tokens_stats[:]
+        if self.local_rank == 0:
+            self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DOING.value
+            self.rearrange_end_ts = 0
+            self.need_load_weight_result_allreduce = True
+            self.load_weight_begin_ts = int(time.time())
+            self.last_load_weight_result_allreduce_ts = 0
 
-    def broadcast_expert_token_stats(self):
-        """
-        broadcast_expert_token_stats
-        """
-        success_count = 0
-        for addr in self.dp_rank_address:
-            try:
-                params = {
-                    "user": self.api_user,
-                    "passwd": self.api_passwd,
-                    "action": "recv_expert_weight",
-                    "data": self.model_tokens_per_expert_stats_list.tolist(),
-                }
-                res = requests.post(
-                    f"http://{addr}/rearrange_experts",
-                    json=params,
-                    timeout=self.http_timeout,
-                )
-                if res.status_code != HTTPStatus.OK:
-                    self.logger.warning(
-                        "redundant_expert: broadcast_expert_token_stats fail. "
-                        + f"addr {addr}, res {res.status_code} {res.json()}"
-                    )
-                    break
-                success_count += 1
-            except Exception as e:
-                self.logger.error(
-                    f"redundant_expert: broadcast_expert_token_stats request fail. addr {addr}, error {e}"
-                )
-        if success_count == len(self.dp_rank_address):
-            self.logger.info("redundant_expert: broadcast_expert_token_stats success")
-            return True
-        self.logger.info(
-            "redundant_expert: broadcast_expert_token_stats failed, "
-            + f"succ {success_count} total {len(self.dp_rank_address)}"
-        )
-        return False
+        self.calculate_expert_rank_table()
+        if self.fd_config.afd_config.is_attn:
+            # AFD attn ranks hold no expert weights, only the routing table.
+            self.update_weight_from_disk_result.value[0] = 1
+        else:
+            self.update_weight_from_disk()
 
-    def allreduce_load_weight_result(self):
+    def drive_load_weight_result_allreduce(self):
         """
-        权重加载结果
+        Ask the worker event loop to all-reduce(MIN) the per rank disk load results.
         """
-        if int(time.time()) - self.load_weight_begin_ts > self.load_weight_timeout:
-            self.logger.info(f"redundant_expert: allreduce_load_weight_result timeout {self.load_weight_timeout}s")
-            return True
+        if not self.need_load_weight_result_allreduce:
+            return
 
-        all_success, exist_fail = self.allgather_load_weight_result()
-        if exist_fail:
+        now = int(time.time())
+        if now - self.load_weight_begin_ts > self.load_weight_timeout:
+            self.logger.warning(f"redundant_expert: load weight from disk timeout {self.load_weight_timeout}s")
+            self.finish_load_weight_wait()
+            return
+        if now - self.last_load_weight_result_allreduce_ts <= self.load_weight_result_allreduce_interval:
+            return
+
+        self.last_load_weight_result_allreduce_ts = now
+        self.signal_allreduce_load_weight_result_array.value[0] = 1
+
+    def finish_load_weight_wait(self):
+        """
+        Stop waiting for the disk load result, whatever the outcome was.
+        """
+        self.need_load_weight_result_allreduce = False
+        # A request raised but not yet consumed by the event loop would otherwise fire
+        # a pointless collective the next time the worker runs a step.
+        self.signal_allreduce_load_weight_result_array.value[0] = 0
+        self.rearrange_experts_signal.value[0] = RearrangeExpertStatus.LOAD_SUCC.value
+        self.rearrange_end_ts = int(time.time())
+
+    def on_load_weight_result_allreduced(self, min_result: int):
+        """
+        min_result: -1 if any rank failed to load, 0 if any rank is still loading, 1 if all
+        ranks succeeded.
+        """
+        if self.local_rank != 0 or not self.need_load_weight_result_allreduce:
+            # Only tp0 owns the dp level signals, and another rank may still be polling
+            # after this one already gave up.
+            return
+
+        if min_result == 0:
+            self.logger.info("redundant_expert: allreduce_load_weight_result waiting")
+            return
+        if min_result < 0:
             # 如果有DP权重加载异常，结束本次重排
             self.logger.warning("redundant_expert: allreduce_load_weight_result exist fail, terminate this rearrange")
-            return True
-        if not all_success:
-            self.logger.info("redundant_expert: allreduce_load_weight_result waiting")
-            return False
-        # self.broadcast_load_weight_success()
-        self.logger.info(
-            f"redundant_expert_enable_schedule_cordon {self.eplb_config.redundant_expert_enable_schedule_cordon}"
-        )
-        if not exist_fail and all_success:
-            # prefill需要等待调度屏蔽
-            if (
-                self.fd_config.afd_config.enable_afd
-                or self.fd_config.scheduler_config.splitwise_role == "mixed"
-                or self.fd_config.scheduler_config.splitwise_role == "decode"
-                or not self.eplb_config.redundant_expert_enable_schedule_cordon
-            ):
-                self.need_update_weight_from_tensor = True
-        return True
+            self.finish_load_weight_wait()
+            return
 
-    def notify_update_weight_from_tensor(self):
-        """
-        Notify workers to apply loaded tensors and routing tables to the model.
-        """
-        if self.fd_config.afd_config.enable_afd:
-            return self.broadcast_update_weight_from_tensor()
-
+        self.finish_load_weight_wait()
+        # prefill需要等待调度屏蔽
         if (
-            self.fd_config.scheduler_config.splitwise_role == "mixed"
+            self.fd_config.afd_config.enable_afd
+            or self.fd_config.scheduler_config.splitwise_role == "mixed"
             or self.fd_config.scheduler_config.splitwise_role == "decode"
             or not self.eplb_config.redundant_expert_enable_schedule_cordon
         ):
             self.logger.info("redundant_expert: allreduce_load_weight_result success, notify infer.py")
             self.signal_update_weight_from_tensor_array.value[0] = 1
-        return True
-
-    def broadcast_update_weight_from_tensor(self):
-        """
-        Broadcast the final disk-to-model update signal to all rearrange participants.
-        """
-        success_count = 0
-        for addr in self.dp_rank_address:
-            try:
-                params = {
-                    "user": self.api_user,
-                    "passwd": self.api_passwd,
-                    "action": "update_weight_from_tensor",
-                    "from_controller": True,
-                }
-                res = requests.post(
-                    f"http://{addr}/rearrange_experts",
-                    json=params,
-                    timeout=self.http_timeout,
-                )
-                if res.status_code != HTTPStatus.OK:
-                    self.logger.warning(
-                        "redundant_expert: broadcast_update_weight_from_tensor fail. "
-                        + f"addr {addr}, res {res.status_code} {res.json()}"
-                    )
-                    break
-                success_count += 1
-            except Exception as e:
-                self.logger.error(
-                    f"redundant_expert: broadcast_update_weight_from_tensor request fail. addr {addr}, error {e}"
-                )
-        if success_count == len(self.dp_rank_address):
-            self.logger.info("redundant_expert: broadcast_update_weight_from_tensor success")
-            return True
-        self.logger.info(
-            "redundant_expert: broadcast_update_weight_from_tensor failed, "
-            + f"succ {success_count} total {len(self.dp_rank_address)}"
-        )
-        return False
-
-    def allgather_load_weight_result(self):
-        """
-        allgather_load_weight_result
-        """
-        all_success, exist_fail = False, False
-
-        success_count, fail_count, unfinish_count = 0, 0, 0
-        for addr in self.dp_rank_address:
-            try:
-                params = {
-                    "user": self.api_user,
-                    "passwd": self.api_passwd,
-                    "action": "check_load_weight_result",
-                }
-                res = requests.post(
-                    f"http://{addr}/check_redundant",
-                    json=params,
-                    timeout=self.http_timeout,
-                )
-                if res.status_code != HTTPStatus.OK:
-                    self.logger.warning(
-                        "redundant_expert: allgather_load_weight_result fail. "
-                        + f"addr {addr}, res {res.status_code} {res.json()}"
-                    )
-                    break
-                result_list = res.json()["data"]
-                self.logger.info(
-                    f"redundant_expert: allgather_load_weight_result success. addr {addr}, result_list {result_list}"
-                )
-                for result in result_list:
-                    if result == 1:
-                        success_count += 1
-                    elif result == -1:
-                        fail_count += 1
-                        self.logger.error(
-                            f"redundant_expert: allgather_load_weight_result fail. addr {addr}, result {result}"
-                        )
-                        exist_fail = True
-                    elif result == 0:
-                        unfinish_count += 1
-                        self.logger.debug(
-                            f"redundant_expert: allgather_load_weight_result unfinish. addr {addr}, result {result}"
-                        )
-            except Exception as e:
-                self.logger.error(f"redundant_expert: allgather_load_weight_result error. addr {addr}, error {e}")
-
-        if fail_count > 0:
-            self.logger.info(
-                "redundant_expert: allgather_load_weight_result not all ready, "
-                + f"succ {success_count} fail {fail_count} total {len(self.dp_rank_address)}"
-            )
-        elif unfinish_count > 0:
-            self.logger.info(
-                "redundant_expert: allgather_load_weight_result not all ready, "
-                + f"succ {success_count} fail {fail_count} unfinish_count {unfinish_count} total {len(self.dp_rank_address)}"
-            )
-        else:
-            self.logger.info("redundant_expert: allgather_load_weight_result all success")
-            all_success = True
-        return all_success, exist_fail

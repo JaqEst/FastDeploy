@@ -728,17 +728,6 @@ async def rearrange_experts(request: Request):
     return JSONResponse(content, status_code=status_code)
 
 
-@app.post("/get_per_expert_tokens_stats")
-@tracing.trace_span("get_per_expert_tokens_stats")
-async def get_per_expert_tokens_stats(request: Request):
-    """
-    get per expert tokens stats
-    """
-    request_dict = await request.json()
-    content, status_code = await app.state.engine_client.get_per_expert_tokens_stats(request_dict=request_dict)
-    return JSONResponse(content, status_code=status_code)
-
-
 @app.post("/get_expert_rank_table")
 @tracing.trace_span("get_expert_rank_table")
 async def get_expert_rank_table(request: Request):

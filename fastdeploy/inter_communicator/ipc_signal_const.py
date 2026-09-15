@@ -54,3 +54,10 @@ class RearrangeExpertStatus(Enum):
     DOING = 1
     LOAD_SUCC = 2  # load weight from disk success
     DONE = 3
+
+
+class EplbCollectiveOp(Enum):
+    NONE = 0
+    UPDATE_WEIGHT_FROM_TENSOR = 1
+    ALLREDUCE_LOAD_WEIGHT_RESULT = 2
+    ALLREDUCE_TOKENS_STATS = 3

@@ -15,7 +15,8 @@
 """
 
 """redundant expert manager."""
-from typing import Optional, Tuple
+import time
+from typing import Tuple
 
 import numpy as np
 import paddle
@@ -96,6 +97,11 @@ class RedundantExpertManger:
         self.model_tokens_per_expert_stats_list = paddle.ones(
             shape=[self.num_hidden_layers, self.num_expert], dtype="int32"
         )
+        self.model_tokens_per_expert_stats_list_cpu = paddle.zeros_like(
+            self.model_tokens_per_expert_stats_list
+        ).pin_memory()
+        self.model_tokens_per_expert_stats_ready = paddle.device.Event()
+        self.last_stats_copy_ts = 0.0
 
         shm_expert_rank_table = read_shared_expert_rank_table(fd_config) if fd_config is not None else None
         if shm_expert_rank_table is not None:
@@ -149,29 +155,18 @@ class RedundantExpertManger:
             self.model_expert_in_rank_num_list,
         )
 
-    def get_expert_tokens_stats(
-        self, verbose: bool = False, clear_stat: bool = False
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        """
-        get_per_expert_tokens_stats
-        """
-        try:
-            if verbose:
-                return (
-                    self.model_tokens_per_expert_stats_list.cpu().numpy(),
-                    self.model_expert_id_to_ep_rank_array.cpu().numpy(),
-                    self.model_ep_rank_to_expert_id_list.cpu().numpy(),
-                    self.model_expert_in_rank_num_list.cpu().numpy(),
-                )
-            return (
-                self.model_tokens_per_expert_stats_list.cpu().numpy(),
-                None,
-                None,
-                None,
-            )
-        finally:
-            if clear_stat:
-                self.model_tokens_per_expert_stats_list.zero_()
+    def maybe_copy_tokens_stats(self, interval: float) -> None:
+        now = time.time()
+        if now - self.last_stats_copy_ts <= interval:
+            return
+        self.last_stats_copy_ts = now
+        self.model_tokens_per_expert_stats_list_cpu.copy_(self.model_tokens_per_expert_stats_list, False)
+        self.model_tokens_per_expert_stats_ready.record()
+        self.model_tokens_per_expert_stats_list.zero_()
+
+    def get_tokens_stats_snapshot(self) -> paddle.Tensor:
+        self.model_tokens_per_expert_stats_ready.synchronize()
+        return self.model_tokens_per_expert_stats_list_cpu.cpu()
 
     def get_expert_id_to_ep_rank_array(self) -> np.ndarray:
         """

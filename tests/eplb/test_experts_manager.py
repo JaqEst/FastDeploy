@@ -14,12 +14,14 @@
 # limitations under the License.
 """
 
+import time
 import unittest
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import paddle
 
 from fastdeploy.config import (
     AFDConfig,
@@ -31,6 +33,7 @@ from fastdeploy.config import (
 )
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.eplb.experts_manager import RedundantExpertManager
+from fastdeploy.inter_communicator import RearrangeExpertStatus
 
 
 class TestRedundantExpertManager(unittest.TestCase):
@@ -70,7 +73,6 @@ class TestRedundantExpertManager(unittest.TestCase):
             "redundant_expert_api_user": "test_user",
             "redundant_expert_api_password": "test_pass",
             "redundant_expert_eplb_strategy": "",
-            "redundant_expert_ip_shm_size": 1024,
             "moe_quant_type": "",
             "redundant_expert_enable_schedule_cordon": False,
         }
@@ -201,7 +203,7 @@ class TestRedundantExpertManager(unittest.TestCase):
     @patch("fastdeploy.eplb.experts_manager.threading.Thread")
     @patch("fastdeploy.eplb.experts_manager.IPCSignal")
     def test_update_weight_from_disk(self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger):
-        """Test update_weight_from_disk method"""
+        """Test update_weight_from_disk only sends the request, without waiting for it"""
         mock_logger = MagicMock()
         mock_get_logger.return_value = mock_logger
 
@@ -210,167 +212,204 @@ class TestRedundantExpertManager(unittest.TestCase):
         # Mock IPCSignal
         mock_ipc_instance = MagicMock()
         mock_ipc_signal.return_value = mock_ipc_instance
-        manager.update_weight_from_disk_result = MagicMock()
+        manager.update_weight_from_disk_result = MagicMock(value=np.array([1]))
 
         # Mock parent connections
         manager.parent_mg_conn = MagicMock()
         manager.parent_data_conn = MagicMock()
-        manager.parent_data_conn.recv.return_value = {"result": True, "weights": ["weight1", "weight2"]}
 
         # Set up test data
         manager.last_model_ep_rank_to_expert_id_list = np.array([[0, 1, 2, 3]])
         manager.model_ep_rank_to_expert_id_list = np.array([[1, 2, 3, 4]])
 
-        with patch("time.time", return_value=1000):
-            manager.update_weight_from_disk()
+        manager.update_weight_from_disk()
 
-            # Verify that data was sent and received
-            manager.parent_mg_conn.send.assert_called_once()
-            manager.parent_data_conn.recv.assert_called_once()
-
-            # Verify that tensor_infos was set
-            self.assertEqual(manager.tensor_infos, ["weight1", "weight2"])
+        # The request is sent, but the answer is never awaited on this thread
+        manager.parent_mg_conn.send.assert_called_once()
+        manager.parent_data_conn.recv.assert_not_called()
+        self.assertTrue(manager.disk_load_in_flight)
+        self.assertEqual(manager.update_weight_from_disk_result.value[0], 0)
 
     @patch("fastdeploy.eplb.experts_manager.get_logger")
     @patch("fastdeploy.eplb.experts_manager.Process")
     @patch("fastdeploy.eplb.experts_manager.threading.Thread")
-    @patch("fastdeploy.eplb.experts_manager.requests.post")
-    def test_allgather_expert_token_stats(self, mock_requests, mock_thread, mock_process, mock_get_logger):
-        """Test allgather_expert_token_stats method"""
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    def test_poll_update_weight_from_disk(self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger):
+        """Test poll_update_weight_from_disk only consumes a ready answer"""
         mock_logger = MagicMock()
         mock_get_logger.return_value = mock_logger
 
         manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.update_weight_from_disk_result = MagicMock(value=np.array([0]))
+        manager.parent_data_conn = MagicMock()
+        manager.parent_data_conn.poll.return_value = False
+        manager.disk_load_in_flight = True
 
-        # Set up test addresses
-        manager.dp_rank_address = ["127.0.0.1:8000", "127.0.0.1:8001"]
+        manager.poll_update_weight_from_disk()
+        manager.parent_data_conn.recv.assert_not_called()
+        self.assertTrue(manager.disk_load_in_flight)
 
-        # Mock successful responses
-        mock_response1 = MagicMock()
-        mock_response1.status_code = 200
-        mock_response1.json.return_value = {"data": np.random.randint(0, 100, size=(3, 64))}  # 2 layers, 2 experts
+        manager.parent_data_conn.poll.return_value = True
+        manager.parent_data_conn.recv.return_value = {"result": True, "weights": ["weight1", "weight2"]}
 
-        mock_response2 = MagicMock()
-        mock_response2.status_code = 200
-        mock_response2.json.return_value = {"data": np.random.randint(0, 100, size=(3, 64))}  # 2 layers, 2 experts
+        manager.poll_update_weight_from_disk()
 
-        mock_requests.side_effect = [mock_response1, mock_response2]
-
-        # Update model config for this test
-        manager.num_hidden_layers = 3
-        manager.num_logical_experts = 64
-
-        manager.dp_rank_address = []
-        result = manager.allgather_expert_token_stats()
-
-        self.assertTrue(result)
-        # Verify that stats were accumulated
-        expected_stats = np.zeros((3, 64))
-        np.testing.assert_array_equal(manager.model_tokens_per_expert_stats_list, expected_stats)
+        self.assertFalse(manager.disk_load_in_flight)
+        self.assertEqual(manager.tensor_infos, ["weight1", "weight2"])
+        self.assertEqual(manager.update_weight_from_disk_result.value[0], 1)
 
     @patch("fastdeploy.eplb.experts_manager.get_logger")
     @patch("fastdeploy.eplb.experts_manager.Process")
     @patch("fastdeploy.eplb.experts_manager.threading.Thread")
-    @patch("fastdeploy.eplb.experts_manager.requests.post")
-    def test_broadcast_expert_token_stats(self, mock_requests, mock_thread, mock_process, mock_get_logger):
-        """Test broadcast_expert_token_stats method"""
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    @patch("fastdeploy.eplb.experts_manager.paddle.distributed.all_reduce")
+    def test_allreduce_expert_tokens_stats(
+        self, mock_all_reduce, mock_ipc_signal, mock_thread, mock_process, mock_get_logger
+    ):
+        """Test allreduce_expert_tokens_stats reduces then hands the payload over"""
         mock_logger = MagicMock()
         mock_get_logger.return_value = mock_logger
 
         manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.update_weight_from_disk_result = MagicMock(value=np.array([1]))
+        manager.calculate_expert_rank_table = MagicMock()
+        manager.update_weight_from_disk = MagicMock()
 
-        # Set up test addresses
-        manager.dp_rank_address = ["127.0.0.1:8000", "127.0.0.1:8001"]
+        tokens_stats = paddle.full(
+            shape=[manager.num_hidden_layers, manager.num_logical_experts], fill_value=7, dtype="int32"
+        )
+        manager.allreduce_expert_tokens_stats(tokens_stats, ep_group=None)
 
-        # Mock successful responses
-        mock_response1 = MagicMock()
-        mock_response1.status_code = 200
+        mock_all_reduce.assert_called_once()
+        # Nothing slow runs on the caller's thread, and the stale result is invalidated
+        manager.calculate_expert_rank_table.assert_not_called()
+        manager.update_weight_from_disk.assert_not_called()
+        self.assertEqual(manager.update_weight_from_disk_result.value[0], 0)
+        np.testing.assert_array_equal(manager.pending_tokens_stats, tokens_stats.numpy())
 
-        mock_response2 = MagicMock()
-        mock_response2.status_code = 200
-
-        mock_requests.side_effect = [mock_response1, mock_response2]
-
-        result = manager.broadcast_expert_token_stats()
-
-        self.assertTrue(result)
-        self.assertEqual(mock_requests.call_count, 2)
+        # A second trigger while the first is still pending is dropped
+        manager.allreduce_expert_tokens_stats(paddle.zeros_like(tokens_stats), ep_group=None)
+        np.testing.assert_array_equal(manager.pending_tokens_stats, tokens_stats.numpy())
 
     @patch("fastdeploy.eplb.experts_manager.get_logger")
     @patch("fastdeploy.eplb.experts_manager.Process")
     @patch("fastdeploy.eplb.experts_manager.threading.Thread")
-    @patch("fastdeploy.eplb.experts_manager.requests.post")
-    def test_broadcast_update_weight_from_tensor(self, mock_requests, mock_thread, mock_process, mock_get_logger):
-        """Test broadcast update_weight_from_tensor notification."""
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    def test_begin_rearrange(self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger):
+        """Test begin_rearrange rebalances and starts the disk load on the listen thread"""
         mock_logger = MagicMock()
         mock_get_logger.return_value = mock_logger
 
         manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
-        manager.dp_rank_address = ["127.0.0.1:8000", "127.0.0.1:8001"]
+        manager.rearrange_experts_signal = MagicMock(value=np.array([RearrangeExpertStatus.FREE.value]))
+        manager.update_weight_from_disk_result = MagicMock(value=np.array([0]))
+        manager.update_weight_from_disk = MagicMock()
+        manager.calculate_expert_rank_table = MagicMock()
 
-        mock_response1 = MagicMock()
-        mock_response1.status_code = 200
-        mock_response2 = MagicMock()
-        mock_response2.status_code = 200
-        mock_requests.side_effect = [mock_response1, mock_response2]
+        tokens_stats = np.full((manager.num_hidden_layers, manager.num_logical_experts), 3, dtype=np.int32)
+        manager.begin_rearrange(tokens_stats)
 
-        result = manager.broadcast_update_weight_from_tensor()
-
-        self.assertTrue(result)
-        self.assertEqual(mock_requests.call_count, 2)
-        for call_args in mock_requests.call_args_list:
-            self.assertEqual(call_args.kwargs["json"]["action"], "update_weight_from_tensor")
-            self.assertTrue(call_args.kwargs["json"]["from_controller"])
+        np.testing.assert_array_equal(manager.model_tokens_per_expert_stats_list, tokens_stats)
+        manager.calculate_expert_rank_table.assert_called_once()
+        manager.update_weight_from_disk.assert_called_once()
+        self.assertTrue(manager.need_load_weight_result_allreduce)
+        self.assertEqual(manager.rearrange_experts_signal.value[0], RearrangeExpertStatus.DOING.value)
 
     @patch("fastdeploy.eplb.experts_manager.get_logger")
     @patch("fastdeploy.eplb.experts_manager.Process")
     @patch("fastdeploy.eplb.experts_manager.threading.Thread")
-    @patch("fastdeploy.eplb.experts_manager.requests.post")
-    def test_allgather_load_weight_result(self, mock_requests, mock_thread, mock_process, mock_get_logger):
-        """Test allgather_load_weight_result method"""
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    def test_drive_load_weight_result_allreduce(self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger):
+        """Test the listen thread asks for the result all-reduce and owns the timeout"""
         mock_logger = MagicMock()
         mock_get_logger.return_value = mock_logger
 
         manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.rearrange_experts_signal = MagicMock(value=np.array([RearrangeExpertStatus.DOING.value]))
+        manager.signal_allreduce_load_weight_result_array = MagicMock(value=np.array([0]))
+        manager.need_load_weight_result_allreduce = True
+        manager.load_weight_begin_ts = int(time.time())
 
-        # Set up test addresses
-        manager.dp_rank_address = ["127.0.0.1:8000", "127.0.0.1:8001"]
+        manager.drive_load_weight_result_allreduce()
+        self.assertEqual(manager.signal_allreduce_load_weight_result_array.value[0], 1)
 
-        # Mock successful responses with mixed results
-        mock_response1 = MagicMock()
-        mock_response1.status_code = 200
-        mock_response1.json.return_value = {"data": [1, 1]}  # Two successful loads
+        # Within the interval no new request is raised
+        manager.signal_allreduce_load_weight_result_array.value[0] = 0
+        manager.drive_load_weight_result_allreduce()
+        self.assertEqual(manager.signal_allreduce_load_weight_result_array.value[0], 0)
 
-        mock_response2 = MagicMock()
-        mock_response2.status_code = 200
-        mock_response2.json.return_value = {"data": [-1, 1]}  # One failed, one successful
+        # Past the timeout the wait ends instead of asking for another collective
+        manager.load_weight_begin_ts = int(time.time()) - manager.load_weight_timeout - 1
+        manager.last_load_weight_result_allreduce_ts = 0
+        manager.drive_load_weight_result_allreduce()
+        self.assertEqual(manager.signal_allreduce_load_weight_result_array.value[0], 0)
+        self.assertFalse(manager.need_load_weight_result_allreduce)
+        self.assertEqual(manager.rearrange_experts_signal.value[0], RearrangeExpertStatus.LOAD_SUCC.value)
 
-        mock_requests.side_effect = [mock_response1, mock_response2]
+    @patch("fastdeploy.eplb.experts_manager.get_logger")
+    @patch("fastdeploy.eplb.experts_manager.Process")
+    @patch("fastdeploy.eplb.experts_manager.threading.Thread")
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    def test_on_load_weight_result_allreduced_success(
+        self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger
+    ):
+        """Test on_load_weight_result_allreduced with all ranks succeeding (min_result=1)."""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
 
-        all_success, exist_fail = manager.allgather_load_weight_result()
+        manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.rearrange_experts_signal = MagicMock(value=np.array([RearrangeExpertStatus.DOING.value]))
+        manager.signal_allreduce_load_weight_result_array = MagicMock(value=np.array([1]))
+        manager.signal_update_weight_from_tensor_array = MagicMock(value=np.array([0]))
+        manager.need_load_weight_result_allreduce = True
+        manager.eplb_config.redundant_expert_enable_schedule_cordon = False
 
-        self.assertFalse(all_success)  # Not all successful due to failure
-        self.assertTrue(exist_fail)  # There is a failure
+        manager.on_load_weight_result_allreduced(1)
 
-    def test_edge_cases(self):
-        """Test edge cases"""
-        # Test with empty addresses
-        with (
-            patch("fastdeploy.eplb.experts_manager.get_logger"),
-            patch("fastdeploy.eplb.experts_manager.Process"),
-            patch("fastdeploy.eplb.experts_manager.threading.Thread"),
-        ):
+        self.assertFalse(manager.need_load_weight_result_allreduce)
+        self.assertEqual(manager.rearrange_experts_signal.value[0], RearrangeExpertStatus.LOAD_SUCC.value)
+        self.assertEqual(manager.signal_update_weight_from_tensor_array.value[0], 1)
 
-            manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
-            manager.dp_rank_address = []
-            # Test allgather with empty addresses
-            result = manager.allgather_expert_token_stats()
-            self.assertTrue(result)
+    @patch("fastdeploy.eplb.experts_manager.get_logger")
+    @patch("fastdeploy.eplb.experts_manager.Process")
+    @patch("fastdeploy.eplb.experts_manager.threading.Thread")
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    def test_on_load_weight_result_allreduced_fail(self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger):
+        """Test on_load_weight_result_allreduced with a failure (min_result=-1)."""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
 
-            manager.dp_rank_address = []
-            # Test broadcast with empty addresses
-            result = manager.broadcast_expert_token_stats()
-            self.assertTrue(result)  # Should return True for empty list
+        manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.rearrange_experts_signal = MagicMock(value=np.array([RearrangeExpertStatus.DOING.value]))
+        manager.signal_allreduce_load_weight_result_array = MagicMock(value=np.array([1]))
+        manager.signal_update_weight_from_tensor_array = MagicMock(value=np.array([0]))
+        manager.need_load_weight_result_allreduce = True
+
+        manager.on_load_weight_result_allreduced(-1)
+
+        self.assertFalse(manager.need_load_weight_result_allreduce)
+        self.assertEqual(manager.rearrange_experts_signal.value[0], RearrangeExpertStatus.LOAD_SUCC.value)
+        self.assertEqual(manager.signal_update_weight_from_tensor_array.value[0], 0)
+        self.assertEqual(manager.signal_allreduce_load_weight_result_array.value[0], 0)
+
+    @patch("fastdeploy.eplb.experts_manager.get_logger")
+    @patch("fastdeploy.eplb.experts_manager.Process")
+    @patch("fastdeploy.eplb.experts_manager.threading.Thread")
+    @patch("fastdeploy.eplb.experts_manager.IPCSignal")
+    def test_on_load_weight_result_allreduced_waiting(
+        self, mock_ipc_signal, mock_thread, mock_process, mock_get_logger
+    ):
+        """Test on_load_weight_result_allreduced still waiting (min_result=0)."""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+
+        manager = RedundantExpertManager(rank=0, ep_size=32, fd_config=self.fd_config, ipc_signal_suffix=0)
+        manager.need_load_weight_result_allreduce = True
+
+        manager.on_load_weight_result_allreduced(0)
+
+        # still waiting, flag remains set
+        self.assertTrue(manager.need_load_weight_result_allreduce)
 
 
 if __name__ == "__main__":

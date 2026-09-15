@@ -1666,8 +1666,6 @@ class EPLBConfig:
         self.enable_eplb: bool = False
         # redundant experts num
         self.redundant_experts_num: int = 0
-        # expert ip shm size
-        self.redundant_expert_ip_shm_size: int = 1024
         # expert meta dir
         self.redundant_expert_meta_dir: str = "/tmp/redundant_expert_meta"
         # expert api user and password

@@ -46,7 +46,6 @@ except Exception as _e:
 
 from fastdeploy.config import EPLBConfig
 
-REARRANGE_EXPERT_MAGIC_NUM = 147183647
 REARRANGE_ORIGINATOR_EP_RANK = 0
 CHECK_TIME_INTERNAL = 3
 HTTP_RETRY_NUM = 5

@@ -54,7 +54,6 @@ from fastdeploy.config import (
 from fastdeploy.engine.request import ControlRequest, ControlResponse, RequestType
 from fastdeploy.eplb.async_expert_loader import (
     MODEL_MAIN_NAME,
-    REARRANGE_EXPERT_MAGIC_NUM,
     create_mmap,
     load_tensor_from_shm_mem,
 )
@@ -62,6 +61,7 @@ from fastdeploy.eplb.experts_manager import RedundantExpertManager
 from fastdeploy.eplb.utils import dump_redundant_expert_table_snapshot
 from fastdeploy.inter_communicator import EngineWorkerQueue as TaskQueue
 from fastdeploy.inter_communicator import (
+    EplbCollectiveOp,
     ExistTaskStatus,
     IPCSignal,
     ModelWeightsStatus,
@@ -442,8 +442,11 @@ class PaddleDisWorkerProc:
             logger.info(f"Skip eplb init. enable_eplb: {self.eplb_config.enable_eplb}")
             return
 
+        assert (
+            envs.FD_ENABLE_CPU_GROUP and getattr(self.parallel_config, "ep_group_cpu", None) is not None
+        ), "eplb requires FD_ENABLE_CPU_GROUP=1"
+
         start_time = time.perf_counter()
-        self.last_dump_expert_workload_ts = 0
         # Run before RedundantExpertManager forks the async loader: the loader
         # inherits shm_fd, which is the only handle left once create_mmap unlinks the file.
         if self.fd_config.afd_config.is_attn:
@@ -467,31 +470,6 @@ class PaddleDisWorkerProc:
             fd_config=self.fd_config,
             ipc_signal_suffix=self.parallel_config.local_engine_worker_queue_port,
             shm_fd=shm_fd,
-        )
-
-        dp_ipc_signal_suffix = (
-            f"{self.parallel_config.local_engine_worker_queue_port}_dp{self.parallel_config.local_data_parallel_id}"
-        )
-        tp_ipc_signal_suffix = f"{dp_ipc_signal_suffix}_tp{self.parallel_config.tensor_parallel_rank}"
-        experts_token_stats = np.zeros(
-            (self.fd_config.model_config.num_hidden_layers, self.fd_config.model_config.moe_num_experts),
-            dtype=np.int32,
-        )
-        self.local_experts_token_stats_array = IPCSignal(
-            name="local_experts_token_stats",
-            array=experts_token_stats,
-            dtype=np.int32,
-            suffix=tp_ipc_signal_suffix,
-            create=False,
-        )
-
-        clear_experts_token_stats = np.zeros([1], dtype=np.int32)
-        self.signal_clear_experts_token_stats = IPCSignal(
-            name="signal_clear_experts_token_stats",
-            array=clear_experts_token_stats,
-            dtype=np.int32,
-            suffix=tp_ipc_signal_suffix,
-            create=False,
         )
 
         end_time = time.perf_counter()
@@ -525,6 +503,53 @@ class PaddleDisWorkerProc:
                 clear_stat=False,
             )
 
+    def _sync_eplb_op(self, tp_rank):
+        local_op, local_signal = EplbCollectiveOp.NONE, None
+        if tp_rank == 0:
+            for signal, candidate in (
+                (
+                    self.experts_manager.signal_allreduce_expert_tokens_stats_array,
+                    EplbCollectiveOp.ALLREDUCE_TOKENS_STATS,
+                ),
+                (
+                    self.experts_manager.signal_allreduce_load_weight_result_array,
+                    EplbCollectiveOp.ALLREDUCE_LOAD_WEIGHT_RESULT,
+                ),
+                (
+                    self.experts_manager.signal_update_weight_from_tensor_array,
+                    EplbCollectiveOp.UPDATE_WEIGHT_FROM_TENSOR,
+                ),
+            ):
+                if signal.value[0] == 1:
+                    local_op, local_signal = candidate, signal
+                    break
+
+        data = paddle.to_tensor([local_op.value], dtype="int32", place="cpu")
+        paddle.distributed.all_reduce(
+            data, op=paddle.distributed.ReduceOp.MAX, group=self.parallel_config.ep_group_cpu
+        )
+        op = EplbCollectiveOp(int(data.numpy()[0]))
+
+        if local_signal is not None and local_op is op:
+            local_signal.value[0] = 0
+        if op is not EplbCollectiveOp.NONE:
+            logger.info(f"redundant_expert: ep group runs {op.name}")
+        return op
+
+    def _apply_expert_weights(self, tp_rank):
+        """Swap the preloaded expert weights and the new routing table into the model."""
+        begin_ts = time.time()
+        # update_weights_from_tensor overwrites model weights in place, so the pending
+        # forward has to be drained first: the op negotiation runs on the cpu group and
+        # therefore does not order device work.
+        paddle.device.synchronize()
+        self.update_weights_from_tensor(self.mmap_infos)
+        logger.info(f"redundant_expert: update_weight_from_tensor success, cost {(time.time() - begin_ts)*1000}ms")
+        paddle.distributed.barrier(self.parallel_config.ep_group)
+        if tp_rank == 0:
+            self.experts_manager.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
+        logger.info("redundant_expert: done")
+
     def _run_eplb(self, tp_rank):
         """internal call to run eplb"""
         if not self.eplb_config.enable_eplb:
@@ -537,56 +562,17 @@ class PaddleDisWorkerProc:
         ):
             self.refresh_expert_rank_table(dump_table_snapshot=False)
 
-        rearrange_time = time.time()
-        # Get expert load
-        if self.local_experts_token_stats_array.value is not None and (
-            int(rearrange_time) - self.last_dump_expert_workload_ts
-            > self.eplb_config.redundant_expert_dump_workload_interval
-        ):
-            self.last_dump_expert_workload_ts = int(rearrange_time)
-            clear_stat = False
-            if self.signal_clear_experts_token_stats.value[0] == 1:
-                clear_stat = True
-                self.signal_clear_experts_token_stats.value[0] = 0
-            (
-                new_stats_array,
-                _,
-                _,
-                _,
-            ) = self.worker.get_model().redundant_table_manger.get_expert_tokens_stats(clear_stat=clear_stat)
-            self.local_experts_token_stats_array.value[:] = new_stats_array[:]
-        elif self.local_experts_token_stats_array.value is None:
-            logger.warning("redundant_expert: local_experts_token_stats not init")
-
-        # All DP synchronously update weights
-        broadcast_value = 0
-        if tp_rank == 0 and self.experts_manager.signal_update_weight_from_tensor_array.value[0] == 1:
-            logger.info("redundant_expert: update_weight_from_tensor broadcast signal")
-            self.experts_manager.signal_update_weight_from_tensor_array.value[0] = 0
-            broadcast_value = REARRANGE_EXPERT_MAGIC_NUM
-
-        if envs.FD_ENABLE_CPU_GROUP:
-            group = self.parallel_config.ep_group_cpu
-            data = paddle.to_tensor([broadcast_value], place="cpu")
-        else:
-            group = self.parallel_config.ep_group
-            data = paddle.to_tensor([broadcast_value])
-
-        paddle.distributed.broadcast(data, 0, group=group)
-        if data[0] == REARRANGE_EXPERT_MAGIC_NUM:
-            # update_weights_from_tensor overwrites model weights in place. On the
-            # GPU broadcast path the implicit device sync from reading data[0]
-            # used to guarantee the pending forward had drained; the CPU path has
-            # no such barrier, so drain explicitly before touching the weights.
-            paddle.device.synchronize()
-            self.update_weights_from_tensor(self.mmap_infos)
-            logger.info(
-                f"redundant_expert: update_weight_from_tensor success, cost {(time.time() - rearrange_time)*1000}ms"
-            )
-            paddle.distributed.barrier(group)
-            if tp_rank == 0:
-                self.experts_manager.rearrange_experts_signal.value[0] = RearrangeExpertStatus.DONE.value
-            logger.info("redundant_expert: done")
+        cpu_group = self.parallel_config.ep_group_cpu
+        op = self._sync_eplb_op(tp_rank)
+        if op is EplbCollectiveOp.ALLREDUCE_TOKENS_STATS:
+            tokens_stats = self.worker.get_model().redundant_table_manger.get_tokens_stats_snapshot()
+            self.experts_manager.allreduce_expert_tokens_stats(tokens_stats, cpu_group)
+        elif op is EplbCollectiveOp.ALLREDUCE_LOAD_WEIGHT_RESULT:
+            result = paddle.to_tensor(self.experts_manager.update_weight_from_disk_result.value, place="cpu")
+            paddle.distributed.all_reduce(result, op=paddle.distributed.ReduceOp.MIN, group=cpu_group)
+            self.experts_manager.on_load_weight_result_allreduced(int(result.numpy()[0]))
+        elif op is EplbCollectiveOp.UPDATE_WEIGHT_FROM_TENSOR:
+            self._apply_expert_weights(tp_rank)
 
     def event_loop_normal(self) -> None:
         """Main event loop for Paddle Distributed Workers.

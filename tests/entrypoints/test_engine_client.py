@@ -85,7 +85,6 @@ def create_mock_fd_config(
     mock_config.eplb_config.enable_eplb = enable_eplb
     mock_config.eplb_config.redundant_expert_api_user = kwargs.get("eplb_user", "test_user")
     mock_config.eplb_config.redundant_expert_api_password = kwargs.get("eplb_password", "test_pass")
-    mock_config.eplb_config.redundant_expert_ip_shm_size = kwargs.get("eplb_shm_size", 1024)
     mock_config.eplb_config.redundant_expert_meta_dir = kwargs.get("eplb_meta_dir", "/tmp/meta")
 
     mock_config.parallel_config = Mock()
@@ -107,15 +106,12 @@ def create_mock_fd_config(
     return mock_config
 
 
-def create_mock_eplb_config(
-    enable_eplb=True, user="test_user", password="test_pass", shm_size=1024, meta_dir="/tmp/meta"
-):
+def create_mock_eplb_config(enable_eplb=True, user="test_user", password="test_pass", meta_dir="/tmp/meta"):
     """Create a mock EPLB config with common settings."""
     mock_config = Mock()
     mock_config.enable_eplb = enable_eplb
     mock_config.redundant_expert_api_user = user
     mock_config.redundant_expert_api_password = password
-    mock_config.redundant_expert_ip_shm_size = shm_size
     mock_config.redundant_expert_meta_dir = meta_dir
     return mock_config
 
@@ -124,7 +120,7 @@ def create_mock_signals():
     """Create common mock signal objects."""
     return {
         "rearrange_experts_signal": Mock(value=np.array([0])),
-        "rearrange_experts_ips_size_signal": Mock(value=np.array([0])),
+        "signal_allreduce_expert_tokens_stats_array": Mock(value=np.array([0])),
         "signal_update_weight_from_tensor_array": Mock(value=np.array([0])),
         "model_weights_status_signal": Mock(value=np.array([0])),
         "kv_cache_status_signal": Mock(value=np.array([0])),
@@ -1197,38 +1193,6 @@ class TestEngineClientValidParameters(unittest.TestCase):
             self.assertEqual(call_args["prompt_token_ids"], [1, 2, 3])
             self.assertEqual(call_args["max_tokens"], 50)
 
-    async def test_get_per_expert_tokens_stats_success(self):
-        """Test get_per_expert_tokens_stats successful response."""
-        mock_eplb_config = Mock()
-        mock_eplb_config.enable_eplb = True
-        mock_eplb_config.redundant_expert_api_user = "test_user"
-        mock_eplb_config.redundant_expert_api_password = "test_pass"
-
-        mock_parallel_config = Mock()
-        mock_parallel_config.tensor_parallel_rank = 0
-
-        mock_config = Mock()
-        mock_config.eplb_config = mock_eplb_config
-        mock_config.parallel_config = mock_parallel_config
-
-        self.engine_client.config = mock_config
-
-        # Set up mock arrays
-        mock_local_stats = Mock()
-        mock_local_stats.value = np.array([1, 2, 3])
-        self.engine_client.local_experts_token_stats_array_list = [mock_local_stats]
-        self.engine_client.signal_clear_experts_token_stats_list = []
-
-        request_dict = {"user": "test_user", "passwd": "test_pass"}
-
-        content, status_code = await self.engine_client.get_per_expert_tokens_stats(request_dict)
-
-        self.assertEqual(content["code"], 0)
-        self.assertEqual(content["msg"], "ok")
-        self.assertIn("data", content)
-        self.assertEqual(content["data"], [[1, 2, 3]])
-        self.assertEqual(status_code, 200)
-
     async def test_check_redundant_disabled(self):
         """Test check_redundant when EPLB is disabled."""
         mock_config = Mock()
@@ -1294,7 +1258,7 @@ class TestEngineClientValidParameters(unittest.TestCase):
 
             # Should return None (implicitly) and not create any signals
             self.assertFalse(hasattr(self.engine_client, "rearrange_experts_signal"))
-            self.assertFalse(hasattr(self.engine_client, "signal_clear_experts_token_stats_list"))
+            self.assertFalse(hasattr(self.engine_client, "update_weight_from_disk_result_list"))
 
     def test_init_eplb_signals_rank_zero_success(self):
         """Test init_eplb_signals successful initialization for rank 0."""
@@ -1303,7 +1267,7 @@ class TestEngineClientValidParameters(unittest.TestCase):
         mock_model_config.moe_num_experts = 8
 
         mock_eplb_config = Mock()
-        mock_eplb_config.redundant_expert_ip_shm_size = 1024
+        mock_eplb_config.redundant_experts_num = 2
 
         mock_parallel_config = Mock()
         mock_parallel_config.tensor_parallel_rank = 0
@@ -1325,9 +1289,8 @@ class TestEngineClientValidParameters(unittest.TestCase):
 
             self.engine_client.init_eplb_signals("8080")
 
-            # Check that IPCSignal was called with correct parameters
-            # Based on the actual implementation: 4 base signals + 4 TP ranks * 5 signals each = 24 total
-            self.assertEqual(mock_ipcsignal.call_count, 24)  # 4 TP ranks * 5 signals each + 4 base signals = 24 total
+            # 4 dp level signals + 1 signal per TP rank
+            self.assertEqual(mock_ipcsignal.call_count, 8)
 
             # Check that the suffix includes data parallel ID
             call_args_list = mock_ipcsignal.call_args_list
@@ -1335,17 +1298,13 @@ class TestEngineClientValidParameters(unittest.TestCase):
             self.assertTrue(dp_suffix_found)
 
             # Check that all required signal lists were created
-            self.assertEqual(len(self.engine_client.signal_clear_experts_token_stats_list), 4)
-            self.assertEqual(len(self.engine_client.local_experts_token_stats_array_list), 4)
-            self.assertEqual(len(self.engine_client.expert_tokens_stats_array_list), 4)
-            self.assertEqual(len(self.engine_client.signal_update_weight_from_disk_array_list), 4)
             self.assertEqual(len(self.engine_client.update_weight_from_disk_result_list), 4)
 
             # Check that base signals were created
             self.assertTrue(hasattr(self.engine_client, "rearrange_experts_signal"))
-            self.assertTrue(hasattr(self.engine_client, "rearrange_experts_ips_size_signal"))
-            self.assertTrue(hasattr(self.engine_client, "shm_rearrange_experts_ips_list"))
+            self.assertTrue(hasattr(self.engine_client, "signal_allreduce_expert_tokens_stats_array"))
             self.assertTrue(hasattr(self.engine_client, "signal_update_weight_from_tensor_array"))
+            self.assertTrue(hasattr(self.engine_client, "shm_expert_rank_table_array"))
 
     def test_init_eplb_signals_array_dimensions(self):
         """Test init_eplb_signals creates arrays with correct dimensions."""
@@ -1354,7 +1313,7 @@ class TestEngineClientValidParameters(unittest.TestCase):
         mock_model_config.moe_num_experts = 4
 
         mock_eplb_config = Mock()
-        mock_eplb_config.redundant_expert_ip_shm_size = 512
+        mock_eplb_config.redundant_experts_num = 1
 
         mock_parallel_config = Mock()
         mock_parallel_config.tensor_parallel_rank = 0
@@ -1379,28 +1338,21 @@ class TestEngineClientValidParameters(unittest.TestCase):
             # Check that IPCSignal was called with arrays of correct shape
             call_args_list = mock_ipcsignal.call_args_list
 
-            # Find calls for expert token stats arrays (should be 6x4 shape for 2D arrays)
-            all_experts_token_stats_calls = [call for call in call_args_list if "all_experts_token_stats" in str(call)]
-            local_experts_token_stats_calls = [
-                call for call in call_args_list if "local_experts_token_stats" in str(call)
-            ]
-
-            # These should be 2D arrays with shape (6, 4)
-            for call in all_experts_token_stats_calls:
+            # The routing table is (num_hidden_layers, moe_num_experts + redundant_experts_num)
+            expert_rank_table_calls = [call for call in call_args_list if "expert_rank_table" in str(call)]
+            self.assertEqual(len(expert_rank_table_calls), 1)
+            for call in expert_rank_table_calls:
                 array_arg = call[1]["array"]
-                self.assertEqual(array_arg.shape, (6, 4))  # (num_hidden_layers, moe_num_experts)
-
-            for call in local_experts_token_stats_calls:
-                array_arg = call[1]["array"]
-                self.assertEqual(array_arg.shape, (6, 4))  # (num_hidden_layers, moe_num_experts)
+                self.assertEqual(array_arg.shape, (6, 5))
 
             # Check that single-element signals have shape (1,)
             single_element_calls = [
                 call
                 for call in call_args_list
                 if "rearrange_experts_status" in str(call)
-                or "rearrange_experts_ips_size" in str(call)
+                or "signal_allreduce_expert_tokens_stats" in str(call)
                 or "signal_update_weight_from_tensor" in str(call)
+                or "result_update_weight_from_disk" in str(call)
             ]
 
             for call in single_element_calls:
@@ -1549,8 +1501,8 @@ class TestEngineClientValidParameters(unittest.TestCase):
 
     # ========== Phase 1: Critical EPLB Core Functionality Tests ==========
 
-    async def test_rearrange_experts_action_start_with_ips(self):
-        """Test rearrange_experts start action with valid IP list."""
+    async def test_rearrange_experts_action_start(self):
+        """Test rearrange_experts start action claims the state machine."""
         # Use helper to create config
         mock_config = create_mock_fd_config(enable_eplb=True)
 
@@ -1559,39 +1511,34 @@ class TestEngineClientValidParameters(unittest.TestCase):
 
         # Setup signals
         self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.FREE.value]))
-        self.engine_client.rearrange_experts_ips_size_signal = Mock(value=np.array([0]))
+        self.engine_client.signal_allreduce_expert_tokens_stats_array = Mock(value=np.array([0]))
         self.engine_client.signal_update_weight_from_tensor_array = Mock(value=np.array([0]))
-        self.engine_client.shm_rearrange_experts_ips_list = Mock()
-        self.engine_client.shm_rearrange_experts_ips_list.shm.buf = bytearray(1024)
 
         content, status_code = await self.engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": "", "ips": ["10.0.0.1:8000", "10.0.0.2:8000"]}
+            {"user": "test_user", "passwd": "test_pass", "action": ""}
         )
 
         self.assertEqual(content["code"], 0)
         self.assertEqual(status_code, 200)
+        self.assertEqual(self.engine_client.signal_allreduce_expert_tokens_stats_array.value[0], 1)
+        self.assertEqual(self.engine_client.rearrange_experts_signal.value[0], RearrangeExpertStatus.DOING.value)
 
-    async def test_rearrange_experts_recv_expert_weight(self):
-        """Test rearrange_experts recv_expert_weight action."""
-        mock_config = create_mock_fd_config(enable_eplb=True, splitwise_role="prefill")
+    async def test_rearrange_experts_action_start_rejected_when_busy(self):
+        """Test rearrange_experts start action is rejected while a rearrange is running."""
+        mock_config = create_mock_fd_config(enable_eplb=True)
 
         self.engine_client.config = mock_config
         self.engine_client.fd_config = mock_config
-        self.engine_client.rearrange_experts_signal = Mock(value=np.array([2]))
-        self.engine_client.expert_tokens_stats_array_list = [Mock(value=np.array([0]))]
-        self.engine_client.signal_update_weight_from_disk_array_list = [Mock(value=np.array([0]))]
+        self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.DOING.value]))
+        self.engine_client.signal_allreduce_expert_tokens_stats_array = Mock(value=np.array([0]))
 
         content, status_code = await self.engine_client.rearrange_experts(
-            {
-                "user": "test_user",
-                "passwd": "test_pass",
-                "action": "recv_expert_weight",
-                "data": [[1, 2, 3], [4, 5, 6]],
-            }
+            {"user": "test_user", "passwd": "test_pass", "action": "allreduce_expert_tokens_stats"}
         )
 
-        self.assertEqual(content["code"], 0)
-        self.assertEqual(status_code, 200)
+        self.assertEqual(content["code"], 1)
+        self.assertEqual(status_code, 400)
+        self.assertEqual(self.engine_client.signal_allreduce_expert_tokens_stats_array.value[0], 0)
 
     async def test_rearrange_experts_update_weight_from_tensor(self):
         """Test rearrange_experts update_weight_from_tensor action."""
@@ -1609,11 +1556,11 @@ class TestEngineClientValidParameters(unittest.TestCase):
         self.assertEqual(content["code"], 0)
         self.assertEqual(status_code, 200)
 
-    async def test_rearrange_experts_afd_controller_update_weight_from_tensor(self):
-        """Test AFD controller can notify decode roles to update tensor/table."""
+    async def test_rearrange_experts_non_prefill_update_weight_from_tensor(self):
+        """Test rearrange_experts update_weight_from_tensor rejects non-prefill roles."""
         mock_config = create_mock_fd_config(enable_eplb=True, splitwise_role="decode")
         mock_config.afd_config = Mock()
-        mock_config.afd_config.enable_afd = True
+        mock_config.afd_config.enable_afd = False
 
         self.engine_client.config = mock_config
         self.engine_client.fd_config = mock_config
@@ -1625,13 +1572,12 @@ class TestEngineClientValidParameters(unittest.TestCase):
                 "user": "test_user",
                 "passwd": "test_pass",
                 "action": "update_weight_from_tensor",
-                "from_controller": True,
             }
         )
 
-        self.assertEqual(content["code"], 0)
-        self.assertEqual(status_code, 200)
-        self.assertEqual(self.engine_client.signal_update_weight_from_tensor_array.value[0], 1)
+        self.assertEqual(content["code"], 1)
+        self.assertEqual(status_code, 400)
+        self.assertEqual(self.engine_client.signal_update_weight_from_tensor_array.value[0], 0)
 
     async def test_rearrange_experts_invalid_action(self):
         """Test rearrange_experts with invalid action string."""
@@ -1646,28 +1592,6 @@ class TestEngineClientValidParameters(unittest.TestCase):
         self.assertEqual(content["code"], 1)
         self.assertEqual(content["msg"], "invalid action invalid_action")
         self.assertEqual(status_code, 400)
-
-    async def test_rearrange_experts_action_start_ips_too_large(self):
-        """Test rearrange_experts when IP list exceeds SHM size."""
-        mock_config = create_mock_fd_config(enable_eplb=True, eplb_shm_size=10)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.FREE.value]))
-        self.engine_client.shm_rearrange_experts_ips_list = Mock()
-        self.engine_client.shm_rearrange_experts_ips_list.shm.buf = bytearray(10)
-
-        content, status_code = await self.engine_client.rearrange_experts(
-            {
-                "user": "test_user",
-                "passwd": "test_pass",
-                "action": "",
-                "ips": ["10.0.0.1:8000", "10.0.0.2:8000"],  # > 10 bytes
-            }
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertIn("max limit", content["msg"])
-        self.assertEqual(status_code, 500)
 
     async def test_add_requests_preprocessing_exception(self):
         """Test add_requests with preprocessing error raises EngineError."""
@@ -1691,18 +1615,6 @@ class TestEngineClientValidParameters(unittest.TestCase):
 
         content, status_code = await self.engine_client.rearrange_experts(
             {"user": "invalid_user", "passwd": "invalid_pass"}
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertEqual(status_code, 401)
-
-    async def test_get_per_expert_tokens_stats_invalid_auth(self):
-        """Test get_per_expert_tokens_stats with invalid credentials."""
-        mock_config = create_mock_fd_config(enable_eplb=True)
-        self.engine_client.config = mock_config
-
-        content, status_code = await self.engine_client.get_per_expert_tokens_stats(
-            {"user": "wrong_user", "passwd": "wrong_pass"}
         )
 
         self.assertEqual(content["code"], 1)
@@ -1811,8 +1723,6 @@ def test_control_and_redundant_and_expert_stats(minimal_engine_client):
     minimal_engine_client.fd_config = cfg
     minimal_engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.LOAD_SUCC.value]))
     minimal_engine_client.signal_update_weight_from_tensor_array = Mock(value=np.array([0]))
-    minimal_engine_client.signal_clear_experts_token_stats_list = [Mock(value=np.array([0]))]
-    minimal_engine_client.local_experts_token_stats_array_list = [Mock(value=np.array([[1, 2]]))]
     minimal_engine_client.update_weight_from_disk_result_list = [Mock(value=np.array([7]))]
 
     content, code = asyncio.run(
@@ -1822,14 +1732,6 @@ def test_control_and_redundant_and_expert_stats(minimal_engine_client):
     )
     assert (content["code"], code) == (0, 200)
     assert minimal_engine_client.signal_update_weight_from_tensor_array.value[0] == 1
-
-    content, code = asyncio.run(
-        minimal_engine_client.get_per_expert_tokens_stats(
-            {"user": "test_user", "passwd": "test_pass", "clear_stat": True}
-        )
-    )
-    assert code == 200 and content["data"] == [[[1, 2]]]
-    assert minimal_engine_client.signal_clear_experts_token_stats_list[0].value[0] == 1
 
     content, code = asyncio.run(minimal_engine_client.check_redundant({"user": "test_user", "passwd": "test_pass"}))
     assert (content["code"], code) == (0, 200)
@@ -1976,27 +1878,19 @@ def test_rearrange_and_redundant_branch_matrix(minimal_engine_client):
     cfg = create_mock_fd_config(enable_eplb=True)
     cfg.parallel_config.tensor_parallel_rank = 0
     cfg.scheduler_config.splitwise_role = "decode"
-    cfg.eplb_config.redundant_expert_ip_shm_size = 4
     minimal_engine_client.fd_config = cfg
     minimal_engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.FREE.value]))
-    minimal_engine_client.rearrange_experts_ips_size_signal = Mock(value=np.array([0]))
-    minimal_engine_client.shm_rearrange_experts_ips_list = Mock(shm=Mock(buf=bytearray(8)))
-    minimal_engine_client.expert_tokens_stats_array_list = [Mock(value=np.zeros((1, 2), dtype=np.int32))]
-    minimal_engine_client.signal_update_weight_from_disk_array_list = [Mock(value=np.array([0]))]
+    minimal_engine_client.signal_allreduce_expert_tokens_stats_array = Mock(value=np.array([0]))
     minimal_engine_client.signal_update_weight_from_tensor_array = Mock(value=np.array([0]))
     minimal_engine_client.update_weight_from_disk_result_list = [Mock(value=np.array([1]))]
 
-    content, code = asyncio.run(
-        minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass", "ips": ["1.1.1.1"]})
-    )
-    assert code == 500 and content["code"] == 1
-
-    content, code = asyncio.run(
-        minimal_engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": "recv_expert_weight", "data": [1]}
-        )
-    )
+    content, code = asyncio.run(minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass"}))
     assert code == 200 and content["code"] == 0
+    assert minimal_engine_client.signal_allreduce_expert_tokens_stats_array.value[0] == 1
+
+    # The trigger already moved the state machine, so a second one is refused
+    content, code = asyncio.run(minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass"}))
+    assert code == 400 and content["code"] == 1
 
     content, code = asyncio.run(
         minimal_engine_client.rearrange_experts(
@@ -2053,26 +1947,19 @@ def test_update_clear_success_prefix_and_rearrange_success_paths(minimal_engine_
         code, body = minimal_engine_client.clear_load_weight(timeout=2)
     assert code == 200 and "successfully" in body["msg"]
 
-    # rearrange start branch for status-check and success copy-to-shm
+    # rearrange start branch for status-check and success signal raise
     cfg = create_mock_fd_config(enable_eplb=True)
     cfg.parallel_config.tensor_parallel_rank = 0
-    cfg.eplb_config.redundant_expert_ip_shm_size = 64
     minimal_engine_client.fd_config = cfg
     minimal_engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.DOING.value]))
-    content, code = asyncio.run(
-        minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass", "ips": ["1:1"]})
-    )
+    content, code = asyncio.run(minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass"}))
     assert code == 400 and "rearrange is doing" in content["msg"]
 
     minimal_engine_client.rearrange_experts_signal.value[0] = RearrangeExpertStatus.FREE.value
-    minimal_engine_client.rearrange_experts_ips_size_signal = Mock(value=np.array([0]))
-    minimal_engine_client.shm_rearrange_experts_ips_list = Mock(shm=Mock(buf=bytearray(64)))
-    content, code = asyncio.run(
-        minimal_engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "ips": ["10.0.0.1:80", "10.0.0.2:80"]}
-        )
-    )
+    minimal_engine_client.signal_allreduce_expert_tokens_stats_array = Mock(value=np.array([0]))
+    content, code = asyncio.run(minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass"}))
     assert code == 200 and content["code"] == 0
+    assert minimal_engine_client.signal_allreduce_expert_tokens_stats_array.value[0] == 1
 
 
 def test_update_and_clear_prefix_timeout_branches(minimal_engine_client):
@@ -2108,26 +1995,19 @@ def test_eplb_guard_and_invalid_rearrange_branches(minimal_engine_client):
     cfg = create_mock_fd_config(enable_eplb=True)
     cfg.parallel_config.tensor_parallel_rank = 1
     minimal_engine_client.fd_config = cfg
-    content, code = asyncio.run(minimal_engine_client.get_per_expert_tokens_stats({"user": "bad", "passwd": "bad"}))
+    content, code = asyncio.run(minimal_engine_client.rearrange_experts({"user": "bad", "passwd": "bad"}))
     assert code == 401
     content, code = asyncio.run(minimal_engine_client.check_redundant({"user": "test_user", "passwd": "test_pass"}))
     assert code == 400 and "expect rank 0" in content["msg"]
 
-    # start action with missing ips branch
+    # invalid action branch
     cfg.parallel_config.tensor_parallel_rank = 0
     minimal_engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.FREE.value]))
+    minimal_engine_client.signal_allreduce_expert_tokens_stats_array = Mock(value=np.array([0]))
     content, code = asyncio.run(
-        minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass", "action": ""})
+        minimal_engine_client.rearrange_experts({"user": "test_user", "passwd": "test_pass", "action": "nope"})
     )
-    assert code == 400 and "ips" in content["msg"]
-
-    # recv_expert_weight with invalid payload
-    content, code = asyncio.run(
-        minimal_engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": "recv_expert_weight", "data": "bad"}
-        )
-    )
-    assert code == 400 and "data is not a list" in content["msg"]
+    assert code == 400 and "invalid action" in content["msg"]
 
     # update_weight_from_tensor status mismatch branch
     cfg.scheduler_config.splitwise_role = "prefill"

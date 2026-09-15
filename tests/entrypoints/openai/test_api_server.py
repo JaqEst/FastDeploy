@@ -142,9 +142,6 @@ def _dummy_engine_client():
         async def rearrange_experts(self, request_dict):
             return {"data": request_dict}, 201
 
-        async def get_per_expert_tokens_stats(self, request_dict):
-            return {"stats": request_dict}, 202
-
         async def check_redundant(self, request_dict):
             return {"redundant": request_dict}, 203
 
@@ -636,7 +633,6 @@ async def test_expert_and_stats_routes():
     req.json = AsyncMock(return_value={"a": 1})
 
     assert (await api_server.rearrange_experts(req)).status_code == 201
-    assert (await api_server.get_per_expert_tokens_stats(req)).status_code == 202
     assert (await api_server.check_redundant(req)).status_code == 203
 
 
