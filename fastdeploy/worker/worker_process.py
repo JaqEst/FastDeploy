@@ -32,6 +32,8 @@ with intercept_paddle_loggers():
     from paddle.distributed import fleet
 
 from fastdeploy import envs
+from fastdeploy.afd.expert_weight_daemon import ExpertBlockSpec
+from fastdeploy.afd.expert_weight_shm import ExpertWeightShm
 from fastdeploy.config import (
     AFDConfig,
     CacheConfig,
@@ -861,6 +863,25 @@ class PaddleDisWorkerProc:
             )
             step_shm_value.value[0] = -1
 
+    def maybe_attach_expert_weight_shm(self) -> None:
+        """Attach the daemon's expert weight block, if this rank needs it and it is ready."""
+        self.expert_weight_shm = None
+        if not self.fd_config.afd_config.is_ffn or not self.fd_config.launch_config.enable_fault_tolerant:
+            return
+        inst_id = self.parallel_config.engine_worker_queue_port[0]
+        try:
+            shm = ExpertWeightShm(inst_id)
+        except FileNotFoundError:
+            logger.info(f"expert weight block not ready, skipping attach: {inst_id}")
+            return
+        fingerprint = ExpertBlockSpec.from_fd_config(self.fd_config).fingerprint()
+        if shm.fingerprint != fingerprint:
+            logger.warning(f"expert weight block fingerprint mismatch, ignoring {inst_id}")
+            shm.close()
+            return
+        self.expert_weight_shm = shm
+        logger.info(f"attached expert weight block {inst_id} from pid {shm.daemon_pid}, {len(shm.entries)} entries")
+
     def init_device(self) -> None:
         """Initialize device and Construct model runner"""
         self.worker.init_device()
@@ -1522,6 +1543,9 @@ def run_worker_proc() -> None:
 
     # Initialize device and create model runner
     worker_proc.init_device()
+
+    # Attach the expert weight block.
+    worker_proc.maybe_attach_expert_weight_shm()
 
     # Load model
     worker_proc.load_model()

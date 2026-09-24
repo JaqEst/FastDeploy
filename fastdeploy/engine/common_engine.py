@@ -41,6 +41,7 @@ import zmq
 from tqdm import tqdm
 
 import fastdeploy.metrics.trace as tracing
+from fastdeploy.afd.expert_weight_daemon import ExpertBlockSpec, spawn_expert_weight_daemon
 from fastdeploy.cache_manager.cache_data import CacheStatus
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.elastic_manager import ElasticManager
@@ -282,6 +283,16 @@ class EngineService:
         self._register_manager.start()
         self._elastic_manager.start()
 
+    def start_expert_weight_daemon(self):
+        """Start the expert weight daemon."""
+        self.expert_weight_daemon_proc = None
+        if self.cfg.afd_config.is_ffn and self.cfg.launch_config.enable_fault_tolerant:
+            self.expert_weight_daemon_proc = spawn_expert_weight_daemon(
+                ExpertBlockSpec.from_fd_config(self.cfg),
+                self.cfg.parallel_config.engine_worker_queue_port[0],
+            )
+            console_logger.info(f"Launched expert weight daemon pid={self.expert_weight_daemon_proc.pid}")
+
     def start_worker_service(self, async_llm_pid=None):
         # Initialize IPC signals for worker management
         self.ipc_signal_suffix = self.cfg.parallel_config.engine_worker_queue_port[0]
@@ -302,6 +313,9 @@ class EngineService:
         ):
             device_ids = self.cfg.parallel_config.device_ids.split(",")
             self.cache_manager_processes = self.start_cache_service(device_ids, self.ipc_signal_suffix)
+
+        # Start the expert weight daemon before the workers, so FFN ranks can attach to its block.
+        self.start_expert_weight_daemon()
 
         # Start worker processes
         self.worker_proc = self._start_worker_service()
@@ -2405,6 +2419,10 @@ class EngineService:
             self.recv_request_server.close()
         if hasattr(self, "recv_control_cmd_server") and self.recv_control_cmd_server is not None:
             self.recv_control_cmd_server.close()
+        if hasattr(self, "expert_weight_daemon_proc") and self.expert_weight_daemon_proc is not None:
+            self.llm_logger.info(f"Stopping expert weight daemon {self.expert_weight_daemon_proc.pid}")
+            self.expert_weight_daemon_proc.terminate()
+            self.expert_weight_daemon_proc.join(timeout=30)
 
     # 从 async_llm 移到 common_engine
     def _worker_processes_ready(self):

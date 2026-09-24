@@ -157,6 +157,9 @@ class LLMEngine:
                 device_ids = self.cfg.parallel_config.device_ids.split(",")
                 self.cache_manager_processes = self.engine.start_cache_service(device_ids, self.ipc_signal_suffix)
 
+        # Start the expert weight daemon before the workers.
+        self.engine.start_expert_weight_daemon()
+
         # Start workers
         self.worker_proc = self._start_worker_service()
         console_logger.info("Waiting for worker processes to be ready...")
