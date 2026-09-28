@@ -78,26 +78,38 @@ def _order_one_layer(importance: np.ndarray, similarity: np.ndarray):
     order = np.empty(num_experts, dtype=np.int16)
     cost = np.empty(num_experts, dtype=np.float32)
 
+    best_col = work.argmax(axis=1)
+    best = work[rows, best_col]
+    work[rows, best_col] = -np.inf
+    second_col = work.argmax(axis=1)
+    second = work[rows, second_col]
+    work[rows, best_col] = best
+    gain = flat_importance * (best - second)
+    delta = np.bincount(best_col, weights=gain, minlength=num_experts)
+
     for step in range(num_experts - 1):
-        best_col = work.argmax(axis=1)
-        best = work[rows, best_col]
-        work[rows, best_col] = -np.inf
-        second = work.max(axis=1)
-        work[rows, best_col] = best
-
-        # A kept expert scores its own diagonal, so its entry is the cost of
-        # giving it up; an already-dropped one scores its current stand-in.
-        gain = flat_importance * (best - second)
-        delta = np.zeros(num_experts)
-        np.add.at(delta, best_col, gain)  # add.at: best_col repeats
-
         victim = int(np.where(alive, delta, np.inf).argmin())
         order[step] = victim
         cost[step] = delta[victim] / num_domains
         alive[victim] = False
+        if step == num_experts - 2:
+            break
         # Masking the column also clears the diagonal, so a dropped expert stops
         # covering itself.
         work[:, victim] = -np.inf
+
+        affected = np.flatnonzero((best_col == victim) | (second_col == victim))
+        if affected.size:
+            delta -= np.bincount(best_col[affected], weights=gain[affected], minlength=num_experts)
+            sub = work[affected]
+            local = np.arange(affected.size)
+            best_col[affected] = sub.argmax(axis=1)
+            best[affected] = sub[local, best_col[affected]]
+            sub[local, best_col[affected]] = -np.inf
+            second_col[affected] = sub.argmax(axis=1)
+            second[affected] = sub[local, second_col[affected]]
+            gain[affected] = flat_importance[affected] * (best[affected] - second[affected])
+            delta += np.bincount(best_col[affected], weights=gain[affected], minlength=num_experts)
 
     order[num_experts - 1] = int(np.flatnonzero(alive)[0])
     cost[num_experts - 1] = np.inf
