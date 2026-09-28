@@ -73,8 +73,8 @@ from fastdeploy.model_executor.utils import v1_loader_support
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
 from fastdeploy.utils import all_gather_values, get_logger, optional_type
-from fastdeploy.weight_cache.expert_weight_daemon import ExpertBlockSpec
-from fastdeploy.weight_cache.expert_weight_shm import ExpertWeightShm
+from fastdeploy.weight_cache.expert_weight_daemon import ExpertBlockSpec, READY_TIMEOUT
+from fastdeploy.weight_cache.expert_weight_shm import ExpertWeightShm, block_paths
 from fastdeploy.worker.worker_base import WorkerBase
 
 if envs.FD_USE_MOONCAKE_PG:
@@ -404,7 +404,8 @@ class PaddleDisWorkerProc:
         redundant_table_manger.refresh_active_expert_rank_table()
         # TO BE FIXED
         self.worker.get_model().update_state_dict(state_dicts)
-        self.experts_manager.tensor_infos = None
+        if self.expert_weight_shm is None:
+            self.experts_manager.tensor_infos = None
 
     def _broadcast_model_weights_signal(self, src: int, group) -> int:
         model_weights_signal_tensor = paddle.full(shape=[1], fill_value=self.model_weights_signal[0], dtype="int32")
@@ -454,6 +455,11 @@ class PaddleDisWorkerProc:
         if self.fd_config.afd_config.is_attn:
             self.mmap_infos = None
             shm_fd = -1
+        elif self.expert_weight_shm is not None:
+            # The daemon's block already holds every expert, so there is nothing to load
+            # from disk and no loader process to fork.
+            self.mmap_infos = {MODEL_MAIN_NAME: self.expert_weight_shm.ptr}
+            shm_fd = -1
         else:
             logger.info("Creating shared memory for eplb.")
             self.mmap_infos, shm_fds = create_mmap(
@@ -473,6 +479,9 @@ class PaddleDisWorkerProc:
             ipc_signal_suffix=self.parallel_config.local_engine_worker_queue_port,
             shm_fd=shm_fd,
         )
+        if self.expert_weight_shm is not None:
+            # The block is immutable, so its infos stay valid across rearranges.
+            self.experts_manager.tensor_infos = self.expert_weight_shm.tensor_infos()
 
         end_time = time.perf_counter()
         logger.info(f"Initialize eplb took {end_time - start_time} seconds.")
@@ -864,15 +873,21 @@ class PaddleDisWorkerProc:
             step_shm_value.value[0] = -1
 
     def maybe_attach_expert_weight_shm(self) -> None:
-        """Attach the daemon's expert weight block, if this rank needs it and it is ready."""
+        """Attach the daemon's expert weight block, waiting for it if it is still building."""
         self.expert_weight_shm = None
         if not self.fd_config.launch_config.enable_expert_weight_daemon or self.fd_config.afd_config.is_attn:
             return
         inst_id = self.parallel_config.engine_worker_queue_port[0]
+        _, _, ready_path = block_paths(inst_id)
+        deadline = time.time() + READY_TIMEOUT
+        while not os.path.exists(ready_path) and time.time() < deadline:
+            time.sleep(1)
         try:
             shm = ExpertWeightShm(inst_id)
         except FileNotFoundError:
-            logger.info(f"expert weight block not ready, skipping attach: {inst_id}")
+            logger.warning(
+                f"expert weight block not ready after {READY_TIMEOUT}s, falling back to disk: {inst_id}"
+            )
             return
         fingerprint = ExpertBlockSpec.from_fd_config(self.fd_config).fingerprint()
         if shm.fingerprint != fingerprint:

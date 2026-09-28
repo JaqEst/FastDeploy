@@ -194,10 +194,13 @@ class RedundantExpertManager:
 
         self.tensor_infos = None
 
-        if not self.fd_config.afd_config.is_attn:
-            # Fork explicitly: shm_fd is handed over by inheritance, and create_mmap has
-            # already unlinked the expert weight file, so this descriptor is the only way
-            # into the buffer.
+        self.parent_data_conn = None
+        self.parent_mg_conn = None
+        if not self.fd_config.afd_config.is_attn and shm_fd >= 0:
+            # Fork explicitly: shm_fd is handed over by inheritance since create_mmap
+            # has already unlinked the expert weight file.
+            # A negative shm_fd means the experts already sit in the weight
+            # daemon's block, so there is no loader to fork.
             ctx = get_context("fork")
             self.parent_data_conn, child_data_conn = ctx.Pipe()
             self.parent_mg_conn, child_mg_conn = ctx.Pipe()
@@ -356,6 +359,11 @@ class RedundantExpertManager:
             return
 
         self.update_weight_from_disk_result.value[0] = 0
+        if self.parent_mg_conn is None:
+            # Every expert already sits in the weight daemon's block, so there is nothing to
+            # load and no async result to wait for.
+            self.update_weight_from_disk_result.value[0] = 1
+            return
         self.disk_load_begin_ts = int(time.time())
         self.disk_load_in_flight = True
         self.parent_mg_conn.send(
