@@ -50,7 +50,7 @@ class ExpertBlockSpec:
         cfg = fd_config.model_config
         return cls(
             model_path=cfg.model,
-            n_routed_experts=cfg.n_routed_experts,
+            n_routed_experts=cfg.moe_num_experts,
             hidden_size=cfg.hidden_size,
             moe_intermediate_size=cfg.moe_intermediate_size,
             num_hidden_layers=cfg.num_hidden_layers,
