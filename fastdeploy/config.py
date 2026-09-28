@@ -2027,6 +2027,7 @@ class LaunchConfig:
         args = None,
     ):
         self.enable_fault_tolerant: bool = False
+        self.enable_expert_weight_daemon: bool = False
         self.is_extension: bool = False
         self.launch_port: int = -1
 
@@ -2483,6 +2484,12 @@ class FDConfig:
             assert 0 <= self.afd_config.inst_rank < self.afd_config.ninsts, (
                 f"inst_rank must be in [0, {self.afd_config.ninsts}), "
                 f"got {self.afd_config.inst_rank}"
+            )
+
+        if self.launch_config.enable_expert_weight_daemon:
+            assert self.model_config.moe_num_experts, (
+                "--enable-expert-weight-daemon requires a MoE model, but "
+                f"moe_num_experts is {self.model_config.moe_num_experts!r}"
             )
 
         if not self.cache_config.enable_chunked_prefill:

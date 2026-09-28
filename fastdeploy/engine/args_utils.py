@@ -592,6 +592,12 @@ class EngineArgs:
     Enable worker-process fault tolerance. (Only available for FFN roles)
     """
 
+    enable_expert_weight_daemon: bool = False
+    """
+    Serve expert weights from a pinned shared-memory block instead of disk.
+    Ignored for dense models and for AFD attention ranks.
+    """
+
     is_extension: bool = False
     """
     Whether this process is an extension process.. Default is False.
@@ -1235,6 +1241,13 @@ class EngineArgs:
             action="store_true",
             default=EngineArgs.enable_fault_tolerant,
             help="Enable worker-process fault tolerance.",
+        )
+
+        system_group.add_argument(
+            "--enable-expert-weight-daemon",
+            action="store_true",
+            default=EngineArgs.enable_expert_weight_daemon,
+            help="Serve expert weights from a pinned shared-memory block instead of disk.",
         )
 
         system_group.add_argument(

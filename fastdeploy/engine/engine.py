@@ -677,6 +677,7 @@ class LLMEngine:
             "ep_prefill_use_worst_num_tokens": self.cfg.parallel_config.ep_prefill_use_worst_num_tokens,
             "enable_overlap_schedule": self.cfg.scheduler_config.enable_overlap_schedule,
             "enable_fault_tolerant": self.cfg.launch_config.enable_fault_tolerant,
+            "enable_expert_weight_daemon": self.cfg.launch_config.enable_expert_weight_daemon,
             "is_extension": self.cfg.launch_config.is_extension,
         }
         for worker_flag, value in worker_store_true_flag.items():

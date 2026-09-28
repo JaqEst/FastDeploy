@@ -286,12 +286,13 @@ class EngineService:
     def start_expert_weight_daemon(self):
         """Start the expert weight daemon."""
         self.expert_weight_daemon_proc = None
-        if self.cfg.afd_config.is_ffn and self.cfg.launch_config.enable_fault_tolerant:
-            self.expert_weight_daemon_proc = spawn_expert_weight_daemon(
-                ExpertBlockSpec.from_fd_config(self.cfg),
-                self.cfg.parallel_config.engine_worker_queue_port[0],
-            )
-            console_logger.info(f"Launched expert weight daemon pid={self.expert_weight_daemon_proc.pid}")
+        if not self.cfg.launch_config.enable_expert_weight_daemon or self.cfg.afd_config.is_attn:
+            return
+        self.expert_weight_daemon_proc = spawn_expert_weight_daemon(
+            ExpertBlockSpec.from_fd_config(self.cfg),
+            self.cfg.parallel_config.engine_worker_queue_port[0],
+        )
+        console_logger.info(f"Launched expert weight daemon pid={self.expert_weight_daemon_proc.pid}")
 
     def start_worker_service(self, async_llm_pid=None):
         # Initialize IPC signals for worker management
@@ -2674,6 +2675,7 @@ class EngineService:
             "enable_entropy": self.cfg.model_config.enable_entropy,
             "enable_overlap_schedule": self.cfg.scheduler_config.enable_overlap_schedule,
             "enable_fault_tolerant": self.cfg.launch_config.enable_fault_tolerant,
+            "enable_expert_weight_daemon": self.cfg.launch_config.enable_expert_weight_daemon,
             "is_extension": self.cfg.launch_config.is_extension,
         }
         for worker_flag, value in worker_store_true_flag.items():

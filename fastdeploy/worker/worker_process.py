@@ -866,7 +866,7 @@ class PaddleDisWorkerProc:
     def maybe_attach_expert_weight_shm(self) -> None:
         """Attach the daemon's expert weight block, if this rank needs it and it is ready."""
         self.expert_weight_shm = None
-        if not self.fd_config.afd_config.is_ffn or not self.fd_config.launch_config.enable_fault_tolerant:
+        if not self.fd_config.launch_config.enable_expert_weight_daemon or self.fd_config.afd_config.is_attn:
             return
         inst_id = self.parallel_config.engine_worker_queue_port[0]
         try:
@@ -1312,6 +1312,13 @@ def parse_args():
         action="store_true",
         default=False,
         help="Enable fault tolerant mechanism.",
+    )
+
+    parser.add_argument(
+        "--enable_expert_weight_daemon",
+        action="store_true",
+        default=False,
+        help="Serve expert weights from a pinned shared-memory block.",
     )
 
     parser.add_argument(
