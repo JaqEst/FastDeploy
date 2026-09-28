@@ -17,6 +17,7 @@
 import ctypes
 import json
 import os
+import threading
 
 from fastdeploy.eplb.async_expert_loader import cudart, libc
 
@@ -30,13 +31,13 @@ def block_paths(inst_id):
     return base + ".bin", base + ".json", base + ".ready"
 
 
-def _check(ret, what):
+def _cuda_check(ret, what):
     if ret[0] != cudart.cudaError_t.cudaSuccess:
         raise RuntimeError(f"{what} failed: {cudart.cudaGetErrorString(ret[0])}")
     return ret[1] if len(ret) > 1 else None
 
 
-def _map(path, size, create):
+def _mmap(path, size, create):
     fd = os.open(path, os.O_RDWR | (os.O_CREAT if create else 0), 0o600)
     if create:
         os.ftruncate(fd, size)
@@ -50,10 +51,11 @@ def _map(path, size, create):
 class ExpertWeightShmWriter:
     """Daemon side: fill the block, then publish it.
 
-    Entries are keyed by logical expert, "{layer_id}.{logical_expert_id}.{up_gate|down}",
-    and stored in the GPU parameter's per-expert layout so readers copy without any
-    transformation. The file is never unlinked while in use: attaching workers reopen
-    it by name, and it only goes away when this writer closes.
+    Entries are keyed by the checkpoint tensor name, e.g.
+    "model.layers.3.mlp.experts.7.gate_proj.weight", and stored verbatim in the
+    checkpoint's layout, so a reader can hand them straight to the model's weight
+    loader. The file is never unlinked while in use: attaching workers reopen it by
+    name, and it only goes away when this writer closes.
     """
 
     def __init__(self, inst_id, size):
@@ -62,23 +64,37 @@ class ExpertWeightShmWriter:
             if os.path.exists(p):
                 os.unlink(p)
         self.size = size
-        self.fd, self.ptr = _map(self.bin_path, size, create=True)
-        # Pin here so an attaching worker only pays the warm mapping cost.
-        _check(cudart.cudaHostRegister(self.ptr, size, 0), "cudaHostRegister")
+        self.fd, self.ptr = _mmap(self.bin_path, size, create=True)
         self.offset = 0
         self.entries = {}
+        self.registered = False
+        self._lock = threading.Lock()
 
-    def add(self, key, ptr, nbytes):
-        """Append one entry copied from a raw host pointer."""
-        end = self.offset + nbytes
-        if end > self.size:
-            raise IOError(f"expert weight block overflow: {end} > {self.size}")
-        ctypes.memmove(ctypes.c_void_p(self.ptr + self.offset), ctypes.c_void_p(ptr), nbytes)
-        self.entries[key] = {"offset": self.offset, "nbytes": nbytes}
-        self.offset = end
+    def add(self, key, tensor):
+        """Append one entry from a CPU tensor. Safe to call from several threads."""
+        nbytes = int(tensor.numel().item() * tensor.element_size())
+        with self._lock:
+            offset = self.offset
+            end = offset + nbytes
+            if end > self.size:
+                raise IOError(f"expert weight block overflow: {end} > {self.size}")
+            self.offset = end
+            self.entries[key] = {
+                "offset": offset,
+                "nbytes": nbytes,
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+            }
+        # Outside the lock: this copy is the bulk of the work and has to overlap across threads.
+        # Callers join their threads before publish(), so the bytes are in place by then.
+        ctypes.memmove(ctypes.c_void_p(self.ptr + offset), ctypes.c_void_p(tensor.data_ptr()), nbytes)
 
     def publish(self, fingerprint):
-        """Write the manifest, then ready. Readers must not trust the blob before ready."""
+        """Pin the filled block, then write the manifest and ready."""
+        # Registering after every page has been touched is far cheaper than letting the driver
+        # fault them in, and the faulting is what the threaded fill spreads across cores.
+        _cuda_check(cudart.cudaHostRegister(self.ptr, self.size, 0), "cudaHostRegister")
+        self.registered = True
         tmp = self.manifest_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"fingerprint": fingerprint, "size": self.size, "entries": self.entries}, f)
@@ -87,7 +103,8 @@ class ExpertWeightShmWriter:
             f.write(str(os.getpid()))
 
     def close(self):
-        _check(cudart.cudaHostUnregister(self.ptr), "cudaHostUnregister")
+        if self.registered:
+            _cuda_check(cudart.cudaHostUnregister(self.ptr), "cudaHostUnregister")
         libc.munmap(ctypes.c_void_p(self.ptr), ctypes.c_size_t(self.size))
         os.close(self.fd)
         for p in (self.bin_path, self.manifest_path, self.ready_path):
@@ -96,7 +113,7 @@ class ExpertWeightShmWriter:
 
 
 class ExpertWeightShm:
-    """Worker side: map the daemon's block and copy experts into GPU parameters."""
+    """Worker side: map the daemon's block and hand its entries to the weight loader."""
 
     def __init__(self, inst_id):
         self.bin_path, self.manifest_path, self.ready_path = block_paths(inst_id)
@@ -107,25 +124,20 @@ class ExpertWeightShm:
         self.fingerprint = manifest["fingerprint"]
         self.size = manifest["size"]
         self.entries = manifest["entries"]
-        self.fd, self.ptr = _map(self.bin_path, self.size, create=False)
+        self.fd, self.ptr = _mmap(self.bin_path, self.size, create=False)
         # Per-process registration; the daemon's pin does not make this memory usable here.
-        _check(cudart.cudaHostRegister(self.ptr, self.size, 0), "cudaHostRegister")
+        _cuda_check(cudart.cudaHostRegister(self.ptr, self.size, 0), "cudaHostRegister")
 
-    def copy_expert(self, layer_id, expert_id, proj, dst_ptr, stream=None):
-        """One DMA from the block into a GPU parameter slice."""
-        e = self.entries[f"{layer_id}.{expert_id}.{proj}"]
-        _check(
-            cudart.cudaMemcpyAsync(
-                dst_ptr,
-                self.ptr + e["offset"],
-                e["nbytes"],
-                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
-                stream,
-            ),
-            "cudaMemcpyAsync",
-        )
+    def tensor_infos(self):
+        """The entries in the form load_tensor_from_shm_mem expects."""
+        import paddle
+
+        return [
+            (name, e["offset"], e["nbytes"], e["shape"], getattr(paddle, e["dtype"].split(".")[-1]))
+            for name, e in self.entries.items()
+        ]
 
     def close(self):
-        _check(cudart.cudaHostUnregister(self.ptr), "cudaHostUnregister")
+        _cuda_check(cudart.cudaHostUnregister(self.ptr), "cudaHostUnregister")
         libc.munmap(ctypes.c_void_p(self.ptr), ctypes.c_size_t(self.size))
         os.close(self.fd)

@@ -20,13 +20,17 @@ import os
 import signal
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from fastdeploy.afd.expert_weight_shm import ExpertWeightShmWriter
 from fastdeploy.eplb.async_expert_loader import load_ep_checkpoint
 from fastdeploy.utils import get_logger
+from fastdeploy.weight_cache.expert_weight_shm import ExpertWeightShmWriter
 
 PR_SET_PDEATHSIG = 1
+
+READY_TIMEOUT = 600  # seconds
+FILL_THREADS = 8
 
 
 @dataclass
@@ -78,54 +82,31 @@ class ExpertBlockSpec:
         }
 
 
-def _is_glm_style(index):
+def _is_format_supported(index):
     return any(name.startswith("model.layers.") and ".mlp.experts." in name for name in index)
 
 
-def _iter_experts(spec, index):
-    """Yield (layer_id, expert_id, up_gate, down), reading each shard at most once.
-
-    up_gate and down are stored in the GPU parameter's per-expert layout, i.e. the exact
-    bytes FusedMoE's weight loader would place in up_gate_proj_weight[slot] /
-    down_proj_weight[slot].
-    """
-    import paddle
-    from safetensors import safe_open
-
-    needed = {}
+def _expert_tensors_by_shard(spec, index):
+    """{shard_path: [checkpoint_name, ...]} for every expert tensor, in canonical order."""
+    by_file = {}
     for layer_id in spec.moe_layer_ids:
         for expert_id in range(spec.n_routed_experts):
             prefix = f"model.layers.{layer_id}.mlp.experts.{expert_id}"
             for proj in ("gate_proj", "up_proj", "down_proj"):
-                needed[f"{prefix}.{proj}.weight"] = (layer_id, expert_id, proj)
+                name = f"{prefix}.{proj}.weight"
+                if name not in index:
+                    raise KeyError(f"expert tensor missing from the checkpoint index: {name}")
+                by_file.setdefault(index[name], []).append(name)
+    return by_file
 
-    by_file = {}
-    for name, key in needed.items():
-        if name not in index:
-            raise KeyError(f"expert tensor missing from the checkpoint index: {name}")
-        by_file.setdefault(index[name], []).append(name)
 
-    pending = {}
-    for shard, names in by_file.items():
-        with safe_open(shard, framework="paddle", device="cpu") as f:
-            for name in names:
-                layer_id, expert_id, proj = needed[name]
-                slot = pending.setdefault((layer_id, expert_id), {})
-                slot[proj] = f.get_tensor(name)
-                if len(slot) == 3:
-                    pending.pop((layer_id, expert_id))
-                    # Checkpoints store [out, in]; the GPU parameter is [in, out], with gate in
-                    # the first half of the last axis and up in the second. This mirrors
-                    # FusedMoE._load_gate_up_weight / _load_down_weight, so the reader copies
-                    # bytes straight into the parameter slice.
-                    up_gate = paddle.concat(
-                        [slot.pop("gate_proj").transpose([1, 0]), slot.pop("up_proj").transpose([1, 0])],
-                        axis=-1,
-                    )
-                    yield layer_id, expert_id, up_gate, slot.pop("down_proj").transpose([1, 0]).contiguous()
+def _fill_shard(shard, names, writer):
+    """Copy one shard's expert tensors into the block. Runs on a fill thread."""
+    from safetensors import safe_open
 
-    if pending:
-        raise RuntimeError(f"incomplete experts after scanning every shard: {sorted(pending)[:4]}")
+    with safe_open(shard, framework="paddle", device="cpu") as f:
+        for name in names:
+            writer.add(name, f.get_tensor(name))
 
 
 def run_expert_weight_daemon(spec, inst_id):
@@ -143,26 +124,25 @@ def run_expert_weight_daemon(spec, inst_id):
         os._exit(0)
 
     index = load_ep_checkpoint(spec.model_path)
-    if not _is_glm_style(index):
+    if not _is_format_supported(index):
         raise NotImplementedError(
-            "expert weight daemon only supports the GLM checkpoint naming "
-            "(model.layers.*.mlp.experts.*); the quantized ERNIE layout needs its "
-            "scale/transpose handling added first"
+            "expert weight daemon only supports the checkpoint "
+            "naming (model.layers.*.mlp.experts.*)"
         )
 
     tic = time.perf_counter()
     writer = ExpertWeightShmWriter(inst_id, spec.size)
     try:
-        count = 0
-        for layer_id, expert_id, up_gate, down in _iter_experts(spec, index):
-            for key, tensor in ((f"{layer_id}.{expert_id}.up_gate", up_gate), (f"{layer_id}.{expert_id}.down", down)):
-                writer.add(key, tensor.data_ptr(), int(tensor.numel().item() * tensor.element_size()))
-            count += 1
-            if stop.is_set():
-                return
+        by_file = _expert_tensors_by_shard(spec, index)
+        with ThreadPoolExecutor(max_workers=min(len(by_file), FILL_THREADS)) as pool:
+            futures = [pool.submit(_fill_shard, shard, names, writer) for shard, names in by_file.items()]
+            for future in as_completed(futures):
+                future.result()  # re-raise the first failure
+                if stop.is_set():
+                    return
         writer.publish(spec.fingerprint())
         logger.info(
-            f"expert weight block ready: {count} experts, {spec.size / 1024**3:.1f} GiB, "
+            f"expert weight block ready: {len(writer.entries)} tensors, {spec.size / 1024**3:.1f} GiB, "
             f"{time.perf_counter() - tic:.1f}s"
         )
         stop.wait()

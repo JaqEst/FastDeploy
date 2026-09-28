@@ -41,7 +41,7 @@ import zmq
 from tqdm import tqdm
 
 import fastdeploy.metrics.trace as tracing
-from fastdeploy.afd.expert_weight_daemon import ExpertBlockSpec, spawn_expert_weight_daemon
+from fastdeploy.weight_cache.expert_weight_daemon import ExpertBlockSpec, spawn_expert_weight_daemon
 from fastdeploy.cache_manager.cache_data import CacheStatus
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.elastic_manager import ElasticManager

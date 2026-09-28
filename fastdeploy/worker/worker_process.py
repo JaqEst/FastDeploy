@@ -32,8 +32,6 @@ with intercept_paddle_loggers():
     from paddle.distributed import fleet
 
 from fastdeploy import envs
-from fastdeploy.afd.expert_weight_daemon import ExpertBlockSpec
-from fastdeploy.afd.expert_weight_shm import ExpertWeightShm
 from fastdeploy.config import (
     AFDConfig,
     CacheConfig,
@@ -75,6 +73,8 @@ from fastdeploy.model_executor.utils import v1_loader_support
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
 from fastdeploy.utils import all_gather_values, get_logger, optional_type
+from fastdeploy.weight_cache.expert_weight_daemon import ExpertBlockSpec
+from fastdeploy.weight_cache.expert_weight_shm import ExpertWeightShm
 from fastdeploy.worker.worker_base import WorkerBase
 
 if envs.FD_USE_MOONCAKE_PG:
