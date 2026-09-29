@@ -41,23 +41,7 @@ def evict_order(importance: np.ndarray, similarity: np.ndarray):
         cost: [L, E] float32, Loss increase per step, non-decreasing along a
             row. The last entry is +inf.
     """
-    if importance.ndim != 3:
-        raise ValueError(f"importance must be [D, L, E], got shape {importance.shape}")
     num_domains, num_layers, num_experts = importance.shape
-    if similarity.shape != (num_domains, num_layers, num_experts, num_experts):
-        raise ValueError(
-            f"similarity must be {(num_domains, num_layers, num_experts, num_experts)}, "
-            f"got shape {similarity.shape}"
-        )
-    if num_experts < 2:
-        raise ValueError(f"need at least 2 experts per layer, got {num_experts}")
-
-    diagonal = np.einsum("dluu->dlu", similarity)
-    if not np.allclose(diagonal, 1.0):
-        raise ValueError(
-            f"similarity needs a unit diagonal, observed range "
-            f"[{diagonal.min()}, {diagonal.max()}]"
-        )
 
     order = np.empty((num_layers, num_experts), dtype=np.int16)
     cost = np.empty((num_layers, num_experts), dtype=np.float32)

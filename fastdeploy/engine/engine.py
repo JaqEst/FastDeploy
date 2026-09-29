@@ -699,6 +699,7 @@ class LLMEngine:
         worker_default_none_flag = {
             "num_gpu_blocks_override": self.cfg.cache_config.num_gpu_blocks_override,
             "kvcache_storage_backend": self.cfg.cache_config.kvcache_storage_backend,
+            "fault_tolerance_stats_path": self.cfg.launch_config.fault_tolerance_stats_path,
         }
         for worker_flag, value in worker_default_none_flag.items():
             if value:

@@ -2028,6 +2028,7 @@ class LaunchConfig:
     ):
         self.enable_fault_tolerant: bool = False
         self.enable_expert_weight_daemon: bool = False
+        self.fault_tolerance_stats_path: str = None
         self.is_extension: bool = False
         self.launch_port: int = -1
 

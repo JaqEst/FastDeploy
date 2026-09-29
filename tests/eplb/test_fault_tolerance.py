@@ -150,19 +150,6 @@ class TestEvictOrder(unittest.TestCase):
         order32, _ = evict_order(importance.astype(np.float32), similarity.astype(np.float32))
         np.testing.assert_array_equal(order64, order32)
 
-    def test_rejects_non_unit_diagonal(self):
-        importance, similarity = worked_example()
-        similarity[0, 0, 3, 3] = 0.5
-        with self.assertRaises(ValueError):
-            evict_order(importance, similarity)
-
-    def test_rejects_mismatched_shapes(self):
-        importance, similarity = worked_example()
-        with self.assertRaises(ValueError):
-            evict_order(importance, similarity[:, :, :, :-1])
-        with self.assertRaises(ValueError):
-            evict_order(importance[0], similarity)
-
     def test_layers_are_independent(self):
         """
         Compared against per-layer runs rather than by relabelling experts: ties

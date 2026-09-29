@@ -58,6 +58,7 @@ from fastdeploy.eplb.async_expert_loader import (
     load_tensor_from_shm_mem,
 )
 from fastdeploy.eplb.experts_manager import RedundantExpertManager
+from fastdeploy.eplb.fault_tolerance_stats import FaultToleranceStatsManager
 from fastdeploy.eplb.utils import dump_redundant_expert_table_snapshot
 from fastdeploy.inter_communicator import EngineWorkerQueue as TaskQueue
 from fastdeploy.inter_communicator import (
@@ -897,6 +898,20 @@ class PaddleDisWorkerProc:
         self.expert_weight_shm = shm
         logger.info(f"attached expert weight block {inst_id} from pid {shm.daemon_pid}, {len(shm.entries)} entries")
 
+    def maybe_load_fault_tolerance_stats(self) -> None:
+        """Read the externally produced importance/similarity tables, if they were given."""
+        self.fault_tolerance_stats = None
+        path = self.fd_config.launch_config.fault_tolerance_stats_path
+        if path is None or self.fd_config.afd_config.is_attn:
+            return
+        model_config = self.fd_config.model_config
+        self.fault_tolerance_stats = FaultToleranceStatsManager(
+            path,
+            num_layers=model_config.num_hidden_layers,
+            num_experts=model_config.moe_num_experts,
+        )
+        logger.info(f"loaded fault tolerance stats from {path}: {self.fault_tolerance_stats.importance.shape}")
+
     def init_device(self) -> None:
         """Initialize device and Construct model runner"""
         self.worker.init_device()
@@ -1337,6 +1352,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--fault_tolerance_stats_path",
+        type=str,
+        default=None,
+        help="File holding the per-expert importance and similarity tables.",
+    )
+
+    parser.add_argument(
         "--is_extension",
         action="store_true",
         default=False,
@@ -1568,6 +1590,9 @@ def run_worker_proc() -> None:
 
     # Attach the expert weight block.
     worker_proc.maybe_attach_expert_weight_shm()
+
+    # Read the fault tolerance tables now, so a rank failure never waits on a file read.
+    worker_proc.maybe_load_fault_tolerance_stats()
 
     # Load model
     worker_proc.load_model()

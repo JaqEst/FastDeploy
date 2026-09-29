@@ -598,6 +598,12 @@ class EngineArgs:
     Ignored for dense models and for AFD attention ranks.
     """
 
+    fault_tolerance_stats_path: str = None
+    """
+    File holding the per-expert importance and similarity tables that plan expert
+    eviction after a rank failure.
+    """
+
     is_extension: bool = False
     """
     Whether this process is an extension process.. Default is False.
@@ -1248,6 +1254,13 @@ class EngineArgs:
             action="store_true",
             default=EngineArgs.enable_expert_weight_daemon,
             help="Serve expert weights from a pinned shared-memory block instead of disk.",
+        )
+
+        system_group.add_argument(
+            "--fault-tolerance-stats-path",
+            type=str,
+            default=EngineArgs.fault_tolerance_stats_path,
+            help="File holding the per-expert importance and similarity tables.",
         )
 
         system_group.add_argument(
