@@ -152,24 +152,17 @@ def dump_redundant_expert_table_snapshot(
     return path, snapshot
 
 
-def _ffn_slot_pairs(afd_config):
-    """Yield (ffn_local_slice, global_slice) pairs, matching the layout eplb produces."""
+def _ffn_global_slots(afd_config) -> np.ndarray:
+    """Global slot ids of the FFN ranks, in FFN order."""
     local = afd_config.num_local_physical_experts
-    for ffn_index, global_rank in enumerate(afd_config.ffn_ranks):
-        yield (
-            slice(ffn_index * local, (ffn_index + 1) * local),
-            slice(global_rank * local, (global_rank + 1) * local),
-        )
+    return np.concatenate([np.arange(g * local, (g + 1) * local) for g in afd_config.ffn_ranks])
 
 
 def compact_expert_rank_table(phy2log: np.ndarray, afd_config) -> np.ndarray:
     """Drop the ATTN placeholder slots, leaving a table independent of the AFD rank layout."""
     if not afd_config.enable_afd:
         return phy2log
-    compact = np.full((phy2log.shape[0], afd_config.num_ffn_physical_experts), -1, dtype=np.int32)
-    for ffn_slice, global_slice in _ffn_slot_pairs(afd_config):
-        compact[:, ffn_slice] = phy2log[:, global_slice]
-    return compact
+    return phy2log[:, _ffn_global_slots(afd_config)]
 
 
 def expand_expert_rank_table(compact: np.ndarray, afd_config) -> np.ndarray:
@@ -177,8 +170,7 @@ def expand_expert_rank_table(compact: np.ndarray, afd_config) -> np.ndarray:
     if not afd_config.enable_afd:
         return compact
     phy2log = np.full((compact.shape[0], afd_config.num_physical_experts), -1, dtype=np.int32)
-    for ffn_slice, global_slice in _ffn_slot_pairs(afd_config):
-        phy2log[:, global_slice] = compact[:, ffn_slice]
+    phy2log[:, _ffn_global_slots(afd_config)] = compact
     return phy2log
 
 
@@ -187,12 +179,23 @@ def derive_expert_tables(phy2log: np.ndarray, num_logical_experts: int, max_repl
     num_layers = phy2log.shape[0]
     log2phy = np.full((num_layers, num_logical_experts, max_replicas), -1, dtype=np.int32)
     expert_count = np.zeros((num_layers, num_logical_experts), dtype=np.int32)
-    for layer in range(num_layers):
-        for slot, logical_expert_id in enumerate(phy2log[layer]):
-            if logical_expert_id < 0:
-                continue
-            log2phy[layer, logical_expert_id, expert_count[layer, logical_expert_id]] = slot
-            expert_count[layer, logical_expert_id] += 1
+
+    layers, slots = np.nonzero(phy2log >= 0)
+    if layers.size == 0:
+        return log2phy, expert_count
+    experts = phy2log[layers, slots]
+
+    # Sort by (layer, expert, slot), then number the replicas within each
+    # (layer, expert) group so they land in column order.
+    order = np.lexsort((slots, experts, layers))
+    layers, experts, slots = layers[order], experts[order], slots[order]
+    group_start = np.empty(layers.size, dtype=bool)
+    group_start[0] = True
+    group_start[1:] = (layers[1:] != layers[:-1]) | (experts[1:] != experts[:-1])
+    rank_in_group = np.arange(layers.size) - np.flatnonzero(group_start)[np.cumsum(group_start) - 1]
+
+    log2phy[layers, experts, rank_in_group] = slots
+    np.add.at(expert_count, (layers, experts), 1)
     return log2phy, expert_count
 
 
