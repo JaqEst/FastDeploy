@@ -434,11 +434,6 @@ class FusedMoE(nn.Layer):
                 )
                 loaded_weight = loaded_weight.reshape(expert_param.shape)
             else:
-                logger.warning(
-                    "[MoE] Expert weight layout mismatch detected "
-                    f"(loaded: {loaded_weight.shape}, expected: {expert_param.shape}). "
-                    "Applying transpose to match parameter layout."
-                )
                 loaded_weight = loaded_weight.transpose([1, 0])
         assert expert_param.shape == loaded_weight.shape, (
             f"Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({expert_param.shape})"
