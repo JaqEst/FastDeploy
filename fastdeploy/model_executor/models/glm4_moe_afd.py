@@ -390,7 +390,8 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
             param_down_proj_name="experts.down_proj_",
         )
 
-        for loaded_weight_name, loaded_weight in state_dict.items():
+        items = state_dict.items() if hasattr(state_dict, "items") else state_dict
+        for loaded_weight_name, loaded_weight in items:
             if ".mlp.experts." not in loaded_weight_name:
                 continue
             layer_id = int(loaded_weight_name.split(".mlp.experts.", 1)[0].rsplit(".", 1)[-1])
@@ -404,7 +405,10 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
                     continue
                 param = params_dict[model_param_name]
 
-                param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is None:
+                    weight_loader = self.model.layers[str(layer_id)].mlp.experts.weight_loader
+                weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
 
                 model_sublayer_name = re.sub(
                     r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name
