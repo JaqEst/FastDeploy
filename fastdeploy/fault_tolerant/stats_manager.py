@@ -16,8 +16,10 @@
 
 import numpy as np
 
+from fastdeploy.fault_tolerant.strategy import evict_order
 
-class FaultToleranceStatsManager:
+
+class FaultTolStatsManager:
     """The externally produced per-expert importance and similarity tables."""
 
     def __init__(self, path, num_layers, num_experts):
@@ -25,6 +27,7 @@ class FaultToleranceStatsManager:
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.importance, self.similarity = self._load(path, num_layers, num_experts)
+        self.order, _ = evict_order(self.importance, self.similarity)
 
     @staticmethod
     def _load(path, num_layers, num_experts):

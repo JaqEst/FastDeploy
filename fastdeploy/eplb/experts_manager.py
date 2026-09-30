@@ -302,6 +302,26 @@ class RedundantExpertManager:
         self.logger.info("redundant_expert: read the expert rank table published by the engine")
         return True
 
+    def set_expert_rank_table(self, phy2log: np.ndarray) -> None:
+        logical_to_physical_map, expert_count = derive_expert_tables(
+            phy2log, self.num_logical_experts, self.num_redundant_experts + 1
+        )
+        self.model_ep_rank_to_expert_id_list[:] = phy2log[:]
+        self.model_expert_id_to_ep_rank_array.fill(-1)
+        self.model_expert_id_to_ep_rank_array[..., : logical_to_physical_map.shape[-1]] = logical_to_physical_map[:]
+        self.model_expert_in_rank_num_list[:] = expert_count[:]
+
+        self.last_model_ep_rank_to_expert_id_list[:] = self.model_ep_rank_to_expert_id_list[:]
+        self.last_model_expert_id_to_ep_rank_array[:] = self.model_expert_id_to_ep_rank_array[:]
+        self.last_model_expert_in_rank_num_list[:] = self.model_expert_in_rank_num_list[:]
+
+        # A recovering rank seeds its tables from this, and the engine reports it as the current
+        # placement, so it has to be republished whenever the placement changes.
+        if self.local_rank == 0:
+            self.shm_expert_rank_table.value[:] = compact_expert_rank_table(
+                self.model_ep_rank_to_expert_id_list, self.fd_config.afd_config
+            )
+
     def calculate_expert_rank_table(self, is_init=False):
         """
         calculate_expert_rank_table

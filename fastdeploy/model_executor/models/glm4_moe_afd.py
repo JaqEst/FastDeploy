@@ -389,29 +389,39 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
             param_gate_up_proj_name="experts.up_gate_proj_",
             param_down_proj_name="experts.down_proj_",
         )
+        # weight_name is "experts.{expert}.{proj}."; index by (expert, proj) for O(1) lookup.
+        params_by_expert_proj = {
+            (expert_id, weight_name.split(".", 2)[2][:-1]): (param_name, shard_id)
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping
+        }
 
         items = state_dict.items() if hasattr(state_dict, "items") else state_dict
         for loaded_weight_name, loaded_weight in items:
             if ".mlp.experts." not in loaded_weight_name:
                 continue
-            layer_id = int(loaded_weight_name.split(".mlp.experts.", 1)[0].rsplit(".", 1)[-1])
+            prefix, suffix = loaded_weight_name.split(".mlp.experts.", 1)
+            parts = suffix.split(".", 2)
+            if len(parts) != 3 or not parts[0].isdigit():
+                continue
+            expert_str, proj, _ = parts
+            layer_id = int(prefix.rsplit(".", 1)[-1])
             if str(layer_id) not in self.model.layers:
                 continue
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                if weight_name not in loaded_weight_name:
-                    continue
-                model_param_name = loaded_weight_name.replace(weight_name, param_name)
-                if model_param_name not in params_dict:
-                    continue
-                param = params_dict[model_param_name]
+            mapping = params_by_expert_proj.get((int(expert_str), proj))
+            if mapping is None:
+                continue
+            param_name, shard_id = mapping
+            model_param_name = loaded_weight_name.replace(f"experts.{expert_str}.{proj}.", param_name)
+            if model_param_name not in params_dict:
+                continue
+            param = params_dict[model_param_name]
 
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is None:
-                    weight_loader = self.model.layers[str(layer_id)].mlp.experts.weight_loader
-                weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is None:
+                weight_loader = self.model.layers[str(layer_id)].mlp.experts.weight_loader
+            weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=int(expert_str))
 
-                model_sublayer_name = re.sub(
-                    r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name
-                )
-                process_weights_after_loading_fn(model_sublayer_name, param)
-                break
+            model_sublayer_name = re.sub(
+                r"\.(up_gate_proj_weight|down_proj_weight|weight)$", "", model_param_name
+            )
+            process_weights_after_loading_fn(model_sublayer_name, param)

@@ -160,10 +160,11 @@ class GPUModelRunner(ModelRunnerBase):
         self.detect_rank_liveness = False
         if self.parallel_config.enable_expert_parallel and envs.FD_MOE_A2A_BACKEND == "mooncake":
             self.detect_rank_liveness = True
-            self._changed_ranks = paddle.empty(
+            self._changed_ranks = paddle.zeros(
                 [self.parallel_config.expert_parallel_size],
                 dtype="int32"
             ).pin_memory()
+            self.rank_liveness_event = paddle.device.cuda.Event()
         self.rank_liveness_changed = False
 
         # VL model config:
@@ -2295,18 +2296,20 @@ class GPUModelRunner(ModelRunnerBase):
                 and self.parallel_config.use_ep
             ):
                 self._execute_empty_mtp_input(self.forward_meta)
+            self.check_rank_liveness()
+            self.rank_liveness_changed = self.is_rank_liveness_changed()
             return
         model_output_data, sampler_output, post_process_event = self._postprocess(
             model_output, p_done_idxs, model_forward_batch, num_running_requests, real_bsz
         )
-        self.rank_liveness_changed = False
+        self.check_rank_liveness()
+        self.rank_liveness_changed = self.is_rank_liveness_changed()
         if model_output_data is not None:
             # synchronizes the async DtoH copies of sampled_token_ids.
             post_process_event.synchronize()
-            self.rank_liveness_changed = self._is_ep_active_ranks_changed()
             self._save_model_output(model_output_data, sampler_output)
 
-    def _check_ep_active_ranks(self) -> None:
+    def check_rank_liveness(self) -> None:
         if not self.detect_rank_liveness:
             return
 
@@ -2315,9 +2318,13 @@ class GPUModelRunner(ModelRunnerBase):
         backend = EPBackend()
         changed = (backend.active_ranks != backend.last_active_ranks).astype("int32")
         self._changed_ranks.copy_(changed, False)
+        self.rank_liveness_event.record()
 
-    def _is_ep_active_ranks_changed(self) -> bool:
-        if not self.detect_rank_liveness or not np.any(self._changed_ranks.numpy()):
+    def is_rank_liveness_changed(self) -> bool:
+        if not self.detect_rank_liveness:
+            return False
+        self.rank_liveness_event.synchronize()
+        if not np.any(self._changed_ranks.numpy()):
             return False
         from fastdeploy.model_executor.layers.moe.ep import EPBackend
 
@@ -2339,12 +2346,11 @@ class GPUModelRunner(ModelRunnerBase):
             model_forward_batch, num_running_requests, self._cached_launch_token_num, self._cached_real_bsz
         )
         model_output = self._execute(model_inputs)
-        self.rank_liveness_changed = False
         # save output (last batch)
+        self.rank_liveness_changed = self.is_rank_liveness_changed()
         if self._cached_model_output_data is not None:
             # synchronizes the async DtoH copies of sampled_token_ids.
             self._cached_post_process_event.synchronize()
-            self.rank_liveness_changed = self._is_ep_active_ranks_changed()
             self._save_model_output(
                 self._cached_model_output_data,
                 self._cached_sampler_output,
@@ -2382,6 +2388,7 @@ class GPUModelRunner(ModelRunnerBase):
             self._cached_post_process_event = None
         self._cached_launch_token_num = next_launch_token_num
         self._cached_real_bsz = next_real_bsz
+        self.check_rank_liveness()
 
     def execute_model_ffn_only(
         self,
@@ -2390,7 +2397,9 @@ class GPUModelRunner(ModelRunnerBase):
     ) -> None:
         model_inputs, token_num_event = self._preprocess_ffn_only(model_forward_batch, num_running_requests)
         self._execute(model_inputs)
+        self.rank_liveness_changed = self.is_rank_liveness_changed()
         token_num_event.synchronize()
+        self.check_rank_liveness()
 
     def _preprocess(
         self,
@@ -2721,7 +2730,6 @@ class GPUModelRunner(ModelRunnerBase):
                 self.get_model().redundant_table_manger.maybe_copy_tokens_stats(
                     self.fd_config.eplb_config.redundant_expert_dump_workload_interval
                 )
-            self._check_ep_active_ranks()
             post_process_event.record()
 
             # 6. Speculative decode -- proposer run (method="naive" has proposer=None, skip)

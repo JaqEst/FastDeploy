@@ -73,6 +73,8 @@ class ExpertWeightShmWriter:
     def add(self, key, tensor):
         """Append one entry from a CPU tensor. Safe to call from several threads."""
         nbytes = int(tensor.numel().item() * tensor.element_size())
+        layer, rest = key.split(".mlp.experts.", 1)
+        layer, expert = int(layer.rsplit(".", 1)[-1]), int(rest.split(".", 1)[0])
         with self._lock:
             offset = self.offset
             end = offset + nbytes
@@ -80,6 +82,8 @@ class ExpertWeightShmWriter:
                 raise IOError(f"expert weight block overflow: {end} > {self.size}")
             self.offset = end
             self.entries[key] = {
+                "layer": layer,
+                "expert": expert,
                 "offset": offset,
                 "nbytes": nbytes,
                 "shape": list(tensor.shape),
@@ -128,13 +132,14 @@ class ExpertWeightShm:
         # Per-process registration; the daemon's pin does not make this memory usable here.
         _cuda_check(cudart.cudaHostRegister(self.ptr, self.size, 0), "cudaHostRegister")
 
-    def tensor_infos(self):
+    def tensor_infos(self, names=None):
         """The entries in the form load_tensor_from_shm_mem expects."""
         import paddle
 
+        entries = self.entries.items() if names is None else ((name, self.entries[name]) for name in names)
         return [
             (name, e["offset"], e["nbytes"], e["shape"], getattr(paddle, e["dtype"].split(".")[-1]))
-            for name, e in self.entries.items()
+            for name, e in entries
         ]
 
     def close(self):

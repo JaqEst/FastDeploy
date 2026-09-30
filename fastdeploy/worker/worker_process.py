@@ -58,8 +58,12 @@ from fastdeploy.eplb.async_expert_loader import (
     load_tensor_from_shm_mem,
 )
 from fastdeploy.eplb.experts_manager import RedundantExpertManager
-from fastdeploy.eplb.fault_tolerance_stats import FaultToleranceStatsManager
-from fastdeploy.eplb.utils import dump_redundant_expert_table_snapshot
+from fastdeploy.fault_tolerant.strategy import coverage_repair, keep_from_order
+from fastdeploy.fault_tolerant.stats_manager import FaultTolStatsManager
+from fastdeploy.eplb.utils import (
+    derive_expert_tables,
+    dump_redundant_expert_table_snapshot,
+)
 from fastdeploy.inter_communicator import EngineWorkerQueue as TaskQueue
 from fastdeploy.inter_communicator import (
     EplbCollectiveOp,
@@ -515,6 +519,91 @@ class PaddleDisWorkerProc:
                 clear_stat=False,
             )
 
+    def _handle_rank_failures(self):
+        from fastdeploy.model_executor.layers.moe.ep import EPBackend
+
+        afd_config = self.fd_config.afd_config
+        local = afd_config.num_local_physical_experts
+        table_manager = self.worker.get_model().redundant_table_manger
+
+        active = EPBackend().active_ranks.numpy()
+        survivors = [i for i, rank in enumerate(afd_config.ffn_ranks) if active[rank] > 0]
+        if not survivors or len(survivors) == len(afd_config.ffn_ranks):
+            logger.info(f"no ffn rank failed (active={active.tolist()})")
+            return
+
+        # Every survivor adds its own counts, the same way the eplb rebalance does.
+        load = table_manager.get_tokens_stats_snapshot()
+        paddle.distributed.all_reduce(
+            load, op=paddle.distributed.ReduceOp.SUM, group=self.parallel_config.ep_group_cpu
+        )
+
+        # Plan over surviving slots only, compacted to survivor order.
+        stats = self.ft_stats
+        assert stats is not None
+        phy2log = table_manager.model_ep_rank_to_expert_id_list.numpy()
+        survivor_slots = [afd_config.ffn_ranks[i] for i in survivors]
+        slots = np.concatenate([phy2log[:, g * local : (g + 1) * local] for g in survivor_slots], axis=1)
+
+        keep = keep_from_order(stats.order, slots.shape[1])
+        # coverage_repair orders which lost expert to bring back first, so collapse the
+        # domains to the most demanding one.
+        moves, new_slots = coverage_repair(
+            keep, slots, stats.importance.max(axis=0), load.numpy(), len(survivors)
+        )
+        if not moves:
+            logger.info("rank failure needs no expert moves")
+            return
+
+        # Dead ranks and ATTN slots stay -1 so the router skips their slots.
+        replanned = np.full_like(phy2log, -1)
+        for index, g in enumerate(survivor_slots):
+            replanned[:, g * local : (g + 1) * local] = new_slots[:, index * local : (index + 1) * local]
+        log2phy, expert_count = derive_expert_tables(
+            replanned,
+            afd_config.num_logical_experts,
+            table_manager.model_expert_id_to_ep_rank_array.shape[-1],
+        )
+
+        # Table first: update_state_dict resolves logical experts to slots through it.
+        table_manager.update_expert_rank_table(replanned, log2phy, expert_count, clear_stat=False)
+        logger.info(
+            f"rebalanced {len(moves)} experts after "
+            f"losing {len(afd_config.ffn_ranks) - len(survivors)} rank(s)"
+        )
+
+        if self.expert_weight_shm is not None:
+            wanted = {(layer, expert) for layer, _, expert in moves}
+            names = {
+                name
+                for name, entry in self.expert_weight_shm.entries.items()
+                if (entry["layer"], entry["expert"]) in wanted
+            }
+            infos = self.expert_weight_shm.tensor_infos(names)
+            state_dicts = load_tensor_from_shm_mem(infos, self.expert_weight_shm.ptr)
+            self.worker.get_model().update_state_dict(state_dicts)
+        # ATTN waits here until every FFN rank has loaded the moved expert weights.
+        paddle.distributed.barrier(self.parallel_config.ep_group)
+        return phy2log
+
+    def _run_ft(self):
+        if (
+            not self.fd_config.afd_config.enable_afd
+            or not hasattr(self.worker.model_runner, "rank_liveness_changed")
+            or not self.worker.model_runner.rank_liveness_changed
+        ):
+            return
+
+        logger.info(f">>> start handling rank failures")
+        begin_ts = time.perf_counter()
+        phy2log = self._handle_rank_failures()
+        logger.info(f"<<< rank failures handled in {(time.perf_counter() - begin_ts):.3f}s")
+
+        if phy2log is None:
+            self.refresh_expert_rank_table(dump_table_snapshot=False)
+        elif self.eplb_config.enable_eplb:
+            self.experts_manager.set_expert_rank_table(phy2log)
+
     def _sync_eplb_op(self, tp_rank):
         local_op, local_signal = EplbCollectiveOp.NONE, None
         if tp_rank == 0:
@@ -566,13 +655,6 @@ class PaddleDisWorkerProc:
         """internal call to run eplb"""
         if not self.eplb_config.enable_eplb:
             return
-
-        if (
-            self.fd_config.afd_config.enable_afd
-            and hasattr(self.worker.model_runner, "rank_liveness_changed")
-            and self.worker.model_runner.rank_liveness_changed
-        ):
-            self.refresh_expert_rank_table(dump_table_snapshot=False)
 
         cpu_group = self.parallel_config.ep_group_cpu
         op = self._sync_eplb_op(tp_rank)
@@ -786,6 +868,8 @@ class PaddleDisWorkerProc:
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 self.exist_prefill_task_signal.value[0] = self.worker.exist_prefill()
             logger.debug(f"execute model cost: {time.time()-start_execute_time:.5f} s")
+            # handle rank failures
+            self._run_ft()
             # run eplb
             self._run_eplb(tp_rank)
             self.engine_forward_signal.value[0] = 0
@@ -898,19 +982,19 @@ class PaddleDisWorkerProc:
         self.expert_weight_shm = shm
         logger.info(f"attached expert weight block {inst_id} from pid {shm.daemon_pid}, {len(shm.entries)} entries")
 
-    def maybe_load_fault_tolerance_stats(self) -> None:
-        """Read the externally produced importance/similarity tables, if they were given."""
-        self.fault_tolerance_stats = None
+    def maybe_load_ft_stats(self) -> None:
+        """Read the externally produced importance/similarity tables."""
+        self.ft_stats = None
         path = self.fd_config.launch_config.fault_tolerance_stats_path
-        if path is None or self.fd_config.afd_config.is_attn:
+        if path is None:
             return
         model_config = self.fd_config.model_config
-        self.fault_tolerance_stats = FaultToleranceStatsManager(
+        self.ft_stats = FaultTolStatsManager(
             path,
             num_layers=model_config.num_hidden_layers,
             num_experts=model_config.moe_num_experts,
         )
-        logger.info(f"loaded fault tolerance stats from {path}: {self.fault_tolerance_stats.importance.shape}")
+        logger.info(f"loaded fault tolerance stats from {path}: {self.ft_stats.importance.shape}")
 
     def init_device(self) -> None:
         """Initialize device and Construct model runner"""
@@ -1591,8 +1675,8 @@ def run_worker_proc() -> None:
     # Attach the expert weight block.
     worker_proc.maybe_attach_expert_weight_shm()
 
-    # Read the fault tolerance tables now, so a rank failure never waits on a file read.
-    worker_proc.maybe_load_fault_tolerance_stats()
+    # Read the fault tolerance stats.
+    worker_proc.maybe_load_ft_stats()
 
     # Load model
     worker_proc.load_model()

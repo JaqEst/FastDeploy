@@ -18,7 +18,7 @@ import unittest
 
 import numpy as np
 
-from fastdeploy.eplb.fault_tolerance import (
+from fastdeploy.fault_tolerant.strategy import (
     gpu_imbalance,
     evict_order,
     keep_from_order,
@@ -81,7 +81,7 @@ def random_case(rng, num_domains, num_experts):
 
 
 class TestEvictOrder(unittest.TestCase):
-    """Test cases for the expendability order in fault_tolerance.py"""
+    """Test cases for the expendability order in strategy.py"""
 
     def test_worked_example_order(self):
         importance, similarity = worked_example()
@@ -172,7 +172,7 @@ class TestEvictOrder(unittest.TestCase):
 
 
 class TestKeepFromOrder(unittest.TestCase):
-    """Test cases for the runtime lookup in fault_tolerance.py"""
+    """Test cases for the runtime lookup in strategy.py"""
 
     def test_capacity_sweep(self):
         order = np.array([[0, 2, 6, 3, 4, 7, 1, 5]], dtype=np.int16)
@@ -208,7 +208,7 @@ class TestKeepFromOrder(unittest.TestCase):
 
 
 class TestCoverageRepair(unittest.TestCase):
-    """Test cases for the coverage repair in fault_tolerance.py"""
+    """Test cases for the coverage repair in strategy.py"""
 
     def test_spare_replica_is_taken_first(self):
         """
