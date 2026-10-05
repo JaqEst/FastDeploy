@@ -117,8 +117,20 @@ def get_model_path(fd_config: FDConfig):
     return model_path
 
 
+def get_weight_cache_from(load_config: Optional[LoadConfig]):
+    """Serve expert weights from the daemon block instead of the checkpoint on disk."""
+    shm = getattr(load_config, "weight_cache", None)
+    if shm is None:
+        return None
+    from fastdeploy.eplb.async_expert_loader import load_tensor_from_shm_mem
+
+    return dict(load_tensor_from_shm_mem(shm.tensor_infos(), shm.ptr))
+
+
 def get_weight_iterator(model_path: str, load_config: Optional[LoadConfig] = None):
     files_list, ordered_weight_map, use_safetensors, is_layers_are_grouped = get_all_weights_file(model_path)
+    weight_cache = get_weight_cache_from(load_config)
+    weight_skip = getattr(load_config, "weight_skip", None)
     if use_safetensors:
         extra_config = load_config.model_loader_extra_config if load_config else None
         if extra_config is not None and extra_config.get("enable_multithread_load", False):
@@ -129,9 +141,9 @@ def get_weight_iterator(model_path: str, load_config: Optional[LoadConfig] = Non
             )
         else:
             if is_layers_are_grouped:
-                weights_iterator = safetensors_weights_iterator(files_list)
+                weights_iterator = safetensors_weights_iterator(files_list, weight_cache, weight_skip)
             else:
-                weights_iterator = safetensors_weights_iterator_ordered(ordered_weight_map)
+                weights_iterator = safetensors_weights_iterator_ordered(ordered_weight_map, weight_cache, weight_skip)
     else:
         weights_iterator = pdparams_weight_iterator(files_list)
 
@@ -401,7 +413,7 @@ def kv_cache_scale_iterator(kv_cache_scale_json_path):
             yield key, scale_tensor
 
 
-def safetensors_weights_iterator(safe_tensor_list: list[str]):
+def safetensors_weights_iterator(safe_tensor_list: list[str], cache=None, skip=None):
     """
     safetensors_weights_iterator
     """
@@ -411,8 +423,12 @@ def safetensors_weights_iterator(safe_tensor_list: list[str]):
     ):
         with safe_open(st_file, framework="paddle", device="cpu") as f:
             for name in f.keys():
-                param = f.get_tensor(name)
-                yield name, param
+                if skip is not None and skip(name):
+                    continue
+                if cache is not None and name in cache:
+                    yield name, cache[name]
+                else:
+                    yield name, f.get_tensor(name)
 
 
 def multi_thread_safetensors_weights_iterator(safe_tensor_list, max_workers: int = 4, disable_mmap: bool = False):
@@ -461,7 +477,7 @@ def multi_thread_safetensors_weights_iterator(safe_tensor_list, max_workers: int
                 yield name, param
 
 
-def safetensors_weights_iterator_ordered(ordered_weight_map: dict[str, str]):
+def safetensors_weights_iterator_ordered(ordered_weight_map: dict[str, str], cache=None, skip=None):
     """
     safetensors_weights_iterator_ordered
     """
@@ -473,6 +489,11 @@ def safetensors_weights_iterator_ordered(ordered_weight_map: dict[str, str]):
             ordered_weight_map.items(),
             desc="Loading safetensors weights",
         ):
+            if skip is not None and skip(key):
+                continue
+            if cache is not None and key in cache:
+                yield key, cache[key]
+                continue
             if st_file != current_file:
                 stack.close()
                 current_handle = stack.enter_context(safe_open(st_file, framework="paddle", device="cpu"))

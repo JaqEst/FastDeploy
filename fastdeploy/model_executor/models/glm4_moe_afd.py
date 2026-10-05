@@ -227,6 +227,10 @@ class Glm4MoeForCausalLM_AFDAttn(ModelForCasualLM):
     def name(cls):
         return "Glm4MoeForCausalLM_AFDAttn"
 
+    def weight_name_skip(self, name: str) -> bool:
+        """The ATTN rank holds no expert weights."""
+        return ".mlp.experts." in name
+
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
         from fastdeploy.model_executor.utils import (
@@ -320,6 +324,13 @@ class Glm4MoeForCausalLM_AFDFFN(ModelForCasualLM):
     @classmethod
     def name(cls):
         return "Glm4MoeForCausalLM_AFDFFN"
+
+    def weight_name_skip(self, name: str) -> bool:
+        """The FFN rank holds only expert weights, and only for its own layers."""
+        if ".mlp.experts." not in name:
+            return True
+        match = re.match(r"model\.layers\.(\d+)\.", name)
+        return match is None or match.group(1) not in self.model.layers
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator):

@@ -980,6 +980,7 @@ class PaddleDisWorkerProc:
             shm.close()
             return
         self.expert_weight_shm = shm
+        self.fd_config.load_config.weight_cache = shm
         logger.info(f"attached expert weight block {inst_id} from pid {shm.daemon_pid}, {len(shm.entries)} entries")
 
     def maybe_load_ft_stats(self) -> None:
