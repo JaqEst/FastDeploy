@@ -556,17 +556,17 @@ class PaddleDisWorkerProc:
             return
 
         # Dead ranks and ATTN slots stay -1 so the router skips their slots.
-        replanned = np.full_like(phy2log, -1)
+        phy2log = np.full_like(phy2log, -1)
         for index, g in enumerate(survivor_slots):
-            replanned[:, g * local : (g + 1) * local] = new_slots[:, index * local : (index + 1) * local]
+            phy2log[:, g * local : (g + 1) * local] = new_slots[:, index * local : (index + 1) * local]
         log2phy, expert_count = derive_expert_tables(
-            replanned,
+            phy2log,
             afd_config.num_logical_experts,
             table_manager.model_expert_id_to_ep_rank_array.shape[-1],
         )
 
         # Table first: update_state_dict resolves logical experts to slots through it.
-        table_manager.update_expert_rank_table(replanned, log2phy, expert_count, clear_stat=False)
+        table_manager.update_expert_rank_table(phy2log, log2phy, expert_count, clear_stat=False)
         logger.info(
             f"rebalanced {len(moves)} experts after "
             f"losing {len(afd_config.ffn_ranks) - len(survivors)} rank(s)"
