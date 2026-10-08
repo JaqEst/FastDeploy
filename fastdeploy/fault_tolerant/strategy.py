@@ -259,3 +259,87 @@ def _balance_layer(
         left, right = hot * slots_per_gpu + i, cold * slots_per_gpu + j
         slots[left], slots[right] = slots[right], slots[left]
         per_slot[left], per_slot[right] = per_slot[right], per_slot[left]
+
+
+def reserve_experts(
+    phy2log: np.ndarray,
+    dropped: np.ndarray,
+    load: np.ndarray,
+    dead_ranks: list,
+    local_physical_experts: int,
+    max_replicas: int,
+) -> np.ndarray:
+    """Reserve the experts the down ranks load once they come back.
+
+    Args:
+        phy2log: [L, num_physical_experts] int32 with the survivors already placed,
+            modified in place.
+        dropped: [L, K] int, `evict_order`'s first K columns (most expendable first);
+            K is the number of experts the survivors' plan dropped.
+        load: [L, E] recent token count per logical expert.
+        dead_ranks: global FFN rank ids that are down.
+        local_physical_experts: slots per FFN rank.
+        max_replicas: replica cap per logical expert.
+
+    Returns:
+        phy2log.
+    """
+    capacity = len(dead_ranks) * local_physical_experts
+    if capacity == 0:
+        return phy2log
+
+    dead_slots = np.concatenate(
+        [np.arange(rank * local_physical_experts, (rank + 1) * local_physical_experts) for rank in dead_ranks]
+    )
+
+    # `dropped` lists the most expendable expert first, so reverse it: the dropped experts
+    # that matter most get a slot back first.
+    picked = dropped[:, ::-1].astype(phy2log.dtype)
+    if picked.shape[1] < capacity:
+        picked = np.concatenate(
+            [picked, _hot_replicas(phy2log, picked, load, capacity - picked.shape[1], max_replicas)],
+            axis=1,
+        )
+
+    # Deal the picks round-robin over the dead ranks.
+    num_layers = picked.shape[0]
+    dealt = picked.reshape(num_layers, local_physical_experts, len(dead_ranks)).transpose(0, 2, 1)
+    phy2log[:, dead_slots] = dealt.reshape(num_layers, -1)
+    return phy2log
+
+
+def _hot_replicas(phy2log: np.ndarray, picked: np.ndarray, load: np.ndarray, want: int, max_replicas: int):
+    """[L, want] hottest experts per layer, repeated when there are fewer experts than slots."""
+    num_layers, num_experts = load.shape
+    count = np.zeros((num_layers, num_experts), dtype=np.int64)
+    placed = phy2log >= 0
+    np.add.at(count, (np.repeat(np.arange(num_layers), phy2log.shape[1])[placed.ravel()], phy2log[placed]), 1)
+    count[np.arange(num_layers)[:, None], picked] += 1  # the picked experts already hold one copy
+
+    hot = np.argsort(-load, axis=1)
+    rows = np.arange(num_layers)[:, None]
+    taken = np.zeros((num_layers, num_experts), dtype=bool)
+    taken[rows, picked] = True
+
+    # Fast path: the hottest experts nobody picked that still have room, one copy each.
+    free = ~taken[rows, hot] & (count[rows, hot] < max_replicas)
+    free &= np.cumsum(free, axis=1) <= want
+    if free.sum(axis=1).min() == want:
+        return hot[free].reshape(num_layers, want).astype(phy2log.dtype)
+
+    # Fewer distinct experts than slots (several ranks down at once): repeat the hottest
+    # ones that still have room, so no slot is left at -1.
+    chosen = np.empty((num_layers, want), dtype=phy2log.dtype)
+    for layer in range(num_layers):
+        # Experts nobody picked first, then the picked ones, hottest first in both groups.
+        ranking = np.concatenate([hot[layer][~taken[layer][hot[layer]]], hot[layer][taken[layer][hot[layer]]]])
+        room = max_replicas - count[layer]
+        picks = []
+        for expert in ranking:
+            if len(picks) == want:
+                break
+            picks.extend([int(expert)] * min(int(room[expert]), want - len(picks)))
+        if len(picks) < want:
+            raise ValueError(f"layer {layer}: cannot reserve {want} experts within {max_replicas} copies")
+        chosen[layer] = picks
+    return chosen

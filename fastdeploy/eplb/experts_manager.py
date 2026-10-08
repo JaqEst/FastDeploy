@@ -30,6 +30,7 @@ from fastdeploy.eplb.utils import (
     derive_expert_tables,
     compact_expert_rank_table,
 )
+from fastdeploy.fault_tolerant.strategy import reserve_experts, keep_from_order
 from fastdeploy.inter_communicator import IPCSignal, RearrangeExpertStatus
 from fastdeploy.utils import get_logger
 
@@ -46,12 +47,14 @@ class RedundantExpertManager:
         fd_config: FDConfig = None,
         ipc_signal_suffix: int = 0,
         shm_fd: int = -1,
+        ft_stats=None,
     ):
         self.logger = get_logger("eplb_expert_manager", "eplb_{0}.log".format(rank))
 
         self.rank = rank
         self.ep_size = ep_size
         self.fd_config = fd_config
+        self.ft_stats = ft_stats
         self.eplb_config = fd_config.eplb_config
         self.num_redundant_experts = self.eplb_config.redundant_experts_num
         self.num_hidden_layers = self.fd_config.model_config.num_hidden_layers
@@ -322,6 +325,19 @@ class RedundantExpertManager:
                 self.model_ep_rank_to_expert_id_list, self.fd_config.afd_config
             )
 
+    def get_live_ffn_ranks_and_keep(self, is_init=False):
+        """Restrict eplb to the live FFN ranks."""
+        afd_config = self.fd_config.afd_config
+        if is_init or not afd_config.enable_afd or self.ft_stats is None:
+            return None, None
+
+        active = getattr(self.fd_config.parallel_config, "ep_active_ranks").numpy()
+        ranks = [r for r in afd_config.ffn_ranks if active[r] > 0]
+        if len(ranks) == len(afd_config.ffn_ranks):
+            return None, None
+        capacity = afd_config.num_local_physical_experts * len(ranks)
+        return ranks, keep_from_order(self.ft_stats.order, capacity)
+
     def calculate_expert_rank_table(self, is_init=False):
         """
         calculate_expert_rank_table
@@ -337,6 +353,7 @@ class RedundantExpertManager:
                 num_nodes = 8
                 num_gpus = 8 * 8
         # eplb
+        active_ffn_ranks, keep = self.get_live_ffn_ranks_and_keep(is_init)
         rank_expert_list, logical_to_physical_map, expert_count = rebalance_experts(
             weight=self.model_tokens_per_expert_stats_list,
             num_replicas=self.num_replicas,
@@ -345,7 +362,26 @@ class RedundantExpertManager:
             num_gpus=num_gpus,
             eplb_strategy=eplb_strategy,
             fd_config=self.fd_config,
+            active_ffn_ranks=active_ffn_ranks,
+            keep=keep,
         )
+        if active_ffn_ranks is not None:
+            failed_ranks = [r for r in self.fd_config.afd_config.ffn_ranks if r not in active_ffn_ranks]
+            num_dropped = max(
+                0,
+                self.num_logical_experts - self.fd_config.afd_config.num_local_physical_experts * len(active_ffn_ranks),
+            )
+            reserve_experts(
+                rank_expert_list,
+                self.ft_stats.order[:, :num_dropped],
+                self.model_tokens_per_expert_stats_list,
+                failed_ranks,
+                self.fd_config.afd_config.num_local_physical_experts,
+                self.num_redundant_experts + 1,
+            )
+            logical_to_physical_map, expert_count = derive_expert_tables(
+                rank_expert_list, self.num_logical_experts, self.num_redundant_experts + 1
+            )
 
         # backup info
         self.last_model_ep_rank_to_expert_id_list[:] = self.model_ep_rank_to_expert_id_list[:]

@@ -58,7 +58,7 @@ from fastdeploy.eplb.async_expert_loader import (
     load_tensor_from_shm_mem,
 )
 from fastdeploy.eplb.experts_manager import RedundantExpertManager
-from fastdeploy.fault_tolerant.strategy import coverage_repair, keep_from_order
+from fastdeploy.fault_tolerant.strategy import coverage_repair, reserve_experts, keep_from_order
 from fastdeploy.fault_tolerant.stats_manager import FaultTolStatsManager
 from fastdeploy.eplb.utils import (
     derive_expert_tables,
@@ -483,6 +483,7 @@ class PaddleDisWorkerProc:
             fd_config=self.fd_config,
             ipc_signal_suffix=self.parallel_config.local_engine_worker_queue_port,
             shm_fd=shm_fd,
+            ft_stats=self.ft_stats,
         )
         if self.expert_weight_shm is not None:
             # The block is immutable, so its infos stay valid across rearranges.
@@ -527,9 +528,10 @@ class PaddleDisWorkerProc:
         table_manager = self.worker.get_model().redundant_table_manger
 
         active = EPBackend().active_ranks.numpy()
-        survivors = [i for i, rank in enumerate(afd_config.ffn_ranks) if active[rank] > 0]
-        if not survivors or len(survivors) == len(afd_config.ffn_ranks):
-            logger.info(f"no ffn rank failed (active={active.tolist()})")
+        survivors = [r for r in afd_config.ffn_ranks if active[r] > 0]
+        casualties = [r for r in afd_config.ffn_ranks if active[r] <= 0]
+        if not survivors or not casualties:
+            logger.info(f"no ffn rank failed (live ffn ranks={survivors})")
             return
 
         # Every survivor adds its own counts, the same way the eplb rebalance does.
@@ -542,8 +544,7 @@ class PaddleDisWorkerProc:
         stats = self.ft_stats
         assert stats is not None
         phy2log = table_manager.model_ep_rank_to_expert_id_list.numpy()
-        survivor_slots = [afd_config.ffn_ranks[i] for i in survivors]
-        slots = np.concatenate([phy2log[:, g * local : (g + 1) * local] for g in survivor_slots], axis=1)
+        slots = np.concatenate([phy2log[:, g * local : (g + 1) * local] for g in survivors], axis=1)
 
         keep = keep_from_order(stats.order, slots.shape[1])
         # coverage_repair orders which lost expert to bring back first, so collapse the
@@ -555,15 +556,14 @@ class PaddleDisWorkerProc:
             logger.info("rank failure needs no expert moves")
             return
 
-        # Dead ranks and ATTN slots stay -1 so the router skips their slots.
+        # Survivors take the new placement, while casualties reserve experts nobody kept.
         phy2log = np.full_like(phy2log, -1)
-        for index, g in enumerate(survivor_slots):
+        for index, g in enumerate(survivors):
             phy2log[:, g * local : (g + 1) * local] = new_slots[:, index * local : (index + 1) * local]
-        log2phy, expert_count = derive_expert_tables(
-            phy2log,
-            afd_config.num_logical_experts,
-            table_manager.model_expert_id_to_ep_rank_array.shape[-1],
-        )
+        max_replicas = table_manager.model_expert_id_to_ep_rank_array.shape[-1]
+        dropped = stats.order[:, : max(0, afd_config.num_logical_experts - slots.shape[1])]
+        reserve_experts(phy2log, dropped, load.numpy(), casualties, local, max_replicas)
+        log2phy, expert_count = derive_expert_tables(phy2log, afd_config.num_logical_experts, max_replicas)
 
         # Table first: update_state_dict resolves logical experts to slots through it.
         table_manager.update_expert_rank_table(phy2log, log2phy, expert_count, clear_stat=False)
@@ -599,9 +599,8 @@ class PaddleDisWorkerProc:
         phy2log = self._handle_rank_failures()
         logger.info(f"<<< rank failures handled in {(time.perf_counter() - begin_ts):.3f}s")
 
-        if phy2log is None:
-            self.refresh_expert_rank_table(dump_table_snapshot=False)
-        elif self.eplb_config.enable_eplb:
+        self.refresh_expert_rank_table(dump_table_snapshot=False)
+        if phy2log is not None and self.eplb_config.enable_eplb:
             self.experts_manager.set_expert_rank_table(phy2log)
 
     def _sync_eplb_op(self, tp_rank):
