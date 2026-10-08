@@ -279,8 +279,8 @@ class RedundantExpertManger:
         active_count = keep_int.sum(axis=-1).astype("int32")
 
         # Publish refreshed active expert table.
-        self.model_active_expert_id_to_ep_rank_array.copy_(active_table, True)
-        self.model_active_expert_in_rank_num_list.copy_(active_count, True)
+        self.model_active_expert_id_to_ep_rank_array.copy_(active_table, False)
+        self.model_active_expert_in_rank_num_list.copy_(active_count, False)
         logger.info("redundant_expert: refresh active expert table.")
 
 if __name__ == "__main__":
