@@ -95,7 +95,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use PFCCLab/DeepEP.
     "FD_USE_PFCC_DEEP_EP": lambda: bool(int(os.getenv("FD_USE_PFCC_DEEP_EP", "0"))),
     # Mooncake EP timeout (in microseconds).
-    "FD_MOONCAKE_EP_TIMEOUT": lambda: int(os.getenv("FD_MOONCAKE_EP_TIMEOUT", "3_000_000")),
+    "FD_MOONCAKE_EP_TIMEOUT": lambda: int(os.getenv("FD_MOONCAKE_EP_TIMEOUT", "10_000")),
     # Whether to use aggregate send.
     "FD_USE_AGGREGATE_SEND": lambda: bool(int(os.getenv("FD_USE_AGGREGATE_SEND", "0"))),
     # Whether to open Trace.
