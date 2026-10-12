@@ -288,58 +288,97 @@ def reserve_experts(
     if capacity == 0:
         return phy2log
 
-    dead_slots = np.concatenate(
-        [np.arange(rank * local_physical_experts, (rank + 1) * local_physical_experts) for rank in dead_ranks]
-    )
+    num_layers, num_physical = phy2log.shape
+    num_ranks = num_physical // local_physical_experts
+    num_experts = load.shape[1]
 
-    # `dropped` lists the most expendable expert first, so reverse it: the dropped experts
-    # that matter most get a slot back first.
-    picked = dropped[:, ::-1].astype(phy2log.dtype)
-    if picked.shape[1] < capacity:
-        picked = np.concatenate(
-            [picked, _hot_replicas(phy2log, picked, load, capacity - picked.shape[1], max_replicas)],
-            axis=1,
-        )
+    placed = phy2log.copy()
+    dead_set = np.zeros(num_physical, dtype=bool)
+    for rank in dead_ranks:
+        dead_set[rank * local_physical_experts : (rank + 1) * local_physical_experts] = True
+        placed[:, rank * local_physical_experts : (rank + 1) * local_physical_experts] = -1
+    survivors = np.flatnonzero(~dead_set)
 
-    # Deal the picks round-robin over the dead ranks.
-    num_layers = picked.shape[0]
-    dealt = picked.reshape(num_layers, local_physical_experts, len(dead_ranks)).transpose(0, 2, 1)
-    phy2log[:, dead_slots] = dealt.reshape(num_layers, -1)
+    # Every layer runs in lock-step, so all the state carries a leading layer
+    # axis and one placement costs O(num_ranks) per layer. A copy of e adds
+    # load[e]/(c+1) to its rank and shaves load[e]/(c(c+1)) off every rank
+    # already holding it.
+    ranks_of_slot = np.repeat(np.arange(num_ranks), local_physical_experts)
+    rows = np.arange(num_layers)
+    surv_expert = phy2log[:, survivors]  # [L, S] expert ids
+    layers_full = np.repeat(rows, survivors.size)
+    expert_full = surv_expert.ravel()
+    rank_full = np.tile(ranks_of_slot[survivors], num_layers)
+    count = np.bincount(layers_full * num_experts + expert_full, minlength=num_layers * num_experts)
+    count = count.reshape(num_layers, num_experts)
+    # [L, R, E] so `copies[rows, rank]` is a cheap per-rank gather.
+    copies = np.bincount(
+        layers_full * (num_ranks * num_experts) + rank_full * num_experts + expert_full,
+        minlength=num_layers * num_ranks * num_experts,
+    ).reshape(num_layers, num_ranks, num_experts)
+    per_slot = np.take_along_axis(load, surv_expert, axis=1) / np.take_along_axis(count, surv_expert, axis=1)
+    loads = np.bincount(
+        layers_full * num_ranks + rank_full, weights=per_slot.ravel(), minlength=num_layers * num_ranks
+    ).reshape(num_layers, num_ranks)
+    gain = load / (count + 1)
+    relief = np.where(count > 0, load / np.maximum(count * (count + 1), 1), 0.0)
+    room = count < max_replicas
+
+    free = np.zeros((num_layers, num_ranks), dtype=np.int64)  # next free slot per rank
+    left = np.zeros((num_layers, num_ranks), dtype=np.int64)  # free slots left per rank
+    dead_mask = np.zeros(num_ranks, dtype=bool)
+    for rank in dead_ranks:
+        dead_mask[rank] = True
+        free[:, rank] = rank * local_physical_experts
+        left[:, rank] = local_physical_experts
+
+    def emptiest():
+        return np.where(dead_mask & (left > 0), loads, np.inf).argmin(axis=1)
+
+    def place(rank, expert):
+        nonlocal loads
+        c = count[rows, expert]
+        load_e = load[rows, expert]
+        loads -= np.where(c[:, None] > 0, relief[rows, expert][:, None] * copies[rows, :, expert], 0.0)
+        loads[rows, rank] += load_e / (c + 1)
+        copies[rows, rank, expert] += 1
+        count[rows, expert] = c + 1
+        gain[rows, expert] = load_e / (c + 2)
+        relief[rows, expert] = load_e / ((c + 1) * (c + 2))
+        room[rows, expert] = (c + 1) < max_replicas
+        placed[rows, free[rows, rank]] = expert
+        free[rows, rank] += 1
+        left[rows, rank] -= 1
+
+    # Mandatory: every dropped expert gets a slot back, heaviest first, so the
+    # emptiest rank takes the biggest load (longest-processing-time first).
+    mandatory = np.take_along_axis(dropped, np.argsort(-load[rows[:, None], dropped], axis=1), axis=1)
+    for step in range(mandatory.shape[1]):
+        place(emptiest(), mandatory[:, step])
+
+    # Filler: hand the emptiest down rank the expert whose copy leaves the
+    # smallest peak, preferring the heaviest expert on a tie.
+    for _ in range(capacity - mandatory.shape[1]):
+        rank = emptiest()
+        cand = room & (copies[rows, rank] == 0)
+        has_cand = cand.any(axis=1)
+        if not has_cand.all():
+            cand = np.where(has_cand[:, None], cand, room)  # repeat on the rank if needed
+            if not cand.any(axis=1).all():
+                raise ValueError(
+                    f"cannot fill the down ranks: every expert already has {max_replicas} copies"
+                )
+        # Peak after the copy: the rank we top up, or the heaviest other rank
+        # once every holder of e sheds its relief. Only the heaviest rank can
+        # drop, so the top two loads decide it.
+        top = loads.argmax(axis=1)
+        max1 = loads[rows, top]
+        second = np.partition(loads, -2, axis=1)[:, -2] if num_ranks > 1 else np.full(num_layers, -np.inf)
+        rest = np.where(copies[rows, top] > 0, np.maximum(max1[:, None] - relief, second[:, None]), max1[:, None])
+        peak = np.where(cand, np.maximum(loads[rows, rank][:, None] + gain, rest), np.inf)
+        tie = peak <= peak.min(axis=1)[:, None] + 1e-9
+        expert = np.where(tie, gain, -np.inf).argmax(axis=1)
+        place(rank, expert)
+
+    phy2log[:] = placed
     return phy2log
-
-
-def _hot_replicas(phy2log: np.ndarray, picked: np.ndarray, load: np.ndarray, want: int, max_replicas: int):
-    """[L, want] hottest experts per layer, repeated when there are fewer experts than slots."""
-    num_layers, num_experts = load.shape
-    count = np.zeros((num_layers, num_experts), dtype=np.int64)
-    placed = phy2log >= 0
-    np.add.at(count, (np.repeat(np.arange(num_layers), phy2log.shape[1])[placed.ravel()], phy2log[placed]), 1)
-    count[np.arange(num_layers)[:, None], picked] += 1  # the picked experts already hold one copy
-
-    hot = np.argsort(-load, axis=1)
-    rows = np.arange(num_layers)[:, None]
-    taken = np.zeros((num_layers, num_experts), dtype=bool)
-    taken[rows, picked] = True
-
-    # Fast path: the hottest experts nobody picked that still have room, one copy each.
-    free = ~taken[rows, hot] & (count[rows, hot] < max_replicas)
-    free &= np.cumsum(free, axis=1) <= want
-    if free.sum(axis=1).min() == want:
-        return hot[free].reshape(num_layers, want).astype(phy2log.dtype)
-
-    # Fewer distinct experts than slots (several ranks down at once): repeat the hottest
-    # ones that still have room, so no slot is left at -1.
-    chosen = np.empty((num_layers, want), dtype=phy2log.dtype)
-    for layer in range(num_layers):
-        # Experts nobody picked first, then the picked ones, hottest first in both groups.
-        ranking = np.concatenate([hot[layer][~taken[layer][hot[layer]]], hot[layer][taken[layer][hot[layer]]]])
-        room = max_replicas - count[layer]
-        picks = []
-        for expert in ranking:
-            if len(picks) == want:
-                break
-            picks.extend([int(expert)] * min(int(room[expert]), want - len(picks)))
-        if len(picks) < want:
-            raise ValueError(f"layer {layer}: cannot reserve {want} experts within {max_replicas} copies")
-        chosen[layer] = picks
-    return chosen
