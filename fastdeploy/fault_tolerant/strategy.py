@@ -294,19 +294,14 @@ def reserve_experts(
 
     survivors = np.flatnonzero((phy2log >= 0).all(axis=0))
 
-    # Every layer runs in lock-step, so all the state carries a leading layer
-    # axis and one placement costs O(num_ranks) per layer. A copy of e adds
-    # load[e]/(c+1) to its rank and shaves load[e]/(c(c+1)) off every rank
-    # already holding it.
-    ranks_of_slot = np.repeat(np.arange(num_ranks), local_physical_experts)
     rows = np.arange(num_layers)
     surv_expert = phy2log[:, survivors]  # [L, S] expert ids
     layers_full = np.repeat(rows, survivors.size)
     expert_full = surv_expert.ravel()
-    rank_full = np.tile(ranks_of_slot[survivors], num_layers)
+    rank_full = np.tile(survivors // local_physical_experts, num_layers)
     count = np.bincount(layers_full * num_experts + expert_full, minlength=num_layers * num_experts)
     count = count.reshape(num_layers, num_experts)
-    # [L, R, E] so `copies[rows, rank]` is a cheap per-rank gather.
+
     copies = np.bincount(
         layers_full * (num_ranks * num_experts) + rank_full * num_experts + expert_full,
         minlength=num_layers * num_ranks * num_experts,
@@ -319,12 +314,10 @@ def reserve_experts(
     relief = np.where(count > 0, load / np.maximum(count * (count + 1), 1), 0.0)
     room = count < max_replicas
 
-    free = np.zeros((num_layers, num_ranks), dtype=np.int64)  # next free slot per rank
-    left = np.zeros((num_layers, num_ranks), dtype=np.int64)  # free slots left per rank
+    left = np.zeros((num_layers, num_ranks), dtype=np.int64)
     dead_mask = np.zeros(num_ranks, dtype=bool)
     for rank in dead_ranks:
         dead_mask[rank] = True
-        free[:, rank] = rank * local_physical_experts
         left[:, rank] = local_physical_experts
 
     def emptiest():
@@ -334,8 +327,6 @@ def reserve_experts(
         nonlocal loads
         c = count[rows, expert]
         load_e = load[rows, expert]
-        # `gain` and `relief` still hold the pre-placement values, and relief is
-        # already 0 where c == 0, so both can be used as-is.
         loads -= relief[rows, expert][:, None] * copies[rows, :, expert]
         loads[rows, rank] += gain[rows, expert]
         copies[rows, rank, expert] += 1
@@ -343,8 +334,7 @@ def reserve_experts(
         gain[rows, expert] = load_e / (c + 2)
         relief[rows, expert] = load_e / ((c + 1) * (c + 2))
         room[rows, expert] = (c + 1) < max_replicas
-        phy2log[rows, free[rows, rank]] = expert
-        free[rows, rank] += 1
+        phy2log[rows, (rank + 1) * local_physical_experts - left[rows, rank]] = expert
         left[rows, rank] -= 1
 
     # Mandatory: every dropped expert gets a slot back, heaviest first, so the
@@ -360,7 +350,7 @@ def reserve_experts(
         cand = room & (copies[rows, rank] == 0)
         has_cand = cand.any(axis=1)
         if not has_cand.all():
-            cand = np.where(has_cand[:, None], cand, room)  # repeat on the rank if needed
+            cand = np.where(has_cand[:, None], cand, room)
             if not cand.any(axis=1).all():
                 raise ValueError(
                     f"cannot fill the down ranks: every expert already has {max_replicas} copies"
