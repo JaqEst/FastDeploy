@@ -334,8 +334,10 @@ def reserve_experts(
         nonlocal loads
         c = count[rows, expert]
         load_e = load[rows, expert]
-        loads -= np.where(c[:, None] > 0, relief[rows, expert][:, None] * copies[rows, :, expert], 0.0)
-        loads[rows, rank] += load_e / (c + 1)
+        # `gain` and `relief` still hold the pre-placement values, and relief is
+        # already 0 where c == 0, so both can be used as-is.
+        loads -= relief[rows, expert][:, None] * copies[rows, :, expert]
+        loads[rows, rank] += gain[rows, expert]
         copies[rows, rank, expert] += 1
         count[rows, expert] = c + 1
         gain[rows, expert] = load_e / (c + 2)
@@ -371,8 +373,7 @@ def reserve_experts(
         second = np.partition(loads, -2, axis=1)[:, -2] if num_ranks > 1 else np.full(num_layers, -np.inf)
         rest = np.where(copies[rows, top] > 0, np.maximum(max1[:, None] - relief, second[:, None]), max1[:, None])
         peak = np.where(cand, np.maximum(loads[rows, rank][:, None] + gain, rest), np.inf)
-        tie = peak <= peak.min(axis=1)[:, None] + 1e-9
-        expert = np.where(tie, gain, -np.inf).argmax(axis=1)
+        expert = np.where(peak <= peak.min(axis=1)[:, None] + 1e-9, gain, -np.inf).argmax(axis=1)
         place(rank, expert)
 
     return phy2log
