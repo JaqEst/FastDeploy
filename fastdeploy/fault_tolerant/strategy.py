@@ -292,10 +292,6 @@ def reserve_experts(
     num_ranks = num_physical // local_physical_experts
     num_experts = load.shape[1]
 
-    # Survivors are the filled slots: attn placeholders and lost ffn ranks are
-    # both -1 in the global slot space, so "filled" is exactly ">= 0". Every down
-    # rank's slot is rewritten below, so `placed` needs no clearing.
-    placed = phy2log.copy()
     survivors = np.flatnonzero((phy2log >= 0).all(axis=0))
 
     # Every layer runs in lock-step, so all the state carries a leading layer
@@ -345,7 +341,7 @@ def reserve_experts(
         gain[rows, expert] = load_e / (c + 2)
         relief[rows, expert] = load_e / ((c + 1) * (c + 2))
         room[rows, expert] = (c + 1) < max_replicas
-        placed[rows, free[rows, rank]] = expert
+        phy2log[rows, free[rows, rank]] = expert
         free[rows, rank] += 1
         left[rows, rank] -= 1
 
@@ -379,5 +375,4 @@ def reserve_experts(
         expert = np.where(tie, gain, -np.inf).argmax(axis=1)
         place(rank, expert)
 
-    phy2log[:] = placed
     return phy2log
